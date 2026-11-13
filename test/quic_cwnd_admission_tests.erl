@@ -11,8 +11,14 @@
 -module(quic_cwnd_admission_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("quic/include/quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 -define(CWND, 12000).
+-define(PKT, 1200).
+%% Packets that fill the window in the in_flight/1 states.
+-define(FLIGHT, 10).
 
 %%====================================================================
 %% No allowance above the window
@@ -74,6 +80,135 @@ retransmit_stream_gate_matches_the_send_test() ->
     ?assert(quic_cc:bytes_in_flight(CC3) =< quic_cc:cwnd(CC3)).
 
 %%====================================================================
+%% Control frames wait for the window
+%%====================================================================
+
+%% Every control frame send_frame/2 sends is held while the window is
+%% full, then goes out once an acknowledgement opens room.
+control_frames_wait_for_cwnd_test_() ->
+    [
+        {atom_to_list(element(1, frame_name(F))), fun() -> control_frame_waits(F) end}
+     || F <- control_frames()
+    ].
+
+control_frame_waits(Frame) ->
+    S0 = in_flight(?FLIGHT),
+    S1 = quic_connection:send_frame(Frame, S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([Frame], held(S1)),
+    ?assertEqual(?FLIGHT * ?PKT, quic_cc:bytes_in_flight(cc(S1))),
+    S2 = ack_all(S1),
+    ?assertEqual([], held(S2)),
+    ?assertEqual([[Frame]], sent_frames(S2)).
+
+%% Held frames go out in the order they were sent, before the stream data
+%% that was queued behind them.
+held_frames_go_in_order_before_stream_data_test() ->
+    S0 = in_flight(?FLIGHT),
+    Token = binary:copy(<<"t">>, 16),
+    F1 = {new_connection_id, 1, 0, <<"cid-0001">>, Token},
+    F2 = {retire_connection_id, 0},
+    S1 = quic_connection:send_frame(F2, quic_connection:send_frame(F1, S0)),
+    {ok, S2} = quic_connection:do_send_data(0, <<"data">>, false, S1, check),
+    ?assertEqual(next_pn(S0), next_pn(S2)),
+    ?assertEqual([F1, F2], held(S2)),
+    S3 = ack_all(S2),
+    ?assertEqual([[F1, F2], [{stream, 0, 0, <<"data">>, false}]], sent_frames(S3)).
+
+%% quic:send_ping/1 queues its PING; a second one adds nothing.
+send_ping_waits_for_cwnd_test() ->
+    S0 = in_flight(?FLIGHT),
+    S1 = call_send_ping(call_send_ping(S0)),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([ping], held(S1)),
+    ?assertEqual([[ping]], sent_frames(ack_all(S1))).
+
+%% A PATH_RESPONSE with no source address to answer goes out as an
+%% ordinary frame, and waits like one.
+path_response_fallback_waits_for_cwnd_test() ->
+    S0 = (in_flight(?FLIGHT))#state{current_packet_source = undefined},
+    Data = <<1, 2, 3, 4, 5, 6, 7, 8>>,
+    S1 = quic_connection:process_frame(app, {path_challenge, Data}, S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([{path_response, Data}], held(S1)).
+
+%% The keep-alive PING is dropped: bytes are in flight, so the connection
+%% is not idle.
+keep_alive_ping_is_dropped_test() ->
+    S0 = in_flight(?FLIGHT),
+    S1 = quic_connection:send_keep_alive_ping(S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([], held(S1)).
+
+%% A DATAGRAM the window refuses is dropped, not held (RFC 9221 Section 5).
+datagram_is_dropped_by_a_full_window_test() ->
+    S0 = (in_flight(?FLIGHT))#state{max_datagram_frame_size_remote = 1200},
+    ?assertMatch({error, congestion_limited, _}, quic_connection:do_send_datagram(<<"d">>, S0)),
+    {error, congestion_limited, S1} = quic_connection:do_send_datagram(<<"d">>, S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([], held(S1)).
+
+%% The pacer refuses a DATAGRAM the same way.
+datagram_is_dropped_by_the_pacer_test() ->
+    S0 = paced_out((with_room(app_state(), ?CWND))#state{max_datagram_frame_size_remote = 4000}),
+    Data = binary:copy(<<"d">>, 1000),
+    {error, congestion_limited, S1} = quic_connection:do_send_datagram(Data, S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)).
+
+%% An ACK-only packet is not in flight: it goes out and is not charged.
+ack_only_goes_out_with_a_full_window_test() ->
+    S0 = owing_ack(in_flight(?FLIGHT)),
+    S1 = quic_connection:send_app_ack(S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual(?FLIGHT * ?PKT, quic_cc:bytes_in_flight(cc(S1))).
+
+%% Nor is CONNECTION_CLOSE.
+connection_close_goes_out_with_a_full_window_test() ->
+    S0 = in_flight(?FLIGHT),
+    S1 = quic_connection:send_frame({connection_close, transport, 0, 0, <<>>}, S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual(?FLIGHT * ?PKT, quic_cc:bytes_in_flight(cc(S1))).
+
+%% Frames held while a server receive pass decides where the peer is go
+%% through the same check when the pass ends.
+pass_frames_wait_for_cwnd_test() ->
+    S0 = (in_flight(?FLIGHT))#state{hold_pass_frames = true},
+    Frame = {max_streams, bidi, S0#state.max_streams_bidi_local},
+    S1 = quic_connection:send_pass_frames(quic_connection:send_frame(Frame, S0)),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual([Frame], held(S1)).
+
+%% A control frame joining a coalesced packet is checked with the bytes
+%% already pending in it.
+control_frame_beside_pending_stream_data_test() ->
+    Data = binary:copy(<<"s">>, 900),
+    S0 = (with_room(app_state(), 955))#state{coalesce = true},
+    {ok, S1} = quic_connection:do_send_data(0, Data, false, S0, check),
+    Token = binary:copy(<<"t">>, 16),
+    S2 = quic_connection:send_frame({new_connection_id, 1, 0, <<"cid-0001">>, Token}, S1),
+    S3 = quic_connection:flush_pending_packet(S2),
+    CC = cc(S3),
+    ?assert(quic_cc:bytes_in_flight(CC) =< quic_cc:cwnd(CC)),
+    ?assertMatch([{new_connection_id, 1, 0, _, _}], held(S3)).
+
+%% A limit a newer one replaced while both were held is not sent.
+superseded_limit_is_not_sent_test() ->
+    S0 = in_flight(?FLIGHT),
+    Max = S0#state.max_data_local,
+    S1 = quic_connection:send_frame({max_data, Max}, S0),
+    S2 = quic_connection:send_frame({max_data, Max + 1000}, S1#state{max_data_local = Max + 1000}),
+    ?assertEqual([[{max_data, Max + 1000}]], sent_frames(ack_all(S2))).
+
+%% The queue is bounded; past it the connection closes with INTERNAL_ERROR.
+control_queue_overflow_closes_test() ->
+    S0 = in_flight(?FLIGHT),
+    Full = lists:duplicate(16384, {retire_connection_id, 0}),
+    S1 = quic_connection:send_frame(
+        {retire_connection_id, 1}, S0#state{ctrl_queue = {16384, queue:from_list(Full)}}
+    ),
+    ?assertMatch({transport, ?QUIC_INTERNAL_ERROR, _}, close_error(S1)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -90,3 +225,97 @@ with_room(State, Room) ->
     quic_connection_test_support:state_set(
         State, cc_state, quic_cc:on_packet_sent(CC, ?CWND - Room)
     ).
+
+%% A connected client with stream 0 open, coalescing and pacing off.
+app_state() ->
+    S = quic_connection_test_support:state_for_admission(0, 0, 1000000, 1000000),
+    S#state{
+        loss_state = quic_loss:on_handshake_confirmed(quic_loss:new()),
+        owner = self(),
+        transport_params = #{},
+        max_data_local = 1000000,
+        max_streams_bidi_local = 100,
+        max_streams_uni_local = 100,
+        last_activity = erlang:monotonic_time(millisecond)
+    }.
+
+%% N tracked packets of ?PKT bytes in flight, filling a window of N packets.
+in_flight(N) ->
+    S0 = app_state(),
+    Sent = erlang:monotonic_time(millisecond) - 100,
+    L = lists:foldl(
+        fun(PN, Acc) -> quic_loss:on_packet_sent(app, Acc, PN, ?PKT, true, [ping], Sent) end,
+        S0#state.loss_state,
+        lists:seq(0, N - 1)
+    ),
+    CC0 = quic_cc:new(#{algorithm => newreno, initial_window => N * ?PKT}),
+    CC = lists:foldl(fun(_, Acc) -> quic_cc:on_packet_sent(Acc, ?PKT) end, CC0, lists:seq(1, N)),
+    S0#state{loss_state = L, cc_state = CC, pn_app = (S0#state.pn_app)#pn_space{next_pn = N}}.
+
+%% Acknowledge every packet sent so far, as the peer would.
+ack_all(#state{pn_app = #pn_space{next_pn = Next}} = S) ->
+    quic_connection:process_frame(app, {ack, [{Next - 1, Next - 1}], 0, undefined}, S).
+
+%% Frames of each packet sent after the in_flight/1 flight, by packet
+%% number, ACK frames left out.
+sent_frames(#state{loss_state = L}) ->
+    Sent = quic_loss:sent_packets(app, L),
+    [
+        [F || F <- Fs, element(1, frame_name(F)) =/= ack]
+     || {PN, #sent_packet{frames = Fs}} <- lists:sort(maps:to_list(Sent)), PN >= ?FLIGHT
+    ].
+
+frame_name(F) when is_atom(F) -> {F};
+frame_name(F) -> F.
+
+held(#state{ctrl_queue = {N, Q}}) ->
+    ?assertEqual(N, queue:len(Q)),
+    queue:to_list(Q).
+
+next_pn(#state{pn_app = #pn_space{next_pn = PN}}) -> PN.
+
+close_error(#state{close_reason = R}) -> R.
+
+owing_ack(#state{pn_app = PN} = S) ->
+    S#state{
+        pn_app = PN#pn_space{largest_recv = 4, recv_time = 0, ack_ranges = [{0, 4}]},
+        ack_elicited_count = 1
+    }.
+
+call_send_ping(S) ->
+    {keep_state, S1, _} = quic_connection:connected({call, {self(), make_ref()}}, send_ping, S),
+    S1.
+
+%% Pacing on, the bucket empty.
+paced_out(#state{cfg = Cfg} = S) ->
+    CC = spend(quic_cc:update_pacing_rate(cc(S), 3000)),
+    S#state{cc_state = CC, cfg = Cfg#conn_cfg{pacing_enabled = true}}.
+
+spend(CC) ->
+    case quic_cc:send_check(CC, 1000) of
+        {ok, CC1} -> spend(CC1);
+        _ -> CC
+    end.
+
+control_frames() ->
+    S = in_flight(?FLIGHT),
+    Token = binary:copy(<<"t">>, 16),
+    [
+        {max_data, S#state.max_data_local},
+        {max_stream_data, 0, 1000000},
+        {max_streams, bidi, S#state.max_streams_bidi_local},
+        {data_blocked, 1000},
+        {stream_data_blocked, 0, 1000},
+        {streams_blocked, bidi, 10},
+        {new_connection_id, 1, 0, <<"cid-0001">>, Token},
+        {retire_connection_id, 0},
+        {reset_stream, 0, 0, 0},
+        {reset_stream_at, 0, 0, 10, 5},
+        {stop_sending, 0, 0},
+        handshake_done,
+        {new_token, Token},
+        {crypto, 0, <<"new-session-ticket">>},
+        immediate_ack,
+        ping,
+        {path_response, <<1, 2, 3, 4, 5, 6, 7, 8>>}
+    ].

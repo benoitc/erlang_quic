@@ -12,15 +12,34 @@
 %%% just above cwnd, every probe is denied, no probe means no ACK, and
 %%% loss detection never runs. Exempting loss retransmissions instead
 %%% would burst a full sent_q past the window during recovery.
-%%%
-%%% These tests pin the policy at the retransmit_cc_allowed/3 decision
-%%% point for both modes, over both a full and an open window.
 
 -module(quic_retransmit_cc_policy_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("quic/include/quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
 -define(PACKET, 1200).
+-define(FRAME, {max_streams, bidi, 1000}).
+
+probe_is_exempt_above_cwnd_test() ->
+    S0 = probing(state(full_window())),
+    S1 = quic_connection:send_retransmit_frames_cc([?FRAME], S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual({0, []}, held(S1)).
+
+loss_retransmission_is_refused_above_cwnd_test() ->
+    S0 = state(full_window()),
+    S1 = quic_connection:send_retransmit_frames_cc([?FRAME], S0),
+    ?assertEqual(next_pn(S0), next_pn(S1)),
+    ?assertEqual({1, [?FRAME]}, held(S1)).
+
+loss_retransmission_passes_an_open_window_test() ->
+    S0 = state(quic_cc:new()),
+    S1 = quic_connection:send_retransmit_frames_cc([?FRAME], S0),
+    ?assertEqual(next_pn(S0) + 1, next_pn(S1)),
+    ?assertEqual({0, []}, held(S1)).
 
 %% A congestion state with no room: keep charging full packets until
 %% even one more no longer fits under cwnd.
@@ -33,15 +52,13 @@ fill(CC) ->
         false -> CC
     end.
 
-probe_is_exempt_above_cwnd_test() ->
-    CC = full_window(),
-    ?assertNot(quic_cc:can_send(CC, ?PACKET)),
-    ?assert(quic_connection:retransmit_cc_allowed(probe, CC, ?PACKET)).
+state(CC) ->
+    S = quic_connection_test_support:state_for_admission(0, 0, 1000000, 1000000),
+    S#state{cc_state = CC}.
 
-loss_retransmission_is_refused_above_cwnd_test() ->
-    CC = full_window(),
-    ?assertNot(quic_connection:retransmit_cc_allowed(normal, CC, ?PACKET)).
+probing(#state{hs = HS} = S) ->
+    S#state{hs = HS#hs{hs_probe = true}}.
 
-loss_retransmission_passes_an_open_window_test() ->
-    CC = quic_cc:new(),
-    ?assert(quic_connection:retransmit_cc_allowed(normal, CC, ?PACKET)).
+next_pn(#state{pn_app = #pn_space{next_pn = PN}}) -> PN.
+
+held(#state{ctrl_queue = {N, Q}}) -> {N, queue:to_list(Q)}.

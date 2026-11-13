@@ -2048,8 +2048,8 @@ connected(
 connected({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
     {keep_state, State, [{reply, From, {ok, TP}}]};
 connected({call, From}, send_ping, State) ->
-    %% Send PING frame - bypasses congestion control
-    NewState = send_keep_alive_ping(State),
+    %% Waits for the congestion window when it is full.
+    NewState = send_frame(ping, State),
     {keep_state, flush_event(NewState, event), [{reply, From, ok}]};
 connected({call, From}, get_mtu, State) ->
     MTU = get_current_mtu(State),
@@ -3979,7 +3979,123 @@ send_frame(Frame, State) ->
 %% flushes the pending packet first; coalescing off means the old
 %% one-packet-per-call behaviour, byte for byte.
 send_app_packet_internal(Payload, Frames, State) ->
-    send_app_packet_internal(Payload, Frames, State, State#state.cc_state).
+    case app_admit(erlang:iolist_size(Payload), Frames, State) of
+        {ok, State1, CCState} -> send_app_packet_internal(Payload, Frames, State1, CCState);
+        {blocked, State1} -> hold_frames(Frames, State1)
+    end.
+
+%% RFC 9002 Section 7: an ack-eliciting packet goes out only if the window
+%% and the pacer have room for it, unless it is a PTO probe (Section 7.5).
+%% Packets that are not in flight are never held back.
+app_admit(Size, Frames, State) ->
+    case quic_ack:contains_ack_eliciting_frames(Frames) of
+        true -> admit_in_flight(Size, State);
+        false -> {ok, State, State#state.cc_state}
+    end.
+
+admit_in_flight(_Size, #state{hs = #hs{hs_probe = true}, cc_state = CCState} = State) ->
+    {ok, State, CCState};
+admit_in_flight(_Size, #state{cc_state = undefined} = State) ->
+    {ok, State, undefined};
+%% Held control frames go first, so nothing overtakes them.
+admit_in_flight(_Size, #state{ctrl_queue = {Held, _}} = State) when Held > 0 ->
+    {blocked, State};
+admit_in_flight(Size, State0) ->
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = Pacing}} =
+        State = settle_pending(Size, State0),
+    case cc_check(CCState, Size + ?PACKET_OVERHEAD, Pacing) of
+        {ok, NewCCState} -> {ok, State, NewCCState};
+        {blocked_cwnd, _Avail} -> {blocked, State};
+        {blocked_pacing, Delay} -> {blocked, maybe_set_pacing_timer(Delay, State)}
+    end.
+
+cc_check(CCState, Size, true) -> quic_cc:send_check(CCState, Size);
+cc_check(CCState, Size, false) -> cwnd_only_check(CCState, Size).
+
+%% The pending coalesced packet is not in flight yet: when a send of Size
+%% payload bytes would overflow it, or not fit the window beside it, the
+%% pending packet goes out first so the check sees its bytes.
+settle_pending(Size, #state{coalesce = true, pend_size = PS, cc_state = CCState} = State) when
+    PS > 0
+->
+    Overflow = (PS + Size > get_max_stream_data_per_packet(State)),
+    case Overflow orelse (not quic_cc:can_send(CCState, PS + Size + ?PACKET_OVERHEAD)) of
+        true -> flush_pending_packet(State);
+        false -> State
+    end;
+settle_pending(_Size, State) ->
+    State.
+
+%% Frames of a packet the window refused: stream data goes back to the send
+%% queue (its credit is already spent), control frames to the control queue.
+%% ACK, PADDING, CONNECTION_CLOSE and DATAGRAM are not resent.
+hold_frames(Frames, State) ->
+    lists:foldl(fun hold_frame/2, State, Frames).
+
+hold_frame({stream, StreamId, Offset, Data, Fin}, State) ->
+    enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State);
+hold_frame(Frame, #state{ctrl_queue = {_, Q}} = State) when
+    Frame =:= ping; Frame =:= immediate_ack
+->
+    %% One pending is enough to elicit the acknowledgement.
+    case queue:member(Frame, Q) of
+        true -> State;
+        false -> enqueue_ctrl(Frame, State)
+    end;
+hold_frame(Frame, State) ->
+    case quic_loss:retransmittable_frames([Frame]) of
+        [] -> State;
+        [_] -> enqueue_ctrl(Frame, State)
+    end.
+
+enqueue_ctrl(_Frame, #state{close_reason = Reason} = State) when Reason =/= undefined ->
+    State;
+enqueue_ctrl(_Frame, #state{ctrl_queue = {Held, _}} = State) when Held >= ?MAX_CTRL_QUEUE ->
+    ?LOG_ERROR(#{what => control_queue_overflow, frames => Held}, ?QUIC_LOG_META),
+    close_with_error(
+        app,
+        transport,
+        ?QUIC_INTERNAL_ERROR,
+        0,
+        <<"control frame queue overflow">>,
+        State#state{ctrl_queue = {0, queue:new()}}
+    );
+enqueue_ctrl(Frame, #state{ctrl_queue = {Held, Q}} = State) ->
+    State#state{ctrl_queue = {Held + 1, queue:in(Frame, Q)}}.
+
+%% Send the held control frames, oldest first, stopping at the first packet
+%% the window refuses; it and everything behind it stay held, in order.
+%% A limit a newer one has replaced is dropped (RFC 9000 Section 13.3).
+flush_ctrl_queue(#state{ctrl_queue = {0, _}} = State) ->
+    State;
+flush_ctrl_queue(#state{app_keys = undefined} = State) ->
+    State;
+flush_ctrl_queue(#state{ctrl_queue = {_, Q}} = State) ->
+    Frames = [F || F <- queue:to_list(Q), is_current_limit(F, State)],
+    send_ctrl_packets(
+        pack_frames(Frames, get_max_stream_data_per_packet(State)),
+        State#state{ctrl_queue = {0, queue:new()}}
+    ).
+
+send_ctrl_packets([], State) ->
+    State;
+send_ctrl_packets([Frames | Rest], State) ->
+    Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
+    case app_admit(byte_size(Payload), Frames, State) of
+        {ok, State1, CCState} ->
+            send_ctrl_packets(Rest, send_app_packet_internal(Payload, Frames, State1, CCState));
+        {blocked, State1} ->
+            hold_frames(lists:append([Frames | Rest]), State1)
+    end.
+
+%% The window may have opened: held control frames go before stream data.
+send_held(#state{app_keys = undefined} = State) ->
+    State;
+send_held(State) ->
+    case flush_ctrl_queue(State) of
+        #state{ctrl_queue = {0, _}} = State1 -> process_send_queue(State1);
+        State1 -> State1
+    end.
 
 %% CCState is the congestion state the caller already charged for this
 %% packet, stored with the rest of the update instead of a copy of its own.
@@ -7210,13 +7326,10 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
     %% Ask the peer for the ACK frequency the controller wants now.
     State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, State4a)),
 
-    %% Try to send queued data now that cwnd may have freed up.
-    %% This also drains retransmit_stream entries deferred by CC.
-    State6 = process_send_queue(State4b),
-    %% cwnd reopened: replay CC-deferred control retransmits, then
-    %% complete any local reset-at reclaim whose reliable bytes are
-    %% now acked.
-    State7 = flush_deferred_retransmits(drain_pending_hs(State6)),
+    %% cwnd may have reopened: held handshake packets, then held control
+    %% frames, then the send queue, retransmit_stream entries included.
+    State7 = send_held(drain_pending_hs(State4b)),
+    %% Complete any local reset-at reclaim whose reliable bytes are now acked.
     State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
     %% The PTO is re-armed once per receive pass, not once per ACK frame:
     %% inside a pass flush_event/2 runs at its end.
@@ -7228,7 +7341,7 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
 
 handshake_ack_tail(Level, LostPackets, State1) ->
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
-    State3 = drain_pending_hs(note_handshake_ack(Level, State2)),
+    State3 = send_held(drain_pending_hs(note_handshake_ack(Level, State2))),
     flush_event(State3#state{pto_dirty = true}, event).
 
 %% A Handshake acknowledgement tells a client the server has processed a
@@ -10007,7 +10120,7 @@ schedule_delayed_ack(app, State) ->
 %% Nothing queued, retransmissions included, is app-limited
 %% (draft-ietf-ccwg-bbr-07 Section 4.1.2.4).
 note_app_limited(
-    #state{send_queue_count = 0, deferred_ctrl_retransmits = [], cc_state = CC} = State
+    #state{send_queue_count = 0, ctrl_queue = {0, _}, cc_state = CC} = State
 ) ->
     case quic_cc:on_app_limited(CC) of
         CC -> State;
@@ -11660,9 +11773,7 @@ datagram_stats_snapshot(State) ->
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
-do_send_datagram(
-    Data, #state{max_datagram_frame_size_remote = PeerMax, cc_state = CCState} = State
-) ->
+do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
     PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
@@ -11672,17 +11783,16 @@ do_send_datagram(
         DataSize > PmtuBudget ->
             {error, datagram_too_large_for_path};
         true ->
-            case quic_cc:can_send(CCState, DataSize + datagram_overhead(State)) of
-                true ->
-                    %% Use datagram_with_length for better framing
-                    Frame = {datagram_with_length, DataBin},
-                    Payload = quic_frame:encode(Frame),
-                    bump(?C_DATAGRAM_SENT, 1, State),
-                    {ok, send_app_packet_internal(Payload, [Frame], State)};
-                false ->
-                    %% Datagrams are unreliable - just drop if cwnd is full
-                    bump(?C_DATAGRAM_SEND_DROPPED, 1, State),
-                    {error, congestion_limited, State}
+            Frame = {datagram_with_length, DataBin},
+            Payload = quic_frame:encode(Frame),
+            case app_admit(byte_size(Payload), [Frame], State) of
+                {ok, State1, CCState} ->
+                    bump(?C_DATAGRAM_SENT, 1, State1),
+                    {ok, send_app_packet_internal(Payload, [Frame], State1, CCState)};
+                {blocked, State1} ->
+                    %% Unreliable, so dropped rather than held (RFC 9221 Section 5).
+                    bump(?C_DATAGRAM_SEND_DROPPED, 1, State1),
+                    {error, congestion_limited, State1}
             end
     end.
 
@@ -12241,7 +12351,7 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
             end;
         {value, {retransmit_stream, StreamId, Offset, _Data, _Fin, DataSize}} ->
             %% Exempt from flow control (already counted); the gate sizes the
-            %% packet as send_retransmit_packet/3 does.
+            %% packet as send_retransmit_packet/2 does.
             Size = retransmit_stream_size(StreamId, Offset, DataSize),
             case quic_cc:can_send(State#state.cc_state, Size) of
                 true ->
@@ -12252,7 +12362,7 @@ process_send_queue_unbudgeted(#state{send_queue = PQ} = State) ->
             end
     end.
 
-%% The packet send_retransmit_packet/3 builds for one STREAM frame.
+%% The packet send_retransmit_packet/2 builds for one STREAM frame.
 retransmit_stream_size(StreamId, Offset, DataSize) ->
     OffsetLen =
         case Offset of
@@ -13440,17 +13550,14 @@ filter_reset_stream_at_data(Frames, #state{streams = Streams}) ->
     ).
 
 %% Send frames for retransmission with congestion control check
-send_retransmit_frames_cc([], State) ->
-    State;
-send_retransmit_frames_cc(Frames, State) ->
-    send_retransmit_frames_cc(Frames, State, normal).
-
 %% Lost frames first sent before the path MTU went down may no longer
 %% fit one packet: their stream data is split and the frames spread over
 %% as many packets as it takes.
-send_retransmit_frames_cc(Frames, State, Mode) ->
+send_retransmit_frames_cc([], State) ->
+    State;
+send_retransmit_frames_cc(Frames, State) ->
     lists:foldl(
-        fun(Packet, S) -> send_retransmit_packet(Packet, S, Mode) end,
+        fun send_retransmit_packet/2,
         State,
         fit_to_mtu(Frames, get_current_mtu(State) - ?RETRANSMIT_OVERHEAD)
     ).
@@ -13479,66 +13586,28 @@ split_stream_frame(Max, {stream, Id, Offset, Data0, Fin} = Frame) ->
 split_stream_frame(_Max, Frame) ->
     [Frame].
 
-%% Mode `probe' (PTO) is exempt from congestion control per RFC 9002
-%% §7.5. Gating probes on the control allowance deadlocks a full
-%% window: bytes_in_flight sits at or just above cwnd, every PTO probe
-%% is denied, no probe means no ACK, no ACK means loss detection never
-%% runs, and the connection stalls until idle timeout with a full
-%% sent_q. Mode `normal' (loss retransmission) stays subject to cwnd.
-send_retransmit_packet(Frames, #state{cc_state = CCState} = State, Mode) ->
-    %% Encode all frames and check size
+%% A loss retransmission waits for the window like any packet; a PTO probe
+%% does not (RFC 9002 Sections 7 and 7.5). Frames the window refuses are
+%% held: detect_lost_packets/2 already took them out of sent_q, so nothing
+%% else would resend them.
+send_retransmit_packet(Frames, State) ->
     Payload = iolist_to_binary([quic_frame:encode(F) || F <- Frames]),
-    PacketSize = byte_size(Payload) + ?RETRANSMIT_OVERHEAD,
-
-    case retransmit_cc_allowed(Mode, CCState, PacketSize) of
-        true ->
-            bump(?C_RETRANSMITS, 1, State),
-            send_app_packet_internal(Payload, Frames, State);
-        false ->
-            %% CC doesn't allow yet. detect_lost_packets/2 already pulled these
-            %% frames out of sent_q, so PTO would not retry them. Track them so
-            %% they are resent (and so a RESET_STREAM_AT reclaim does not complete
-            %% before its reliable bytes are actually re-delivered): stream data
-            %% into FC-exempt retransmit_stream queue entries, control frames into
-            %% deferred_ctrl_retransmits, both replayed when cwnd reopens.
+    case app_admit(byte_size(Payload), Frames, State) of
+        {ok, State1, CCState} ->
+            bump(?C_RETRANSMITS, 1, State1),
+            send_app_packet_internal(Payload, Frames, State1, CCState);
+        {blocked, State1} ->
             ?LOG_DEBUG(
                 #{
                     what => retransmit_deferred_by_cc,
-                    packet_size => PacketSize,
-                    cwnd => quic_cc:cwnd(CCState),
-                    bytes_in_flight => quic_cc:bytes_in_flight(CCState)
+                    packet_size => byte_size(Payload) + ?RETRANSMIT_OVERHEAD,
+                    cwnd => quic_cc:cwnd(State1#state.cc_state),
+                    bytes_in_flight => quic_cc:bytes_in_flight(State1#state.cc_state)
                 },
                 ?QUIC_LOG_META
             ),
-            defer_retransmit_frames(Frames, State)
+            hold_frames(Frames, State1)
     end.
-
-%% RFC 9002 §7: an endpoint MUST NOT exceed cwnd "unless the packet is
-%% sent on a PTO timer expiration or when entering a recovery period".
-%% A PTO probe is exempt outright; an ordinary loss retransmission
-%% stays bound by the congestion window proper, not by the more
-%% lenient control allowance.
-retransmit_cc_allowed(probe, _CCState, _PacketSize) ->
-    true;
-retransmit_cc_allowed(normal, CCState, PacketSize) ->
-    quic_cc:can_send(CCState, PacketSize).
-
-%% Split CC-deferred lost frames: stream data into FC-exempt retransmit_stream
-%% queue entries (retried by process_send_queue/1), control frames into
-%% deferred_ctrl_retransmits (replayed by flush_deferred_retransmits/1).
-defer_retransmit_frames(Frames, State) ->
-    lists:foldl(
-        fun
-            ({stream, SId, Off, D, F}, S) ->
-                enqueue_retransmit_stream(SId, Off, D, F, S);
-            (Ctrl, S) ->
-                S#state{
-                    deferred_ctrl_retransmits = S#state.deferred_ctrl_retransmits ++ [Ctrl]
-                }
-        end,
-        State,
-        Frames
-    ).
 
 %% Queue a lost STREAM frame for retransmission. Exempt from flow control and
 %% data_sent (those were counted on the original send); bytes/count/version are
@@ -13563,14 +13632,6 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
     }.
-
-%% Replay CC-deferred control retransmits through the same CC-checked path. NOT
-%% send_frame/2, which would bypass the congestion check. If cwnd is still
-%% blocking, send_retransmit_frames_cc/2 re-defers them back into the list.
-flush_deferred_retransmits(#state{deferred_ctrl_retransmits = []} = State) ->
-    State;
-flush_deferred_retransmits(#state{deferred_ctrl_retransmits = Deferred} = State) ->
-    send_retransmit_frames_cc(Deferred, State#state{deferred_ctrl_retransmits = []}).
 
 %% Drain pending local reset-at streams whose data below ReliableSize is now
 %% fully acked (no longer queued or in flight), completing the reclaim.
@@ -13720,9 +13781,7 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
     ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
 
-    %% Probes use the control allowance, so retry any CC-deferred control
-    %% retransmits here too (they are not in sent_q for the probe to pick up).
-    State2a = flush_deferred_retransmits(State2),
+    State2a = flush_ctrl_queue(State2),
     State2b = complete_send_reset_at(State2a),
 
     %% Flush immediately - probe packets and timers must not be batched
@@ -13770,7 +13829,7 @@ send_probe_packet(app, State) ->
     case get_oldest_unacked_frames(app, State) of
         {ok, Frames} ->
             %% Retransmit oldest data as the probe, cwnd-exempt
-            send_retransmit_frames_cc(Frames, State, probe);
+            send_retransmit_frames_cc(Frames, State);
         none ->
             %% No data to retransmit, send PING (always allowed as control)
             Payload = quic_frame:encode(ping),
@@ -13803,14 +13862,16 @@ get_oldest_unacked_frames(Space, #state{loss_state = LossState} = State) ->
             end
     end.
 
-%% Send keep-alive PING frame (RFC 9000 - transport-level liveness)
-%% PING frames bypass flow control and ensure connection stays alive
+%% Keep-alive PING. One the window refuses is dropped: bytes are in flight,
+%% so the connection is not idle.
 send_keep_alive_ping(#state{app_keys = undefined} = State) ->
-    %% No app keys yet, skip PING
     State;
 send_keep_alive_ping(State) ->
     Payload = quic_frame:encode(ping),
-    send_app_packet_internal(Payload, [ping], State).
+    case app_admit(byte_size(Payload), [ping], State) of
+        {ok, State1, CCState} -> send_app_packet_internal(Payload, [ping], State1, CCState);
+        {blocked, State1} -> State1
+    end.
 
 %%====================================================================
 %% PTO Timer Management
@@ -13960,7 +14021,7 @@ handle_pacing_timeout(State0) ->
     %% Handshake packets the pacer refused are not in the application
     %% send queue, so they are drained before the fast path that looks
     %% only at that queue.
-    State = drain_pending_hs(State0#state{burst_sent = 0}),
+    State = flush_ctrl_queue(drain_pending_hs(State0#state{burst_sent = 0})),
     ?LOG_DEBUG(
         #{what => pacing_timeout_fired, queue_empty => (State#state.send_queue_count =:= 0)},
         ?QUIC_LOG_META
