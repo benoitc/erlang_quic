@@ -230,6 +230,18 @@ quic:start_server(my_server, 4433, #{
 - For HTTP/3, `quic_h3:accept/2` starts the HTTP/3 process; see
   [HTTP3.md](HTTP3.md#accept2) for the listener options it needs.
 
+When a `connection_handler` already started the owner, use the
+3-argument form: it also gets the current owner, the one
+`connection_handler` returned (or the listener without one), so you can
+tell it the ALPN and keep it.
+
+```erlang
+alpn_handler => fun(Conn, Alpn, Owner) ->
+    Owner ! {alpn, Conn, Alpn},
+    {ok, Owner}
+end
+```
+
 ### Manual Connection Handling
 
 ```erlang

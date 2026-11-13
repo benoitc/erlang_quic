@@ -8428,7 +8428,7 @@ run_alpn_handler(_ALPN, #state{cfg = #conn_cfg{alpn_handler = undefined}} = Stat
 run_alpn_handler(undefined, State) ->
     {ok, State};
 run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
-    try Fn(self(), ALPN) of
+    try call_alpn_handler(Fn, ALPN, State) of
         {ok, Owner} when is_pid(Owner) ->
             {ok, reown(State, Owner)};
         Other ->
@@ -8451,6 +8451,13 @@ run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
             ),
             {error, <<"alpn handler failed">>}
     end.
+
+%% The 3-argument form also gets the current owner: the one a
+%% connection_handler chose, which the listener sets before this runs.
+call_alpn_handler(Fn, ALPN, _State) when is_function(Fn, 2) ->
+    Fn(self(), ALPN);
+call_alpn_handler(Fn, ALPN, #state{owner = Owner}) when is_function(Fn, 3) ->
+    Fn(self(), ALPN, Owner).
 
 check_negotiated_alpn(_ALPN, #state{cfg = #conn_cfg{alpn_list = []}}) ->
     ok;
