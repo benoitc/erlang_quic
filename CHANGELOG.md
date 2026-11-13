@@ -153,6 +153,11 @@ All notable changes to this project will be documented in this file.
   with the same data. A PATH_RESPONSE is now sent once and a
   PATH_CHALLENGE is never repeated; the peer's next challenge gets its
   own response (RFC 9000 Sections 8.2.2 and 13.3).
+- A path MTU probe was not counted as data in flight, so it went out
+  whatever the congestion window, and one declared lost by the loss
+  timer cut the window. Probes now count as in flight and wait for the
+  congestion window like other packets, and losing one never lowers the
+  sending rate (RFC 9000 Section 14.4, RFC 9002 Section 2).
 
 ## [2.7.0] - 2026-11-13
 

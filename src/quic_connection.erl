@@ -4215,7 +4215,7 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
     {Payload1, Frames1} =
         case
-            AckEliciting andalso
+            AckEliciting andalso (not lists:member(immediate_ack, Frames0)) andalso
                 (probe_immediate_ack(State) orelse
                     flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
         of
@@ -6524,7 +6524,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
             ),
             CCState4 = cc_after_loss(
-                CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
+                Level, CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
             %% Only ack-eliciting packets move the window: an ACK of
             %% ACK-only packets has no send time to end recovery with.
@@ -10203,6 +10203,29 @@ loss_space(initial) -> initial;
 loss_space(handshake) -> handshake;
 loss_space(_) -> app.
 
+%% A lost PMTU probe leaves the flight without being a congestion signal
+%% (RFC 9000 Section 14.4, RFC 8899 Section 3).
+cc_after_loss(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
+    case lists:partition(fun is_pmtu_probe/1, Lost) of
+        {[], _} ->
+            cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState);
+        {Probes, Rest} ->
+            ProbeBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Probes]),
+            Largest =
+                case [TS || #sent_packet{ack_eliciting = true, time_sent = TS} <- Rest] of
+                    [] -> undefined;
+                    Times -> lists:max(Times)
+                end,
+            CC = quic_cc:on_packets_discarded(CCState, ProbeBytes),
+            cc_after_loss(CC, max(0, LostBytes - ProbeBytes), Largest, Rest, LossState)
+    end;
+cc_after_loss(_Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
+    cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState).
+
+%% In the application space only a PMTU probe carries PADDING.
+is_pmtu_probe(#sent_packet{frames = Frames}) ->
+    lists:member(padding, Frames).
+
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
 %% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
@@ -13816,7 +13839,7 @@ apply_lost_packets(_Space, [], State) ->
 apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
     LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
     LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
-    NewCC = cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState),
+    NewCC = cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -16825,68 +16848,55 @@ maybe_send_pmtu_probe(#state{pmtu_state = PMTUState} = State) ->
 
 %% @doc Send a PMTU probe packet.
 -spec send_pmtu_probe(#state{}) -> #state{}.
-send_pmtu_probe(#state{pmtu_state = PMTUState, pn_app = PNSpace} = State) ->
+send_pmtu_probe(#state{pmtu_state = PMTUState} = State) ->
     %% Calculate header size (approximate)
     HeaderSize = 50,
-    {ProbeSize, Frames} = quic_pmtu:create_probe_packet(PMTUState, HeaderSize),
-
-    case Frames of
-        [] ->
-            %% No frames to send
-            State;
-        _ ->
-            %% Get packet number for this probe
-            PacketNumber = PNSpace#pn_space.next_pn,
-
-            %% Record probe sent (returns generation for stale detection)
-            {_Gen, NewPMTUState} = quic_pmtu:on_probe_sent(PacketNumber, PMTUState),
-
-            %% Send the probe packet
-            State1 = State#state{pmtu_state = NewPMTUState},
-            State2 = send_pmtu_probe_packet(ProbeSize, Frames, State1),
-
-            %% Set probe timeout
-            set_pmtu_probe_timer(State2)
+    case quic_pmtu:create_probe_packet(PMTUState, HeaderSize) of
+        {_ProbeSize, []} -> State;
+        {ProbeSize, Frames} -> send_pmtu_probe_packet(ProbeSize, Frames, State)
     end.
 
-%% @doc Send the actual PMTU probe packet.
-%% Uses the existing send_app_packet infrastructure with PING + PADDING.
+%% @doc Send the PMTU probe packet: PING and PADDING, with IMMEDIATE_ACK
+%% when the peer takes it so the probe's ACK beats the probe timer
+%% (draft-ietf-quic-ack-frequency-14 Section 8.3).
+%% A probe is ack-eliciting and in flight, so it waits for the congestion
+%% window like any packet (RFC 9000 Section 14.4, RFC 9002 Section 2); one
+%% the window refuses is tried again when the probe timer fires. Its loss
+%% is decided by quic_pmtu and is no congestion signal (cc_after_loss/6).
 -spec send_pmtu_probe_packet(pos_integer(), list(), #state{}) -> #state{}.
 send_pmtu_probe_packet(_ProbeSize, _Frames, #state{app_keys = undefined} = State) ->
     %% No keys available yet
     State;
-send_pmtu_probe_packet(ProbeSize, Frames, #state{dcid = DCID, pn_app = PNSpace} = State) ->
-    %% Encode PING + explicit PADDING frames, with IMMEDIATE_ACK when the peer
-    %% takes it so the probe's ACK beats the probe timer
-    %% (draft-ietf-quic-ack-frequency-14 Section 8.3)
-    EncodedFrames = <<(pmtu_immediate_ack(State))/binary, (encode_pmtu_frames(Frames))/binary>>,
+send_pmtu_probe_packet(ProbeSize, Frames, State0) ->
+    case app_admit(ProbeSize, [ping], State0) of
+        {blocked, State} ->
+            set_pmtu_probe_timer(State);
+        {ok, #state{pmtu_state = PMTUState, pn_app = PNSpace} = State, CCState} ->
+            PN = PNSpace#pn_space.next_pn,
+            {_Gen, NewPMTUState} = quic_pmtu:on_probe_sent(PN, PMTUState),
+            {Payload, Tracked} = pmtu_probe_payload(ProbeSize, Frames, PN, State),
+            set_pmtu_probe_timer(
+                send_app_packet_internal(
+                    Payload, Tracked, State#state{pmtu_state = NewPMTUState}, CCState
+                )
+            )
+    end.
 
-    %% Calculate extra padding needed to reach target probe size
+%% The probe payload, padded to ProbeSize on the wire, and the frames it
+%% is tracked with.
+pmtu_probe_payload(ProbeSize, Frames, PN, #state{dcid = DCID} = State) ->
+    Immediate = pmtu_immediate_ack(State),
+    EncodedFrames = <<Immediate/binary, (encode_pmtu_frames(Frames))/binary>>,
     %% Account for: header (1 + DCID), PN (1-4), auth tag (16)
-    PN = PNSpace#pn_space.next_pn,
-    PNLen = quic_packet:pn_length(PN),
     HeaderLen = 1 + byte_size(DCID),
-    AuthTagLen = 16,
-    PayloadLen = byte_size(EncodedFrames),
-    CurrentSize = HeaderLen + PNLen + PayloadLen + AuthTagLen,
+    CurrentSize = HeaderLen + quic_packet:pn_length(PN) + byte_size(EncodedFrames) + 16,
     ExtraPadding = max(0, ProbeSize - CurrentSize),
-
-    %% Add extra padding to frame payload
-    PaddedFrames = <<EncodedFrames/binary, (binary:copy(<<0>>, ExtraPadding))/binary>>,
-
-    %% Send with an empty frames list so the probe is tracked as
-    %% non-ack-eliciting locally: it stays in sent_q, which is what the
-    %% PMTU ack/lost hooks fold over, but adds nothing to
-    %% bytes_in_flight, arms no PTO, and is never retransmitted. Losing
-    %% a probe is the expected outcome of probing past the path MTU
-    %% (RFC 8899 §3, RFC 9000 §14.4): it must be decided by quic_pmtu's
-    %% own probe timer, never surface as connection loss. Tracking it
-    %% as in-flight data let a single lost raise-probe hold
-    %% bytes_in_flight above zero with no possible progress, and the
-    %% disconnect timeout then declared the peer dead: every long-lived
-    %% connection on an MTU-limited path died on the first periodic
-    %% re-probe, both ends at once.
-    send_app_packet_internal(PaddedFrames, [], State).
+    Tracked =
+        case Immediate of
+            <<>> -> [ping, padding];
+            _ -> [immediate_ack, ping, padding]
+        end,
+    {<<EncodedFrames/binary, (binary:copy(<<0>>, ExtraPadding))/binary>>, Tracked}.
 
 pmtu_immediate_ack(State) ->
     case peer_takes_ack_frequency(State) of
