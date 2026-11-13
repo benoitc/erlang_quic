@@ -13545,6 +13545,10 @@ is_current_limit({streams_blocked, bidi, Limit}, State) ->
     Limit =:= State#state.max_streams_bidi_remote;
 is_current_limit({streams_blocked, uni, Limit}, State) ->
     Limit =:= State#state.max_streams_uni_remote;
+%% A connection ID the peer has retired is not offered again; the others
+%% are resent with the same sequence number (RFC 9000 Section 13.3).
+is_current_limit({new_connection_id, Seq, _, _, _}, #state{cid_pool_state = Pool}) ->
+    lists:keymember(Seq, #cid_entry.seq_num, quic_cid:local_entries(Pool));
 %% Only the RESET_STREAM_AT carrying the current Reliable Size is resent:
 %% sending an older one would raise it again
 %% (draft-ietf-quic-reliable-stream-reset-11 Section 5.2). A reclaimed

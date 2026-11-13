@@ -144,6 +144,10 @@ All notable changes to this project will be documented in this file.
   the reliable size go back up, which the draft forbids. Only the
   reset carrying the current reliable size is sent again now
   (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
+- A lost NEW_CONNECTION_ID was sent again even after the peer had
+  retired that connection ID, offering it a connection ID it had
+  already given up. A connection ID the peer has retired is no longer
+  sent again (RFC 9000 Section 13.3).
 
 ## [2.7.0] - 2026-11-13
 

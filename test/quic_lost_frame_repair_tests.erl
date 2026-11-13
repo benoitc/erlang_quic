@@ -118,6 +118,22 @@ reset_stream_at_for_a_reclaimed_stream_is_resent_test() ->
     ?assertEqual([Frame], resent([Frame], S#state{streams = #{}})).
 
 %%====================================================================
+%% NEW_CONNECTION_ID
+%%====================================================================
+
+new_connection_id_still_issued_is_resent_test() ->
+    {Frame, S} = issued_cid(),
+    ?assertEqual([Frame], resent([Frame], S)).
+
+new_connection_id_the_peer_retired_is_dropped_test() ->
+    {{new_connection_id, Seq, _, _, _} = Frame, S0} = issued_cid(),
+    S1 = quic_connection:process_frame(app, {retire_connection_id, Seq}, S0),
+    ?assertNot(
+        lists:keymember(Seq, #cid_entry.seq_num, quic_cid:local_entries(S1#state.cid_pool_state))
+    ),
+    ?assertEqual([], resent([Frame], S1)).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -179,6 +195,12 @@ reset_at() ->
     {ok, S} = quic_connection:do_reset_stream_at(0, 9, 500, S2),
     [Frame] = [F || {_, Fs} <- sent(S), {reset_stream_at, _, _, _, _} = F <- Fs],
     {Frame, S}.
+
+%% One connection ID issued as sequence 1 beside the handshake one, and
+%% the NEW_CONNECTION_ID that carried it.
+issued_cid() ->
+    {Pool, [{Seq, CID, Token}]} = quic_cid:issue(quic_cid:new(<<"own-cid0">>, 2), 1, undefined),
+    {{new_connection_id, Seq, 0, CID, Token}, (state())#state{cid_pool_state = Pool}}.
 
 with_stream(StreamId, Fun, #state{streams = Streams} = State) ->
     State#state{streams = maps:update_with(StreamId, Fun, Streams)}.

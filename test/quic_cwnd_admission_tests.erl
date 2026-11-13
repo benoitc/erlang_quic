@@ -385,6 +385,8 @@ app_state() ->
         max_streams_bidi_local = 100,
         max_streams_uni_local = 100,
         max_streams_bidi_remote = 10,
+        %% Sequence 1 issued, for the NEW_CONNECTION_ID frames sent below.
+        cid_pool_state = element(1, quic_cid:issue(quic_cid:new(<<"own-cid0">>, 2), 1, undefined)),
         last_activity = erlang:monotonic_time(millisecond)
     }.
 
