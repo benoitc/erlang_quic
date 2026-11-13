@@ -757,7 +757,7 @@ connected(
 ->
     %% Set control stream (stream 0) priority now that stream exists in connection.
     %% This must happen AFTER handshake (stream creation) but BEFORE we start sending.
-    %% Urgency 0 allows ticks to use control_allowance, bypassing congestion control.
+    %% Urgency 0 sends ticks ahead of the data streams.
     _ = set_stream_priority(State, 0, ?QUIC_DIST_URGENCY_CONTROL),
     %% Server needs to open data streams for sending distribution data
     case open_server_data_streams(State) of
@@ -1306,14 +1306,14 @@ do_send_control(
 %% @private
 %% Send tick frame on control stream with QUIC PING for reliability.
 %% We send both:
-%% 1. QUIC PING - bypasses congestion, keeps transport alive
+%% 1. QUIC PING - elicits an ACK, keeps transport alive
 %% 2. Stream tick - needed for Erlang distribution response mechanism
 %% Returns updated state with pending_tick flag set if stream send failed.
 %% Starts a retry timer when tick is blocked to ensure retry during idle periods.
 do_send_tick_frame(#state{conn = Conn, control_stream = CtrlStream} = State) when
     CtrlStream =/= undefined
 ->
-    %% Send QUIC PING to keep transport alive (bypasses congestion)
+    %% Send QUIC PING to keep transport alive
     _ = quic:send_ping(Conn),
     %% Also send stream-based tick for Erlang distribution protocol
     case quic:send_data(Conn, CtrlStream, <<0:32/big-unsigned>>, false) of

@@ -51,8 +51,47 @@ All notable changes to this project will be documented in this file.
 - BBR sends bursts of at most 1 ms at its pacing rate, between 2
   packets and 64 KB (draft-ietf-ccwg-bbr-07 Section 5.6.3), instead of
   2 ms with a floor of 12 packets.
+- Stream urgency 0 no longer lets a stream send up to 1200 bytes past
+  the congestion window. This covers a peer's HTTP/3 `priority` of u=0
+  (RFC 9218) and Erlang distribution ticks, which now wait for the
+  window like other data; urgency still decides which stream goes
+  first. Distribution liveness counts every packet received, so a full
+  window does not cause a `net_tick_timeout`.
+- `quic:send_ping/1` queues its PING while the congestion window is
+  full instead of sending it past the window. A keep-alive PING is
+  skipped then: the data in flight already keeps the connection alive.
+- Breaking: `quic_cc:can_send_control/2` is removed, and
+  `quic_cc:send_check` and `quic_cc:send_check_run` no longer take an
+  urgency argument.
 
 ### Fixed
+- Control frames were sent even when the congestion window was full,
+  and still counted as in flight: MAX_DATA, MAX_STREAM_DATA,
+  MAX_STREAMS, the BLOCKED frames, NEW_CONNECTION_ID,
+  RETIRE_CONNECTION_ID, RESET_STREAM, STOP_SENDING, HANDSHAKE_DONE,
+  NEW_TOKEN, session tickets, ACK_FREQUENCY and PING. So were 0-RTT
+  data, small stream data sent along with an ACK, frames added to a
+  packet already being filled, and one packet too many of a large
+  write.
+  Every packet that counts as in flight now waits for the congestion
+  window and the pacer (RFC 9002 Section 7); packets that carry only
+  ACKs or a CONNECTION_CLOSE still go out at once. Held control frames
+  go out in order, before stream data, as soon as the window opens. A
+  connection holding more than 16384 of them closes with
+  INTERNAL_ERROR.
+- A PTO probe did not carry the control frames waiting for the
+  congestion window, so a MAX_DATA the peer needed could wait for an
+  acknowledgement that a lost path would not deliver. The probe now
+  carries them, and a Handshake or Initial probe sends the handshake
+  data the window held back (RFC 9002 Sections 6.2.4 and 7.5). A probe
+  no longer resends a flow-control limit that a newer one replaced
+  (RFC 9000 Section 13.3).
+- When a loss cut the congestion window below the data in flight, the
+  retransmission waited for the window to drain. One packet, normally
+  that retransmission, now goes out at once (RFC 9002 Section 7.3.2).
+- A DATAGRAM the pacer refused was sent anyway. It is now dropped and
+  reported as `congestion_limited`, like one the congestion window
+  refuses.
 - A QUIC-LB server ID and nonce longer than 19 bytes together were
   accepted. The connection IDs were longer than QUIC allows and their
   first byte named the wrong configuration. They are now refused

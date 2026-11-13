@@ -134,7 +134,7 @@
     early_data_accepted/1,
     %% Peer transport parameters
     get_peer_transport_params/1,
-    %% Transport-level PING (bypasses congestion control)
+    %% Transport-level PING
     send_ping/1,
     %% Key update (RFC 9001 Section 6)
     key_update/1,
@@ -576,8 +576,8 @@ early_data_accepted(Conn) ->
 get_peer_transport_params(Conn) ->
     call(Conn, get_peer_transport_params).
 
-%% @doc Send a PING frame (RFC 9000).
-%% PING frames bypass congestion control and are useful for liveness checks.
+%% @doc Send a PING frame (RFC 9000), useful for liveness checks. It waits
+%% for the congestion window like any packet in flight.
 %% The PING elicits an ACK from the peer, confirming the connection is alive.
 -spec send_ping(pid()) -> ok | {error, term()}.
 send_ping(Conn) ->
