@@ -18,6 +18,7 @@ Pure Erlang QUIC implementation (RFC 9000/9001).
 - Stateless reset support (RFC 9000 Section 10.3)
 - Spin bit (RFC 9000 §17.4) and full NEW_TOKEN issuance/validation
 - `RESET_STREAM_AT` extension
+- ACK frequency extension (draft-ietf-quic-ack-frequency-14), used by BBR
 - Flow control (connection and stream level) with RTT-based auto-tune
 - Congestion control (NewReno, CUBIC, BBR with ECN support)
 - HyStart++ slow start (RFC 9406)
