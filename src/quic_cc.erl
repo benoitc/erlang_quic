@@ -50,8 +50,17 @@
     detect_persistent_congestion/3,
     update_pacing_rate/2,
     update_mtu/2,
-    on_app_limited/1
+    on_app_limited/1,
+    on_ack_frequency/2
 ]).
+
+%% API - ACK frequency requests (draft-ietf-quic-ack-frequency-14)
+-export([
+    ack_frequency/2,
+    immediate_ack/1
+]).
+
+-export_type([ack_frequency/0]).
 
 %% API - Queries
 -export([
@@ -168,6 +177,10 @@
 
 -opaque cc_state() :: #cc_wrapper{}.
 
+%% Ack-Eliciting Threshold, Requested Max Ack Delay (microseconds) and
+%% Reordering Threshold (draft-ietf-quic-ack-frequency-14 Section 4).
+-type ack_frequency() :: {non_neg_integer(), pos_integer(), non_neg_integer()}.
+
 -export_type([cc_state/0, cc_opts/0, cc_algorithm/0]).
 
 %%====================================================================
@@ -252,6 +265,29 @@ on_spurious_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
 on_app_limited(#cc_wrapper{algorithm = quic_cc_bbr, state = State} = W) ->
     W#cc_wrapper{state = quic_cc_bbr:on_app_limited(State)};
 on_app_limited(W) ->
+    W.
+
+%% @doc The ACK frequency to ask of the peer, given the smoothed RTT in
+%% microseconds, or `none' to leave its ACK behaviour as it is. Only BBR
+%% asks (draft-ietf-ccwg-bbr-07 Section 4.1.3.3).
+-spec ack_frequency(cc_state(), non_neg_integer()) -> ack_frequency() | none.
+ack_frequency(#cc_wrapper{algorithm = quic_cc_bbr, state = State}, SmoothedRttUs) ->
+    quic_cc_bbr:ack_frequency(State, SmoothedRttUs);
+ack_frequency(_W, _SmoothedRttUs) ->
+    none.
+
+%% @doc Whether the last packet of a flight should carry IMMEDIATE_ACK.
+-spec immediate_ack(cc_state()) -> boolean().
+immediate_ack(#cc_wrapper{algorithm = quic_cc_bbr, state = State}) ->
+    quic_cc_bbr:immediate_ack(State);
+immediate_ack(_W) ->
+    false.
+
+%% @doc The peer was asked for this ACK frequency.
+-spec on_ack_frequency(cc_state(), ack_frequency()) -> cc_state().
+on_ack_frequency(#cc_wrapper{algorithm = quic_cc_bbr, state = State} = W, Request) ->
+    W#cc_wrapper{state = quic_cc_bbr:on_ack_frequency(State, Request)};
+on_ack_frequency(W, _Request) ->
     W.
 
 %% @doc Handle persistent congestion.

@@ -71,6 +71,8 @@
 
     %% Peer transport parameters and handshake confirmation
     set_peer_ack_params/3,
+    max_ack_delay/1,
+    set_max_ack_delay/2,
     on_handshake_confirmed/1,
 
     %% Queries
@@ -997,6 +999,16 @@ initial_path_pto(#loss_state{max_ack_delay = MaxAckDelay} = State, InitialRTT) -
 set_peer_ack_params(#loss_state{} = State, Exponent, MaxAckDelay) ->
     State#loss_state{ack_delay_exponent = Exponent, max_ack_delay = MaxAckDelay}.
 
+%% @doc The peer's max_ack_delay (ms) the PTO and RTT samples use.
+-spec max_ack_delay(loss_state()) -> non_neg_integer().
+max_ack_delay(#loss_state{max_ack_delay = MaxAckDelay}) -> MaxAckDelay.
+
+%% @doc Use MaxAckDelay (ms) for the peer's max_ack_delay, as an
+%% ACK_FREQUENCY request changes it (draft-ietf-quic-ack-frequency-14 Section 7).
+-spec set_max_ack_delay(loss_state(), non_neg_integer()) -> loss_state().
+set_max_ack_delay(#loss_state{} = State, MaxAckDelay) ->
+    State#loss_state{max_ack_delay = MaxAckDelay}.
+
 %% @doc Mark the handshake confirmed (RFC 9001 Section 4.1.2), from which
 %% point max_ack_delay caps RTT samples and joins the PTO.
 -spec on_handshake_confirmed(loss_state()) -> loss_state().
@@ -1136,4 +1148,6 @@ is_retransmittable({connection_close, _, _, _, _}) -> false;
 %% DATAGRAM frames (RFC 9221) are unreliable and never retransmitted
 is_retransmittable({datagram, _}) -> false;
 is_retransmittable({datagram_with_length, _}) -> false;
+%% IMMEDIATE_ACK is not retransmitted (draft-ietf-quic-ack-frequency-14 Section 5)
+is_retransmittable(immediate_ack) -> false;
 is_retransmittable(_) -> true.

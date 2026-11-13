@@ -130,6 +130,114 @@ min_ack_delay_is_not_remembered_test() ->
     ).
 
 %%====================================================================
+%% Sender (Sections 4, 5 and 7)
+%%====================================================================
+
+sends_request_when_peer_advertised_test() ->
+    S = quic_connection:request_ack_frequency({10, 50000, 3}, sender(#{min_ack_delay => 1000})),
+    ?assertEqual([{ack_frequency, 0, 10, 50000, 3}], ack_frequency_frames(S)).
+
+nothing_without_peer_min_ack_delay_test() ->
+    S = quic_connection:request_ack_frequency({10, 50000, 3}, sender(#{})),
+    ?assertEqual([], ack_frequency_frames(S)).
+
+nothing_from_newreno_or_cubic_test_() ->
+    [
+        {atom_to_list(Algo), fun() ->
+            S0 = sender(#{min_ack_delay => 1000}),
+            S = quic_connection:maybe_request_ack_frequency(S0#state{
+                cc_state = quic_cc:new(#{algorithm => Algo})
+            }),
+            ?assertEqual([], sent_frames(S))
+        end}
+     || Algo <- [newreno, cubic]
+    ].
+
+delay_kept_within_peer_bounds_test() ->
+    S1 = quic_connection:request_ack_frequency({10, 500, 3}, sender(#{min_ack_delay => 2000})),
+    ?assertEqual([{ack_frequency, 0, 10, 2000, 3}], ack_frequency_frames(S1)),
+    S2 = quic_connection:request_ack_frequency({10, 1 bsl 40, 3}, sender(#{min_ack_delay => 2000})),
+    ?assertEqual([{ack_frequency, 0, 10, 16383999, 3}], ack_frequency_frames(S2)).
+
+the_default_is_not_requested_test() ->
+    %% RFC 9000 Section 13.2 behaviour with the peer's max_ack_delay.
+    S = quic_connection:request_ack_frequency(
+        {1, 20000, 1}, sender(#{min_ack_delay => 1000, max_ack_delay => 20})
+    ),
+    ?assertEqual([], ack_frequency_frames(S)).
+
+sequence_numbers_increase_test() ->
+    S0 = sender(#{min_ack_delay => 1000}),
+    S1 = quic_connection:request_ack_frequency({10, 50000, 3}, S0),
+    %% Same request: nothing new.
+    S2 = quic_connection:request_ack_frequency({10, 50000, 3}, S1),
+    %% More frequent: at once.
+    S3 = quic_connection:request_ack_frequency({1, 10000, 1}, S2),
+    ?assertEqual(
+        [{ack_frequency, 0, 10, 50000, 3}, {ack_frequency, 1, 1, 10000, 1}],
+        ack_frequency_frames(S3)
+    ).
+
+fewer_acks_at_most_once_per_rtt_test() ->
+    S1 = quic_connection:request_ack_frequency({2, 10000, 1}, sender(#{min_ack_delay => 1000})),
+    S2 = quic_connection:request_ack_frequency({8, 40000, 3}, S1),
+    ?assertEqual(1, length(ack_frequency_frames(S2))),
+    %% One smoothed RTT later.
+    Req = S2#state.ack_freq_req,
+    S3 = quic_connection:request_ack_frequency({8, 40000, 3}, S2#state{
+        ack_freq_req = Req#ack_freq_req{sent_at = Req#ack_freq_req.sent_at - 1000}
+    }),
+    ?assertMatch([_, {ack_frequency, 1, 8, 40000, 3}], ack_frequency_frames(S3)).
+
+pto_uses_a_larger_delay_at_once_test() ->
+    S = quic_connection:request_ack_frequency({10, 50000, 3}, sender(#{min_ack_delay => 1000})),
+    ?assertEqual(50, quic_loss:max_ack_delay(S#state.loss_state)).
+
+pto_takes_a_smaller_delay_once_acknowledged_test() ->
+    %% Section 7: the larger of the current and in-flight values.
+    S1 = quic_connection:request_ack_frequency({10, 50000, 3}, sender(#{min_ack_delay => 1000})),
+    S2 = quic_connection:request_ack_frequency({1, 4500, 1}, S1),
+    ?assertEqual(50, quic_loss:max_ack_delay(S2#state.loss_state)),
+    [_, Second] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
+    [First, _] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
+    S3 = quic_connection:ack_frequency_acked([First], S2),
+    ?assertEqual(50, quic_loss:max_ack_delay(S3#state.loss_state)),
+    S4 = quic_connection:ack_frequency_acked([Second], S3),
+    ?assertEqual(5, quic_loss:max_ack_delay(S4#state.loss_state)).
+
+only_the_latest_request_is_resent_test() ->
+    S1 = quic_connection:request_ack_frequency({10, 50000, 3}, sender(#{min_ack_delay => 1000})),
+    ?assert(quic_connection:is_current_limit({ack_frequency, 0, 10, 50000, 3}, S1)),
+    S2 = quic_connection:request_ack_frequency({1, 4000, 1}, S1),
+    ?assertNot(quic_connection:is_current_limit({ack_frequency, 0, 10, 50000, 3}, S2)),
+    ?assert(quic_connection:is_current_limit({ack_frequency, 1, 1, 4000, 1}, S2)).
+
+immediate_ack_is_not_retransmitted_test() ->
+    ?assertEqual([ping], quic_loss:retransmittable_frames([immediate_ack, ping])).
+
+immediate_ack_on_the_flight_end_test() ->
+    meck:new(quic_cc, [passthrough]),
+    try
+        meck:expect(quic_cc, immediate_ack, 1, true),
+        %% Nothing queued: this packet ends the flight.
+        S = quic_connection:send_frame(ping, sender(#{min_ack_delay => 1000})),
+        ?assertEqual([[ping, immediate_ack]], [P#sent_packet.frames || P <- sent(S)]),
+        %% More queued and room in the window: it does not.
+        S1 = sender(#{min_ack_delay => 1000}),
+        S2 = quic_connection:send_frame(ping, S1#state{send_queue_count = 1}),
+        ?assertEqual([[ping]], [P#sent_packet.frames || P <- sent(S2)]),
+        %% Never to a peer without min_ack_delay.
+        S3 = quic_connection:send_frame(ping, sender(#{})),
+        ?assertEqual([[ping]], [P#sent_packet.frames || P <- sent(S3)])
+    after
+        meck:unload(quic_cc)
+    end.
+
+no_immediate_ack_unless_asked_test() ->
+    S = quic_connection:send_frame(ping, sender(#{min_ack_delay => 1000})),
+    ?assertEqual([[ping]], [P#sent_packet.frames || P <- sent(S)]).
+
+%%====================================================================
 %% Where the frames may appear
 %%====================================================================
 
@@ -180,6 +288,20 @@ run(S0, Packets) ->
         S0,
         Packets
     ).
+
+%% A connected sender whose peer sent TP, packets going straight out.
+sender(TP) ->
+    S = receiver(),
+    S#state{coalesce = false, transport_params = TP}.
+
+sent(#state{loss_state = LS}) ->
+    [P || {_, P} <- lists:sort(maps:to_list(quic_loss:sent_packets(app, LS)))].
+
+sent_frames(S) ->
+    lists:append([P#sent_packet.frames || P <- sent(S)]).
+
+ack_frequency_frames(S) ->
+    [F || {ack_frequency, _, _, _, _} = F <- sent_frames(S)].
 
 acks_sent(S) ->
     quic_connection:count(?C_ACK_SENT, S).

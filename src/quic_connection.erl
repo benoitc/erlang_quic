@@ -4078,7 +4078,15 @@ end_coalescing(true, #state{pend_payload = PP, pend_frames = PF} = State) ->
 send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
     State = flush_long_datagram(State0),
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames0),
-    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload0, Frames0, State),
+    {Payload1, Frames1} =
+        case
+            AckEliciting andalso
+                flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State)
+        of
+            true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
+            false -> {Payload0, Frames0}
+        end,
+    {Payload, Frames, AckFields} = piggyback_ack(AckEliciting, Payload1, Frames1, State),
     #state{
         dcid = DCID,
         app_keys = {ClientKeys, ServerKeys},
@@ -7019,6 +7027,129 @@ apply_ack_frequency(Seq, Threshold, DelayUs, Reordering, #state{ack_timer = Time
 largest_acked_sent(undefined) -> -1;
 largest_acked_sent(#peer_ack_freq{largest_acked = L}) -> L.
 
+%% Ask the peer for the ACK frequency the congestion controller wants, once
+%% it advertised min_ack_delay (draft-ietf-quic-ack-frequency-14 Section 4).
+maybe_request_ack_frequency(#state{cfg = #conn_cfg{ack_frequency = false}} = State) ->
+    State;
+maybe_request_ack_frequency(#state{cc_state = CC, loss_state = LossState} = State) ->
+    SrttUs = quic_rtt:smoothed(quic_loss:rtt(LossState)) * 1000,
+    case quic_cc:ack_frequency(CC, SrttUs) of
+        none -> State;
+        Request -> request_ack_frequency(Request, State)
+    end.
+
+request_ack_frequency({Threshold, Delay0, Reordering}, #state{transport_params = TP} = State) ->
+    case maps:get(min_ack_delay, TP, undefined) of
+        undefined ->
+            State;
+        PeerMin ->
+            %% Section 4: no less than the peer's min_ack_delay, below 2^14 ms.
+            Delay = min(max(Delay0, PeerMin), ?MAX_REQUESTED_ACK_DELAY_US - 1),
+            Request = {Threshold, Delay, Reordering},
+            Now = erlang:monotonic_time(millisecond),
+            case ack_frequency_due(Request, Now, State) of
+                true -> send_ack_frequency(Request, Now, State);
+                false -> State
+            end
+    end.
+
+%% A change asking for ACKs as often or more goes out at once; one asking
+%% for fewer at most once per smoothed RTT (Section 8.1).
+ack_frequency_due({T, D, R} = Request, Now, State) ->
+    {CT, CD, CR, SentAt} = current_ack_frequency(State),
+    case Request of
+        {CT, CD, CR} ->
+            false;
+        _ when T =< CT, D =< CD, R =< CR ->
+            true;
+        _ when SentAt =:= undefined ->
+            true;
+        _ ->
+            Now - SentAt >= quic_rtt:smoothed(quic_loss:rtt(State#state.loss_state))
+    end.
+
+%% What the peer does now: RFC 9000 Section 13.2 until we asked otherwise.
+current_ack_frequency(#state{ack_freq_req = undefined, transport_params = TP}) ->
+    {1, maps:get(max_ack_delay, TP, ?DEFAULT_MAX_ACK_DELAY) * 1000, 1, undefined};
+current_ack_frequency(#state{ack_freq_req = Req}) ->
+    #ack_freq_req{threshold = T, max_ack_delay = D, reordering = R, sent_at = SentAt} = Req,
+    {T, D, R, SentAt}.
+
+send_ack_frequency({Threshold, Delay, Reordering} = Request, Now, State0) ->
+    Seq =
+        case State0#state.ack_freq_req of
+            undefined -> 0;
+            #ack_freq_req{seq = Last} -> Last + 1
+        end,
+    State = send_frame({ack_frequency, Seq, Threshold, Delay, Reordering}, State0),
+    #state{loss_state = LossState, cc_state = CC} = State,
+    %% Section 7: the PTO uses the larger max_ack_delay until the peer has the request.
+    DelayMs = (Delay + 999) div 1000,
+    {LossState1, Pending} =
+        case (DelayMs >= quic_loss:max_ack_delay(LossState)) of
+            true -> {quic_loss:set_max_ack_delay(LossState, DelayMs), undefined};
+            false -> {LossState, DelayMs}
+        end,
+    State#state{
+        loss_state = LossState1,
+        cc_state = quic_cc:on_ack_frequency(CC, Request),
+        ack_freq_req = #ack_freq_req{
+            seq = Seq,
+            threshold = Threshold,
+            max_ack_delay = Delay,
+            reordering = Reordering,
+            sent_at = Now,
+            pending_pto_delay = Pending
+        }
+    }.
+
+%% Section 7: a lower max_ack_delay counts once its request is acknowledged.
+ack_frequency_acked(
+    Acked,
+    #state{
+        ack_freq_req = #ack_freq_req{seq = Seq, pending_pto_delay = DelayMs} = Req,
+        loss_state = LossState
+    } = State
+) when DelayMs =/= undefined ->
+    case
+        lists:any(
+            fun(#sent_packet{frames = Frames}) ->
+                lists:any(
+                    fun
+                        ({ack_frequency, S, _, _, _}) -> S =:= Seq;
+                        (_) -> false
+                    end,
+                    Frames
+                )
+            end,
+            Acked
+        )
+    of
+        true ->
+            State#state{
+                loss_state = quic_loss:set_max_ack_delay(LossState, DelayMs),
+                ack_freq_req = Req#ack_freq_req{pending_pto_delay = undefined}
+            };
+        false ->
+            State
+    end;
+ack_frequency_acked(_Acked, State) ->
+    State.
+
+%% draft-ietf-quic-ack-frequency-14 Section 5: the controller may want the
+%% packet that ends a flight, cwnd full or nothing left queued, to carry
+%% IMMEDIATE_ACK.
+flight_end_immediate_ack(Bytes, More, CC, State) ->
+    quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
+        ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
+            (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% The peer advertised min_ack_delay and the extension is on (Section 3).
+peer_takes_ack_frequency(#state{cfg = #conn_cfg{ack_frequency = false}}) ->
+    false;
+peer_takes_ack_frequency(#state{transport_params = TP}) ->
+    maps:is_key(min_ack_delay, TP).
+
 ack_frequency_not_negotiated(FrameType, State) ->
     close_with_error(
         app,
@@ -7085,9 +7216,12 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
+    %% Ask the peer for the ACK frequency the controller wants now.
+    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, State4a)),
+
     %% Try to send queued data now that cwnd may have freed up.
     %% This also drains retransmit_stream entries deferred by CC.
-    State6 = process_send_queue(State4a),
+    State6 = process_send_queue(State4b),
     %% cwnd reopened: replay CC-deferred control retransmits, then
     %% complete any local reset-at reclaim whose reliable bytes are
     %% now acked.
@@ -11722,8 +11856,18 @@ send_stream_chunk_run(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx, 
     %% Build the run's frames and QUIC-frame payloads, then seal all K
     %% packets: one fused NIF call when available (header, nonce, AEAD
     %% and header protection in C), per-packet Erlang sealing otherwise.
-    {Frames, Payloads, Offset1, Rest} =
+    {Frames, Payloads0, Offset1, Rest} =
         build_run_payloads(K, StreamId, Offset, Data, HeaderPrefix, LengthVarint, MaxChunkSize),
+    %% The run's last packet may end a flight; the chunk size leaves room for one byte.
+    Payloads =
+        case
+            flight_end_immediate_ack(
+                K * (MaxChunkSize + ?PACKET_OVERHEAD), (byte_size(Rest) > 0), CCState, State
+            )
+        of
+            true -> with_immediate_ack_last(Payloads0);
+            false -> Payloads0
+        end,
     FirstByteBase = short_header_first_byte(KeyPhase, 1, State),
     Packets =
         case quic_aead_ctx:protect_run(Cipher, Key, IV, HP, PN0, FirstByteBase, DCID, Payloads) of
@@ -11808,6 +11952,9 @@ build_run_payloads(K, Sid, Offset, Data, HeaderPrefix, LengthVarint, MCS, FrAcc,
         [Frame | FrAcc],
         [Payload | PlAcc]
     ).
+
+with_immediate_ack_last([Last]) -> [[Last, quic_frame:encode(immediate_ack)]];
+with_immediate_ack_last([P | Rest]) -> [P | with_immediate_ack_last(Rest)].
 
 %% A run to an unvalidated address goes through the amplification limit
 %% one datagram at a time; a held one is tracked as sent.
@@ -13263,6 +13410,11 @@ is_current_limit({max_stream_data, StreamId, N}, #state{streams = Streams}) ->
         {ok, #stream_state{final_size = undefined, recv_max_data = Max}} -> N >= Max;
         _ -> false
     end;
+%% draft-ietf-quic-ack-frequency-14 Section 4: resend only the latest request.
+is_current_limit({ack_frequency, Seq, _, _, _}, #state{ack_freq_req = #ack_freq_req{seq = Seq}}) ->
+    true;
+is_current_limit({ack_frequency, _, _, _, _}, _State) ->
+    false;
 is_current_limit(_, _State) ->
     true.
 

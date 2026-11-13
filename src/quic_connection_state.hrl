@@ -60,6 +60,20 @@
     largest_acked = -1 :: integer()
 }).
 
+%% The ACK_FREQUENCY request we last sent (draft-ietf-quic-ack-frequency-14
+%% Section 4).
+-record(ack_freq_req, {
+    seq :: non_neg_integer(),
+    threshold :: non_neg_integer(),
+    %% Requested Max Ack Delay, in microseconds
+    max_ack_delay :: pos_integer(),
+    reordering :: non_neg_integer(),
+    %% Millisecond time it was sent
+    sent_at :: integer(),
+    %% A lower max_ack_delay (ms) the PTO takes once this request is acknowledged
+    pending_pto_delay :: pos_integer() | undefined
+}).
+
 %% Connection state record
 %% Write-once connection configuration, set in init/1 and never
 %% updated. Kept apart from #state{} so a state update copies one
@@ -693,6 +707,8 @@
     %% The peer's latest ACK_FREQUENCY request (draft-ietf-quic-ack-frequency-14
     %% Section 4); it replaces ack_packet_tolerance and the ACK timer delay.
     peer_ack_freq = undefined :: #peer_ack_freq{} | undefined,
+    %% Our latest ACK_FREQUENCY request to the peer.
+    ack_freq_req = undefined :: #ack_freq_req{} | undefined,
 
     %% Small-send coalescing (issue #201). While `coalesce' is true -
     %% only within one drained batch of send_data/send_data_async

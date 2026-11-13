@@ -91,6 +91,13 @@
     info/1
 ]).
 
+%% ACK frequency (Section 4.1.3.3)
+-export([
+    ack_frequency/2,
+    immediate_ack/1,
+    on_ack_frequency/2
+]).
+
 %%====================================================================
 %% Constants (draft-ietf-ccwg-bbr-07 Section 2)
 %%====================================================================
@@ -1635,6 +1642,25 @@ info(#bbr_state{} = S) ->
         probe_rtt_done_stamp => S#bbr_state.probe_rtt_done_stamp,
         sent_packets => queue:len(S#bbr_state.sent)
     }.
+
+%%====================================================================
+%% ACK frequency (Section 4.1.3.3)
+%%====================================================================
+
+%% @doc The ACK frequency to ask of the peer: none yet.
+-spec ack_frequency(cc_state(), non_neg_integer()) -> quic_cc:ack_frequency() | none.
+ack_frequency(_S, _SmoothedRttUs) ->
+    none.
+
+%% @doc Whether the last packet of a flight should carry IMMEDIATE_ACK.
+-spec immediate_ack(cc_state()) -> boolean().
+immediate_ack(_S) ->
+    false.
+
+%% @doc The peer was asked for this ACK frequency.
+-spec on_ack_frequency(cc_state(), quic_cc:ack_frequency()) -> cc_state().
+on_ack_frequency(S, _Request) ->
+    S.
 
 now_us() ->
     erlang:monotonic_time(microsecond).
