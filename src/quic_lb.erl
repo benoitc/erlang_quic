@@ -64,14 +64,16 @@
 %%   - algorithm: plaintext | encrypted (default: plaintext)
 %%   - config_rotation: 0..6 (default: 0)
 %%   - nonce_len: 4..18 (default: 4)
-%%   - key: binary() - 16-byte AES key (required for cipher algorithms)
+%%   - key: binary() - 16-byte AES key (required for encrypted)
+%%
+%% The server ID and nonce lengths sum to 19 bytes or less.
 %%
 %% @returns {ok, #lb_config{}} | {error, term()}
 -spec new_config(map()) -> {ok, #lb_config{}} | {error, term()}.
 new_config(Opts) when is_map(Opts) ->
     try
         ServerID = maps:get(server_id, Opts),
-        ServerIDLen = byte_size(ServerID),
+        ServerIDLen = id_size(ServerID),
         Algorithm = maps:get(algorithm, Opts, plaintext),
         CR = maps:get(config_rotation, Opts, 0),
         NonceLen = maps:get(nonce_len, Opts, 4),
@@ -108,33 +110,29 @@ new_cid_config(Opts) when is_map(Opts) ->
     LBConfig = maps:get(lb_config, Opts, undefined),
     CIDLen = maps:get(cid_len, Opts, 8),
     ResetSecret = maps:get(reset_secret, Opts, undefined),
+    case cid_len(LBConfig, CIDLen) of
+        {ok, Len} ->
+            {ok, #cid_config{lb_config = LBConfig, cid_len = Len, reset_secret = ResetSecret}};
+        {error, _} = Error ->
+            Error
+    end.
 
-    %% Validate CID length
-    case CIDLen >= 1 andalso CIDLen =< 20 of
-        true ->
-            %% If LB config provided, CID length must match expected
-            case LBConfig of
-                undefined ->
-                    {ok, #cid_config{
-                        lb_config = undefined,
-                        cid_len = CIDLen,
-                        reset_secret = ResetSecret
-                    }};
-                #lb_config{} ->
-                    ExpectedLen = expected_cid_len(LBConfig),
-                    case CIDLen =:= ExpectedLen orelse CIDLen =:= 8 of
-                        true ->
-                            {ok, #cid_config{
-                                lb_config = LBConfig,
-                                cid_len = ExpectedLen,
-                                reset_secret = ResetSecret
-                            }};
-                        false ->
-                            {error, {cid_len_mismatch, CIDLen, ExpectedLen}}
-                    end
+%% @private With an LB config the CID is 1 + server ID + nonce bytes;
+%% the default length 8 is taken to mean that length.
+cid_len(_LBConfig, CIDLen) when not is_integer(CIDLen); CIDLen < 1; CIDLen > 20 ->
+    {error, {invalid_cid_len, CIDLen}};
+cid_len(undefined, CIDLen) ->
+    {ok, CIDLen};
+cid_len(#lb_config{} = LBConfig, CIDLen) ->
+    case validate_config(LBConfig) of
+        ok ->
+            ExpectedLen = expected_cid_len(LBConfig),
+            case (CIDLen =:= ExpectedLen) orelse (CIDLen =:= 8) of
+                true -> {ok, ExpectedLen};
+                false -> {error, {cid_len_mismatch, CIDLen, ExpectedLen}}
             end;
-        false ->
-            {error, {invalid_cid_len, CIDLen}}
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Validate an LB configuration.
@@ -148,28 +146,37 @@ validate_config(#lb_config{
     key = Key
 }) ->
     Validations = [
-        {CR >= 0 andalso CR =< 6, {invalid_config_rotation, CR}},
+        {fun() -> in_range(CR, 0, 6) end, {invalid_config_rotation, CR}},
         {
-            not lists:member(Algorithm, [stream_cipher, block_cipher]),
+            fun() -> not lists:member(Algorithm, [stream_cipher, block_cipher]) end,
             {unsupported_lb_algorithm, Algorithm}
         },
-        {lists:member(Algorithm, [plaintext, encrypted]), {invalid_algorithm, Algorithm}},
-        {is_binary(ServerID), {invalid_server_id, not_binary}},
         {
-            ServerIDLen >= 1 andalso ServerIDLen =< ?LB_MAX_SERVER_ID_LEN,
+            fun() -> lists:member(Algorithm, [plaintext, encrypted]) end,
+            {invalid_algorithm, Algorithm}
+        },
+        {fun() -> is_binary(ServerID) end, {invalid_server_id, not_binary}},
+        {
+            fun() -> in_range(ServerIDLen, 1, ?LB_MAX_SERVER_ID_LEN) end,
             {invalid_server_id_len, ServerIDLen}
         },
         {
-            byte_size(ServerID) =:= ServerIDLen,
-            {server_id_len_mismatch, byte_size(ServerID), ServerIDLen}
+            fun() -> id_size(ServerID) =:= ServerIDLen end,
+            {server_id_len_mismatch, id_size(ServerID), ServerIDLen}
         },
         {
-            NonceLen >= ?LB_MIN_NONCE_LEN andalso NonceLen =< ?LB_MAX_NONCE_LEN,
+            fun() -> in_range(NonceLen, ?LB_MIN_NONCE_LEN, ?LB_MAX_NONCE_LEN) end,
             {invalid_nonce_len, NonceLen}
         },
+        %% Section 5.3: at most 19 so the CID fits in 20 bytes.
         {
-            Algorithm =:= plaintext orelse
-                (is_binary(Key) andalso byte_size(Key) =:= 16),
+            fun() -> ServerIDLen + NonceLen =< ?LB_MAX_SERVER_ID_NONCE_LEN end,
+            {invalid_server_id_nonce_len, ServerIDLen, NonceLen}
+        },
+        {
+            fun() ->
+                Algorithm =:= plaintext orelse (is_binary(Key) andalso byte_size(Key) =:= 16)
+            end,
             {missing_or_invalid_key, Algorithm}
         }
     ],
@@ -224,13 +231,18 @@ generate_cid(#cid_config{lb_config = LBConfig}, Nonce) ->
 
 %% @doc Extract the server ID from a CID.
 -spec decode_server_id(binary(), #lb_config{}) -> {ok, binary()} | {error, term()}.
-decode_server_id(CID, #lb_config{algorithm = Algorithm} = Config) when byte_size(CID) >= 1 ->
+decode_server_id(
+    <<FirstByte, _/binary>> = CID, #lb_config{config_rotation = CR, algorithm = Algorithm} = Config
+) when FirstByte bsr 5 =:= CR ->
     case Algorithm of
         plaintext ->
             decode_plaintext(CID, Config);
         encrypted ->
             decode_encrypted(CID, Config)
     end;
+%% Section 3.1: the first three bits name the configuration the CID uses.
+decode_server_id(<<_, _/binary>>, #lb_config{}) ->
+    {error, config_rotation_mismatch};
 decode_server_id(_CID, _Config) ->
     {error, cid_too_short}.
 
@@ -361,10 +373,17 @@ join_halves(Left, Right, Len) ->
 %% Internal Functions
 %%====================================================================
 
-%% @private Validate a list of conditions
+%% @private Return the error of the first check that fails
 validate_list([]) ->
     ok;
-validate_list([{true, _Error} | Rest]) ->
-    validate_list(Rest);
-validate_list([{false, Error} | _Rest]) ->
-    {error, Error}.
+validate_list([{Check, Error} | Rest]) ->
+    case Check() of
+        true -> validate_list(Rest);
+        false -> {error, Error}
+    end.
+
+id_size(ServerID) when is_binary(ServerID) -> byte_size(ServerID);
+id_size(_ServerID) -> 0.
+
+in_range(N, Min, Max) ->
+    is_integer(N) andalso N >= Min andalso N =< Max.

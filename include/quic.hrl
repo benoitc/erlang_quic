@@ -840,6 +840,8 @@
 -define(LB_MAX_NONCE_LEN, 18).
 %% Minimum nonce length
 -define(LB_MIN_NONCE_LEN, 4).
+%% Maximum server ID plus nonce length
+-define(LB_MAX_SERVER_ID_NONCE_LEN, 19).
 
 %% QUIC-LB Configuration record
 %% Defines how the load balancer encodes server identity in CIDs

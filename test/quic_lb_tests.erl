@@ -134,6 +134,107 @@ config_creation_test_() ->
         end}
     ].
 
+%%====================================================================
+%% Length and range rules (draft-ietf-quic-load-balancers-22 3.1, 5.3)
+%%====================================================================
+
+lb_lengths(SIDLen, NonceLen) ->
+    quic_lb:new_config(#{server_id => binary:copy(<<7>>, SIDLen), nonce_len => NonceLen}).
+
+server_id_and_nonce_lengths_accepted_test_() ->
+    [
+        ?_assertMatch({ok, #lb_config{}}, lb_lengths(SIDLen, NonceLen))
+     || {SIDLen, NonceLen} <- [{1, 4}, {1, 18}, {15, 4}, {10, 9}, {3, 16}]
+    ].
+
+server_id_and_nonce_lengths_refused_test_() ->
+    [
+        ?_assertEqual({error, Reason}, lb_lengths(SIDLen, NonceLen))
+     || {SIDLen, NonceLen, Reason} <- [
+            {15, 5, {invalid_server_id_nonce_len, 15, 5}},
+            {10, 10, {invalid_server_id_nonce_len, 10, 10}},
+            {15, 18, {invalid_server_id_nonce_len, 15, 18}},
+            {0, 4, {invalid_server_id_len, 0}},
+            {16, 4, {invalid_server_id_len, 16}},
+            {1, 3, {invalid_nonce_len, 3}},
+            {1, 19, {invalid_nonce_len, 19}}
+        ]
+    ].
+
+non_integer_values_refused_test_() ->
+    SID = <<1, 2, 3, 4>>,
+    [
+        ?_assertEqual(
+            {error, {invalid_config_rotation, 1.5}},
+            quic_lb:new_config(#{server_id => SID, config_rotation => 1.5})
+        ),
+        ?_assertEqual(
+            {error, {invalid_nonce_len, 4.0}},
+            quic_lb:new_config(#{server_id => SID, nonce_len => 4.0})
+        ),
+        ?_assertEqual(
+            {error, {invalid_server_id, not_binary}},
+            quic_lb:new_config(#{server_id => [1, 2, 3, 4]})
+        ),
+        ?_assertEqual({error, {invalid_cid_len, 8.0}}, quic_lb:new_cid_config(#{cid_len => 8.0}))
+    ].
+
+%% new_cid_config/1 applies the same rules to an #lb_config{} built by hand.
+cid_config_validates_lb_record_test_() ->
+    SID = binary:copy(<<7>>, 15),
+    Long = #lb_config{server_id = SID, server_id_len = 15, nonce_len = 5},
+    [
+        ?_assertMatch(
+            {ok, #cid_config{cid_len = 20}},
+            quic_lb:new_cid_config(#{lb_config => Long#lb_config{nonce_len = 4}})
+        ),
+        ?_assertEqual(
+            {error, {invalid_server_id_nonce_len, 15, 5}},
+            quic_lb:new_cid_config(#{lb_config => Long})
+        ),
+        ?_assertEqual(
+            {error, {invalid_server_id_len, undefined}},
+            quic_lb:new_cid_config(#{lb_config => #lb_config{server_id = SID}})
+        ),
+        ?_assertEqual(
+            {error, {missing_or_invalid_key, encrypted}},
+            quic_lb:new_cid_config(#{
+                lb_config => Long#lb_config{nonce_len = 4, algorithm = encrypted}
+            })
+        ),
+        ?_assertEqual(
+            {error, {invalid_config_rotation, 7}},
+            quic_lb:new_cid_config(#{
+                lb_config => Long#lb_config{nonce_len = 4, config_rotation = 7}
+            })
+        )
+    ].
+
+listener_refuses_long_lb_record_test() ->
+    {Cert, Key} = quic_test_echo_server:cert_and_key(),
+    SID = binary:copy(<<7>>, 15),
+    LB = #lb_config{server_id = SID, server_id_len = 15, nonce_len = 5},
+    ?assertEqual(
+        {error, {invalid_lb_config, {invalid_server_id_nonce_len, 15, 5}}},
+        quic_listener:start(0, #{cert => Cert, key => Key, alpn => [<<"h3">>], lb_config => LB})
+    ).
+
+%% A CID decodes only with the configuration its first three bits name.
+decode_checks_config_rotation_test_() ->
+    SID = <<1, 2, 3, 4>>,
+    LB2 = make_lb_config(SID, plaintext, 2, 4),
+    LB3 = make_lb_config(SID, plaintext, 3, 4),
+    CID = quic_lb:generate_cid(make_cid_config(LB2)),
+    <<_, Rest/binary>> = CID,
+    [
+        ?_assertEqual({ok, SID}, quic_lb:decode_server_id(CID, LB2)),
+        ?_assertEqual({error, config_rotation_mismatch}, quic_lb:decode_server_id(CID, LB3)),
+        ?_assertEqual(
+            {error, config_rotation_mismatch},
+            quic_lb:decode_server_id(<<16#e8, Rest/binary>>, LB2)
+        )
+    ].
+
 cid_config_creation_test_() ->
     [
         {"Create CID config without LB", fun() ->

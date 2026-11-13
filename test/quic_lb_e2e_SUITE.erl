@@ -373,7 +373,7 @@ cid_routing_variable_dcid_len(_Config) ->
             ct:log("Testing DCID length ~p (nonce_len=~p)", [ExpectedLen, NonceLen]),
             ok = quic_listener:stop(Listener)
         end,
-        [4, 8, 12, 16, 18]
+        [4, 8, 12, 15]
     ).
 
 %%====================================================================
