@@ -41,7 +41,6 @@
     on_packets_lost/2,
     on_congestion_event/2,
     on_persistent_congestion/1,
-    detect_persistent_congestion/3,
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
@@ -87,7 +86,6 @@
 %% Default values
 -define(MAX_DATAGRAM_SIZE, 1200).
 -define(INITIAL_WINDOW, 38400).
--define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %% HyStart++ constants (RFC 9406)
 %% Minimum RTT samples before making slow start exit decision
@@ -726,23 +724,6 @@ on_spurious_congestion(#cubic_state{undo = {Cwnd, SSThresh, WMax, WLastMax}, cwn
 %%====================================================================
 %% Persistent Congestion
 %%====================================================================
-
-%% @doc Detect persistent congestion from lost packets.
--spec detect_persistent_congestion(
-    [{non_neg_integer(), non_neg_integer()}],
-    non_neg_integer(),
-    cc_state()
-) -> boolean().
-detect_persistent_congestion([], _PTO, _State) ->
-    false;
-detect_persistent_congestion([_], _PTO, _State) ->
-    false;
-detect_persistent_congestion(LostPackets, PTO, _State) ->
-    Times = [T || {_PN, T} <- LostPackets],
-    MinTime = lists:min(Times),
-    MaxTime = lists:max(Times),
-    CongestionPeriod = PTO * ?PERSISTENT_CONGESTION_THRESHOLD,
-    (MaxTime - MinTime) >= CongestionPeriod.
 
 %% @doc Reset to minimum window on persistent congestion.
 -spec on_persistent_congestion(cc_state()) -> cc_state().

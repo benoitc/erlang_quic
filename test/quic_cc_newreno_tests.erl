@@ -238,29 +238,6 @@ newreno_recovery_cwnd_reduction_test() ->
 %% Persistent Congestion Tests
 %%====================================================================
 
-newreno_detect_persistent_congestion_empty_test() ->
-    State = quic_cc_newreno:new(#{}),
-    ?assertNot(quic_cc_newreno:detect_persistent_congestion([], 100, State)).
-
-newreno_detect_persistent_congestion_single_packet_test() ->
-    State = quic_cc_newreno:new(#{}),
-    LostPackets = [{1, 1000}],
-    ?assertNot(quic_cc_newreno:detect_persistent_congestion(LostPackets, 100, State)).
-
-newreno_detect_persistent_congestion_below_threshold_test() ->
-    State = quic_cc_newreno:new(#{}),
-    PTO = 100,
-    %% Lost packets span 200ms, but threshold is PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1200}],
-    ?assertNot(quic_cc_newreno:detect_persistent_congestion(LostPackets, PTO, State)).
-
-newreno_detect_persistent_congestion_at_threshold_test() ->
-    State = quic_cc_newreno:new(#{}),
-    PTO = 100,
-    %% Lost packets span exactly PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1300}],
-    ?assert(quic_cc_newreno:detect_persistent_congestion(LostPackets, PTO, State)).
-
 newreno_persistent_congestion_test() ->
     State = quic_cc_newreno:new(#{initial_window => 65536}),
     InitialCwnd = quic_cc_newreno:cwnd(State),

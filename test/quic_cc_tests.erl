@@ -320,47 +320,6 @@ configured_cwnd_minimum_test() ->
 %% Persistent Congestion Tests (RFC 9002 Section 7.6)
 %%====================================================================
 
-detect_persistent_congestion_empty_test() ->
-    State = quic_cc:new(),
-    ?assertNot(quic_cc:detect_persistent_congestion([], 100, State)).
-
-detect_persistent_congestion_single_packet_test() ->
-    State = quic_cc:new(),
-    %% Single packet cannot establish a time span
-    LostPackets = [{1, 1000}],
-    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, 100, State)).
-
-detect_persistent_congestion_below_threshold_test() ->
-    State = quic_cc:new(),
-    % 100ms
-    PTO = 100,
-    %% Lost packets span 200ms, but threshold is PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1200}],
-    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
-detect_persistent_congestion_at_threshold_test() ->
-    State = quic_cc:new(),
-    % 100ms
-    PTO = 100,
-    %% Lost packets span exactly PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1300}],
-    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
-detect_persistent_congestion_above_threshold_test() ->
-    State = quic_cc:new(),
-    % 100ms
-    PTO = 100,
-    %% Lost packets span 500ms, threshold is PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {5, 1500}],
-    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
-detect_persistent_congestion_multiple_packets_test() ->
-    State = quic_cc:new(),
-    PTO = 100,
-    %% Multiple lost packets spanning > threshold
-    LostPackets = [{1, 1000}, {2, 1100}, {3, 1200}, {4, 1400}],
-    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
 on_persistent_congestion_resets_cwnd_test() ->
     State = quic_cc:new(),
     InitialCwnd = quic_cc:cwnd(State),

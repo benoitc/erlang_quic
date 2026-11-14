@@ -66,6 +66,7 @@
     reset_for_retry/2,
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
+    persistent_congestion/3,
     after_first_rtt_sample/2,
     on_pto_expired/1,
     keep_pto_backoff/2,
@@ -100,6 +101,7 @@
 % 1 millisecond
 -define(MAX_PTO_MS, 5000).
 -define(GRANULARITY, 1).
+-define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 % RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
 -define(DEFAULT_INITIAL_RTT, 100).
 
@@ -123,6 +125,8 @@
     sent_q = queue:new() :: queue:queue(#sent_packet{}),
     loss_time = undefined :: non_neg_integer() | undefined,
     largest_acked = undefined :: non_neg_integer() | undefined,
+    %% Send time of the newest packet acknowledged (RFC 9002 Section 7.6.2).
+    largest_acked_sent = undefined :: integer() | undefined,
 
     %% When the most recent ack-eliciting packet went out, which is what
     %% the PTO deadline is measured from, and how many are outstanding.
@@ -232,6 +236,10 @@ earlier_path_bytes(#loss_state{path_first_pn = FirstPN}, Packets) ->
     ]).
 
 clear_loss_time(#pn_loss{} = P) -> P#pn_loss{loss_time = undefined}.
+
+%% AckedList is newest first.
+newest_sent([], Old) -> Old;
+newest_sent([#sent_packet{time_sent = TS} | _], Old) -> newest(Old, TS).
 
 %% largest_acked only ever moves forward: a reordered ACK naming a
 %% smaller largest must not pull it back (RFC 9002 Appendix A.7).
@@ -493,6 +501,7 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
         PApp#pn_loss{
             sent_q = NewQ,
             largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
+            largest_acked_sent = newest_sent(AckedList, PApp#pn_loss.largest_acked_sent),
             ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
         },
         newly_acked(AckedList, Now, NewState1#loss_state{bytes_in_flight = NewInFlight})
@@ -864,7 +873,7 @@ discard_space(Space, #loss_state{bytes_in_flight = InFlight} = State) ->
     ]),
     Cleared = set_pn(
         Space,
-        #pn_loss{},
+        #pn_loss{largest_acked_sent = P#pn_loss.largest_acked_sent},
         State#loss_state{bytes_in_flight = max(0, InFlight - Bytes), pto_count = 0}
     ),
     {Cleared, Bytes}.
@@ -979,6 +988,80 @@ after_first_rtt_sample(#loss_state{first_rtt_sample = undefined}, _Packet) ->
     false;
 after_first_rtt_sample(#loss_state{first_rtt_sample = T}, #sent_packet{time_sent = Sent}) ->
     Sent > T.
+
+%% @doc Whether the packets just declared lost in Space establish
+%% persistent congestion (RFC 9002 Section 7.6.2). A packet number neither
+%% lost nor queued counts as acknowledged; another space blocks every
+%% packet sent before the newest one it acknowledged.
+-spec persistent_congestion(space(), [#sent_packet{}], loss_state()) -> boolean().
+persistent_congestion(_Space, _Lost, #loss_state{first_rtt_sample = undefined}) ->
+    false;
+persistent_congestion(Space, Lost, #loss_state{} = State) ->
+    Since = acked_elsewhere(Space, State),
+    Declared = lists:keysort(1, [
+        {PN, TS, run_end(Space, P, Since, State)}
+     || #sent_packet{pn = PN, time_sent = TS} = P <- Lost
+    ]),
+    Duration = persistent_congestion_pto(State) * ?PERSISTENT_CONGESTION_THRESHOLD,
+    case (spans([TS || {_, TS, true} <- Declared]) > Duration) of
+        false ->
+            false;
+        true ->
+            [{First, _, _} | _] = Declared,
+            {Last, _, _} = lists:last(Declared),
+            Kept = kept_between((pn(Space, State))#pn_loss.sent_q, First, Last, []),
+            in_one_run(lists:merge(Declared, Kept), undefined, undefined, Duration)
+    end.
+
+run_end(Space, #sent_packet{ack_eliciting = true, time_sent = TS} = P, Since, State) ->
+    after_first_rtt_sample(State, P) andalso (Since =:= undefined orelse TS > Since) andalso
+        not (Space =:= app andalso on_earlier_path(State, P));
+run_end(_Space, #sent_packet{}, _Since, _State) ->
+    false.
+
+%% Send time of the newest packet another space acknowledged.
+acked_elsewhere(Space, State) ->
+    lists:foldl(
+        fun(Other, Acc) ->
+            case (pn(Other, State))#pn_loss.largest_acked_sent of
+                undefined -> Acc;
+                TS when Acc =:= undefined -> TS;
+                TS -> max(TS, Acc)
+            end
+        end,
+        undefined,
+        [S || S <- [initial, handshake, app], S =/= Space]
+    ).
+
+spans([]) -> 0;
+spans(Times) -> lists:max(Times) - lists:min(Times).
+
+%% The queued packets numbered First to Last, oldest first, as run entries.
+kept_between(Q, First, Last, Acc) ->
+    case queue:out(Q) of
+        {{value, #sent_packet{pn = PN}}, _} when PN > Last ->
+            lists:reverse(Acc);
+        {{value, #sent_packet{pn = PN, time_sent = TS}}, Q1} when PN > First ->
+            kept_between(Q1, First, Last, [{PN, TS, false} | Acc]);
+        {{value, _}, Q1} ->
+            kept_between(Q1, First, Last, Acc);
+        {empty, _} ->
+            lists:reverse(Acc)
+    end.
+
+%% Walk {PN, TS, IsEnd} in packet number order; a gap starts a new run.
+in_one_run([], _Prev, _Start, _Duration) ->
+    false;
+in_one_run([{PN, _, _} | _] = Entries, Prev, _Start, Duration) when
+    Prev =/= undefined, PN =/= Prev + 1
+->
+    in_one_run(Entries, undefined, undefined, Duration);
+in_one_run([{PN, TS, true} | Rest], _Prev, undefined, Duration) ->
+    in_one_run(Rest, PN, TS, Duration);
+in_one_run([{_PN, TS, true} | _], _Prev, Start, Duration) when TS - Start > Duration ->
+    true;
+in_one_run([{PN, _, _} | Rest], _Prev, Start, Duration) ->
+    in_one_run(Rest, PN, Start, Duration).
 
 pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
     PTO = quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay,

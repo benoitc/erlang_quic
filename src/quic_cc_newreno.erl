@@ -42,7 +42,6 @@
     on_packets_lost/2,
     on_congestion_event/2,
     on_persistent_congestion/1,
-    detect_persistent_congestion/3,
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
@@ -75,7 +74,6 @@
 % Loss reduction factor: 0.7 like quic-go for less aggressive backoff
 % Standard NewReno uses 0.5, but 0.7 gives better throughput recovery
 -define(LOSS_REDUCTION_FACTOR, 0.7).
--define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %% HyStart++ constants (RFC 9406)
 %% Minimum RTT samples before making slow start exit decision
@@ -841,26 +839,6 @@ update_mtu(#cc_state{max_datagram_size = OldMDS, minimum_window = OldMinWin} = S
 %%====================================================================
 %% Persistent Congestion (RFC 9002 Section 7.6)
 %%====================================================================
-
-%% @doc Detect persistent congestion from lost packets.
-%% Returns true if lost packets span more than PTO * kPersistentCongestionThreshold.
-%% LostPackets is a list of {PacketNumber, TimeSent} tuples.
--spec detect_persistent_congestion(
-    [{non_neg_integer(), non_neg_integer()}],
-    non_neg_integer(),
-    cc_state()
-) -> boolean().
-detect_persistent_congestion([], _PTO, _State) ->
-    false;
-detect_persistent_congestion([_], _PTO, _State) ->
-    %% Need at least 2 packets to establish a time span
-    false;
-detect_persistent_congestion(LostPackets, PTO, _State) ->
-    Times = [T || {_PN, T} <- LostPackets],
-    MinTime = lists:min(Times),
-    MaxTime = lists:max(Times),
-    CongestionPeriod = PTO * ?PERSISTENT_CONGESTION_THRESHOLD,
-    (MaxTime - MinTime) >= CongestionPeriod.
 
 %% @doc Reset to minimum window on persistent congestion (RFC 9002 SS7.6.2).
 %% This is a severe response to prolonged packet loss.

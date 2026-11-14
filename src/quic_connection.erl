@@ -10211,7 +10211,7 @@ loss_space(_) -> app.
 cc_after_loss(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
     case lists:partition(fun is_pmtu_probe/1, Lost) of
         {[], _} ->
-            cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState);
+            loss_response(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState);
         {Probes, Rest} ->
             ProbeBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Probes]),
             Largest =
@@ -10220,10 +10220,10 @@ cc_after_loss(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
                     Times -> lists:max(Times)
                 end,
             CC = quic_cc:on_packets_discarded(CCState, ProbeBytes),
-            cc_after_loss(CC, max(0, LostBytes - ProbeBytes), Largest, Rest, LossState)
+            loss_response(app, CC, max(0, LostBytes - ProbeBytes), Largest, Rest, LossState)
     end;
-cc_after_loss(_Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
-    cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState).
+cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
+    loss_response(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState).
 
 %% In the application space only a PMTU probe carries PADDING.
 is_pmtu_probe(#sent_packet{frames = Frames}) ->
@@ -10232,14 +10232,15 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
 %% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
--spec cc_after_loss(
+-spec loss_response(
+    quic_loss:space(),
     quic_cc:cc_state(),
     non_neg_integer(),
     non_neg_integer() | undefined,
     [#sent_packet{}],
     quic_loss:loss_state()
 ) -> quic_cc:cc_state().
-cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
+loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
     LostPackets = [P || P <- LostPackets0, not quic_loss:on_earlier_path(LossState, P)],
@@ -10250,24 +10251,13 @@ cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) 
             {_, []} -> CC1;
             _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
         end,
-    check_persistent_congestion(LostPackets, LossState, CC2).
+    check_persistent_congestion(Space, LostPackets0, LossState, CC2).
 
-%% Check for persistent congestion (RFC 9002 Section 7.6)
-%% If lost packets span more than PTO * 3, reset to minimum window
-check_persistent_congestion([], _LossState, CCState) ->
-    CCState;
-check_persistent_congestion(LostPackets, LossState, CCState) ->
-    %% Extract packet number and time sent from lost packets
-    LostInfo = [
-        {P#sent_packet.pn, P#sent_packet.time_sent}
-     || P <- LostPackets, quic_loss:after_first_rtt_sample(LossState, P)
-    ],
-    PTO = quic_loss:persistent_congestion_pto(LossState),
-    case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
-        true ->
-            quic_cc:on_persistent_congestion(CCState);
-        false ->
-            CCState
+%% RFC 9002 Section 7.6.2: the window drops to its minimum.
+check_persistent_congestion(Space, LostPackets, LossState, CCState) ->
+    case quic_loss:persistent_congestion(Space, LostPackets, LossState) of
+        true -> quic_cc:on_persistent_congestion(CCState);
+        false -> CCState
     end.
 
 %% Generate a connection ID

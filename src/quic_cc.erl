@@ -47,7 +47,6 @@
     on_congestion_event/2,
     on_spurious_congestion/1,
     on_persistent_congestion/1,
-    detect_persistent_congestion/3,
     update_pacing_rate/2,
     update_mtu/2,
     on_app_limited/1,
@@ -106,11 +105,6 @@
 -callback on_congestion_event(State :: term(), SentTime :: non_neg_integer()) -> State :: term().
 -callback on_persistent_congestion(State :: term()) -> State :: term().
 -callback on_spurious_congestion(State :: term()) -> State :: term().
--callback detect_persistent_congestion(
-    LostInfo :: [{non_neg_integer(), non_neg_integer()}],
-    PTO :: non_neg_integer(),
-    State :: term()
-) -> boolean().
 
 %% Pacing
 -callback update_pacing_rate(State :: term(), SmoothedRTT :: non_neg_integer()) -> State :: term().
@@ -296,15 +290,6 @@ on_ack_frequency(W, _Request) ->
 -spec on_persistent_congestion(cc_state()) -> cc_state().
 on_persistent_congestion(#cc_wrapper{algorithm = Mod, state = State} = W) ->
     W#cc_wrapper{state = Mod:on_persistent_congestion(State)}.
-
-%% @doc Detect persistent congestion from lost packets.
--spec detect_persistent_congestion(
-    [{non_neg_integer(), non_neg_integer()}],
-    non_neg_integer(),
-    cc_state()
-) -> boolean().
-detect_persistent_congestion(LostInfo, PTO, #cc_wrapper{algorithm = Mod, state = State}) ->
-    Mod:detect_persistent_congestion(LostInfo, PTO, State).
 
 %% @doc Update pacing rate based on smoothed RTT.
 -spec update_pacing_rate(cc_state(), non_neg_integer()) -> cc_state().
