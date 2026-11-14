@@ -42,10 +42,10 @@
 -define(PROBE, quic_h3_manual_flow_probe).
 -define(WAIT_MS, 10000).
 -define(WT_STREAM, 16#41).
-%% What a stalled transfer may still deliver: the manual window, plus what
-%% the stream was granted before the handler claimed it. The transfer is
-%% many times larger, so a receiver that keeps granting blows through it.
--define(STALL_BOUND, (?WINDOW + 2 * ?MAX_WINDOW)).
+%% What a stalled transfer may still deliver: one manual window. The
+%% framing credited inside it moves the limit by less than half a window,
+%% so no more is granted. The transfer is many times larger.
+-define(STALL_BOUND, ?WINDOW).
 
 suite() ->
     [{timetrap, {seconds, 120}}].
@@ -185,7 +185,7 @@ an_unread_body_takes_one_window_of_a_large_connection(Config) ->
         Handler = claimed(),
         Stalled = stalled_at(),
         ?assert(Stalled > 0),
-        ?assert(Stalled =< ?WINDOW),
+        ?assert(Stalled =< ?STALL_BOUND),
         Handler ! consume_from_now_on,
         ?assertEqual(
             {200, integer_to_binary(erlang:phash2(body(?UPLOAD)))}, response(Conn, StreamId)
