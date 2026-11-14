@@ -88,7 +88,9 @@
     max_data_local/1,
     state_wanting_send_ready/2,
     send_ready_wanted/1,
-    handshake_with_timeouts/3
+    handshake_with_timeouts/3,
+    state_for_datagram/2,
+    app_packets_sent/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -1157,3 +1159,23 @@ state_wanting_send_ready(QueueBytes, Wanted) ->
 
 -spec send_ready_wanted(#state{}) -> boolean().
 send_ready_wanted(#state{send_ready_wanted = W}) -> W.
+
+%% A connected client that may send DATAGRAMs: the peer advertised
+%% PeerMax as its max_datagram_frame_size, the path is PMTU.
+-spec state_for_datagram(non_neg_integer(), #pmtu_state{} | undefined) -> #state{}.
+state_for_datagram(PeerMax, PMTU) ->
+    S = state_for_admission(0, 0, 1000000, 1000000),
+    S#state{
+        loss_state = quic_loss:on_handshake_confirmed(quic_loss:new()),
+        owner = self(),
+        transport_params = #{},
+        max_datagram_frame_size_remote = PeerMax,
+        pmtu_state = PMTU,
+        last_activity = erlang:monotonic_time(millisecond)
+    }.
+
+%% Size and frames of each 1-RTT packet sent, in packet-number order.
+-spec app_packets_sent(#state{}) -> [{non_neg_integer(), [term()]}].
+app_packets_sent(#state{loss_state = L}) ->
+    Sent = lists:sort(maps:to_list(quic_loss:sent_packets(app, L))),
+    [{Size, Frames} || {_PN, #sent_packet{size = Size, frames = Frames}} <- Sent].

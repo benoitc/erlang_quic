@@ -11828,15 +11828,14 @@ datagram_stats_snapshot(State) ->
 %% Send a datagram (RFC 9221)
 %% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
 %% and MUST NOT send frames larger than peer's advertised value.
-%% Additionally clamp to the current PMTU budget so we don't emit a UDP
-%% payload the network will black-hole.
+%% RFC 8899 Section 3: the packet must also fit the confirmed path MTU.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
 do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
-    PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
+    PmtuBudget = max(0, get_current_mtu(State) - datagram_overhead(State)),
     if
         DataSize > PeerMax ->
             {error, datagram_too_large};
@@ -17283,14 +17282,6 @@ get_current_mtu(#state{pmtu_state = undefined}) ->
     ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 get_current_mtu(#state{pmtu_state = PMTUState}) ->
     quic_pmtu:current_mtu(PMTUState).
-
-%% @doc Get the local max UDP payload size for transport parameters.
-%% Returns the configured max MTU from PMTU state, or the default if not configured.
--spec get_local_max_udp_payload_size(#state{}) -> pos_integer().
-get_local_max_udp_payload_size(#state{pmtu_state = undefined}) ->
-    ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
-get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
-    PMTUState#pmtu_state.max_mtu.
 
 %% The `max_udp_payload_size' transport parameter (RFC 9000 §18.2): the
 %% largest UDP payload we are willing to receive. Distinct from the PMTU
