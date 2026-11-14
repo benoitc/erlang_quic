@@ -46,6 +46,35 @@ budget_follows_the_confirmed_mtu_test() ->
     ?assertEqual(1200, quic_pmtu:current_mtu(Fallen)),
     assert_fits(1200 - ?HEADER - ?FRAME_2, sender(65535, Fallen)).
 
+%% With a 4-byte packet number the packet fills the MTU exactly. The
+%% length takes 2 bytes up to 16383 and 4 above.
+path_budget_counts_the_length_size_test_() ->
+    [
+        {"2-byte length", fun() -> assert_fills_the_mtu(1500, 1500 - ?HEADER - 1 - 2) end},
+        {"4-byte length", fun() -> assert_fills_the_mtu(20000, 20000 - ?HEADER - 1 - 4) end}
+    ].
+
+%% IMMEDIATE_ACK is left out of a packet it would push past the MTU,
+%% and still rides in one with room for it.
+immediate_ack_only_when_it_fits_test() ->
+    S0 = quic_connection_test_support:state_set(
+        quic_connection_test_support:state_set(
+            long_pn(sender(65535, undefined)), transport_params, #{min_ack_delay => 1000}
+        ),
+        hs_probe,
+        true
+    ),
+    Full = 1200 - ?HEADER - ?FRAME_2,
+    {ok, S1} = quic_connection:do_send_datagram(payload(Full), S0),
+    ?assertMatch(
+        [{1200, [{datagram_with_length, _}]}], quic_connection_test_support:app_packets_sent(S1)
+    ),
+    {ok, S2} = quic_connection:do_send_datagram(payload(Full - 1), S0),
+    ?assertMatch(
+        [{1200, [{datagram_with_length, _}, immediate_ack]}],
+        quic_connection_test_support:app_packets_sent(S2)
+    ).
+
 %%====================================================================
 %% Peer's max_datagram_frame_size (RFC 9221 Section 3)
 %%====================================================================
@@ -166,3 +195,22 @@ flush_datagrams() ->
         {quic, _, {datagram, _}} -> flush_datagrams()
     after 0 -> ok
     end.
+
+assert_fills_the_mtu(Mtu, Fit) ->
+    PMTU = #pmtu_state{
+        state = search_complete, current_mtu = Mtu, max_mtu = Mtu, search_min = Mtu
+    },
+    Window = quic_cc:new(#{algorithm => newreno, initial_window => 4 * Mtu}),
+    S0 = quic_connection_test_support:state_set(
+        long_pn(sender(65535, PMTU)), cc_state, Window
+    ),
+    {ok, S1} = quic_connection:do_send_datagram(payload(Fit), S0),
+    ?assertMatch([{Mtu, _}], quic_connection_test_support:app_packets_sent(S1)),
+    ?assertEqual(
+        {error, datagram_too_large_for_path},
+        quic_connection:do_send_datagram(payload(Fit + 1), S0)
+    ).
+
+%% The next packet number takes 4 bytes.
+long_pn(S) ->
+    quic_connection_test_support:state_set(S, app_next_pn, 16#1000000).

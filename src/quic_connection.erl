@@ -4215,7 +4215,8 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
         case
             AckEliciting andalso (not lists:member(immediate_ack, Frames0)) andalso
                 (probe_immediate_ack(State) orelse
-                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
+                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State)) andalso
+                immediate_ack_fits(Payload0, State)
         of
             true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
             false -> {Payload0, Frames0}
@@ -7285,6 +7286,11 @@ flight_end_immediate_ack(Bytes, More, CC, State) ->
     quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
         ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
             (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% The packet with IMMEDIATE_ACK added still fits the current MTU.
+immediate_ack_fits(Payload, #state{dcid = Dcid, pn_app = #pn_space{next_pn = PN}} = State) ->
+    Size = 1 + byte_size(Dcid) + quic_packet:pn_length(PN) + erlang:iolist_size(Payload) + 1 + 16,
+    Size =< get_current_mtu(State).
 
 %% Section 7: a PTO probe can carry IMMEDIATE_ACK, so its ACK is not
 %% held back by the peer's ACK delay.
@@ -11760,17 +11766,15 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
         ack_eliciting_since_recv = false
     }.
 
-%% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
-%%   1 byte flags
-%%   + DCID length (no length byte on short header)
-%%   + up to 4 bytes packet number
-%%   + 16 bytes AEAD tag
-%%   + 1 byte frame type (0x31 DATAGRAM_WITH_LEN)
-%%   + up to 2 bytes length varint (covers lengths up to 16383).
-%% That leaves `pmtu - datagram_overhead(State)` as the upper bound on
-%% the payload we can fit in a single UDP datagram without fragmenting.
-datagram_overhead(#state{dcid = Dcid}) ->
-    1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
+%% A 1-RTT packet around its frames: flags, DCID, the longest packet
+%% number and the AEAD tag.
+short_header_overhead(#state{dcid = Dcid}) ->
+    1 + byte_size(Dcid) + 4 + 16.
+
+%% Largest DATAGRAM payload whose packet fits the confirmed path MTU
+%% (RFC 8899 Section 3).
+datagram_path_budget(State) ->
+    datagram_frame_payload(get_current_mtu(State) - short_header_overhead(State)).
 
 %% Largest payload whose DATAGRAM frame, type and length included, fits
 %% in Max bytes (RFC 9221 Section 3); -1 when not even an empty one does.
@@ -11854,7 +11858,7 @@ do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State)
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
     PeerLimit = datagram_frame_payload(PeerMax),
-    PmtuBudget = max(0, get_current_mtu(State) - datagram_overhead(State)),
+    PmtuBudget = datagram_path_budget(State),
     if
         DataSize > PeerLimit ->
             {error, datagram_too_large};

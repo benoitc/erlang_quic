@@ -580,6 +580,8 @@ state_set(#state{} = S, socket, V) ->
     S#state{socket = V};
 state_set(#state{} = S, remote_addr, V) ->
     S#state{remote_addr = V};
+state_set(#state{} = S, app_next_pn, V) ->
+    S#state{pn_app = (S#state.pn_app)#pn_space{next_pn = V}};
 state_set(#state{hs = #hs{pn_initial = PN} = HS} = S, initial_ack_ranges, V) ->
     S#state{hs = HS#hs{pn_initial = PN#pn_space{ack_ranges = V}}}.
 
