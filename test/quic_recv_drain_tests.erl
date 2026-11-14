@@ -27,9 +27,14 @@ flush_mailbox() ->
     after 0 -> ok
     end.
 
+%% The messages these tests queue; a timer an earlier test armed on this
+%% process can fire in between.
 mailbox() ->
     {messages, Msgs} = process_info(self(), messages),
-    Msgs.
+    [M || M <- Msgs, queued_here(M)].
+
+queued_here({timeout, ref, _}) -> true;
+queued_here(M) -> lists:member(element(1, M), [quic_packet, quic_packets, udp, udp_batch, other]).
 
 drains_queued_server_datagrams_test() ->
     flush_mailbox(),
