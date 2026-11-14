@@ -202,40 +202,6 @@ bbr_persistent_congestion_test() ->
     ?assert(quic_cc_bbr:in_recovery(S1)).
 
 %%====================================================================
-%% Persistent Congestion Detection Tests
-%%====================================================================
-
-bbr_detect_persistent_congestion_empty_test() ->
-    State = quic_cc_bbr:new(#{}),
-    ?assertNot(quic_cc_bbr:detect_persistent_congestion([], 100, State)).
-
-bbr_detect_persistent_congestion_single_packet_test() ->
-    State = quic_cc_bbr:new(#{}),
-    LostPackets = [{1, 1000}],
-    ?assertNot(quic_cc_bbr:detect_persistent_congestion(LostPackets, 100, State)).
-
-bbr_detect_persistent_congestion_below_threshold_test() ->
-    State = quic_cc_bbr:new(#{}),
-    PTO = 100,
-    %% Lost packets span 200ms, but threshold is PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1200}],
-    ?assertNot(quic_cc_bbr:detect_persistent_congestion(LostPackets, PTO, State)).
-
-bbr_detect_persistent_congestion_at_threshold_test() ->
-    State = quic_cc_bbr:new(#{}),
-    PTO = 100,
-    %% Lost packets span exactly PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {2, 1300}],
-    ?assert(quic_cc_bbr:detect_persistent_congestion(LostPackets, PTO, State)).
-
-bbr_detect_persistent_congestion_above_threshold_test() ->
-    State = quic_cc_bbr:new(#{}),
-    PTO = 100,
-    %% Lost packets span 500ms, threshold is PTO * 3 = 300ms
-    LostPackets = [{1, 1000}, {5, 1500}],
-    ?assert(quic_cc_bbr:detect_persistent_congestion(LostPackets, PTO, State)).
-
-%%====================================================================
 %% Pacing Tests
 %%====================================================================
 

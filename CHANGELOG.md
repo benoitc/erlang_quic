@@ -63,8 +63,38 @@ All notable changes to this project will be documented in this file.
 - Breaking: `quic_cc:can_send_control/2` is removed, and
   `quic_cc:send_check` and `quic_cc:send_check_run` no longer take an
   urgency argument.
+- Breaking: `quic_cc:detect_persistent_congestion/3` and the matching
+  congestion control callback are removed. Persistent congestion is now
+  decided by the loss tracker, so a congestion control module no longer
+  implements it.
 
 ### Fixed
+- Packets that carry padding but nothing that needs an acknowledgment,
+  such as a client's Initial packets that only acknowledge, were not
+  counted as data in flight. They now count until they are acknowledged,
+  declared lost or discarded (RFC 9002 Section 2), and they still go out
+  when the congestion window is full, as acknowledgments do (Section 7).
+- The loss tracker and the congestion controller could disagree about
+  the data in flight: discarding the Initial or Handshake keys removed
+  bytes that had never been counted, which could take the count of
+  other packets with it, and a lost packet that only acknowledged was
+  taken off the congestion controller's count. Both now count the same
+  packets (RFC 9002 Section 2 and Appendix B.9).
+- A lost packet that only carried acknowledgments cut the congestion
+  window when the loss timer declared it lost. Only packets in flight
+  now cause a congestion response (RFC 9002 Appendix B.8).
+- Switching congestion control algorithm on a live connection started
+  the new controller with nothing in flight, so it could send past its
+  window until the earlier packets were acknowledged. It now starts
+  with the data already in flight.
+- Persistent congestion, which drops the congestion window to its
+  minimum, was declared from any two lost packets far enough apart: even
+  when a packet sent between them had been acknowledged, when one of
+  them only carried acknowledgments, or when they were exactly the
+  threshold apart. It now follows RFC 9002 Section 7.6.2: two lost
+  packets that needed an acknowledgment, sent after the first RTT
+  sample and more than the persistent congestion duration apart, with
+  no packet sent between them acknowledged in any packet number space.
 - A client that had sent 0-RTT data could not complete a connection
   when the server answered with a Retry: processing the Retry failed
   each time and the connection timed out. The 0-RTT data now goes out

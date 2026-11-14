@@ -70,6 +70,10 @@ path's congestion controller.
 
 ### Loss Detection
 - [x] Packet loss detection
+- [x] Bytes in flight count the packets that are ack-eliciting or carry PADDING
+  (Section 2), a client's padded ACK-only Initial included; the loss tracker
+  and the congestion controller count the same packets. Packets that are not
+  ack-eliciting are never held back by the congestion window (Section 7)
 - [x] Per-packet-number-space recovery (RFC 9002 Appendix A): each space keeps
   its own sent packets and loss state, while the RTT estimate, the probe
   backoff and bytes in flight stay connection-wide
@@ -101,9 +105,12 @@ than from its own timer.
 - [x] Slow start with improved exit detection
 - [x] Congestion avoidance
 - [x] Recovery on packet loss
-- [x] Persistent congestion detection, over the RFC 9002 Section 7.6.1 duration:
-  the PTO without its exponential backoff, times 3. Section 7.6.2's rule about
-  packets sent before the first RTT sample is not applied
+- [x] Persistent congestion detection (RFC 9002 Section 7.6.2): two lost
+  ack-eliciting packets sent after the first RTT sample, more than the Section
+  7.6.1 duration apart (the PTO without its exponential backoff, times 3), with
+  no packet sent between them acknowledged. Another packet number space is
+  known only by the newest packet it acknowledged, so its acknowledgments end
+  the period conservatively
 - [x] ECN support (ECN-CE triggers congestion response)
 - [x] Packet pacing (RFC 9002 Section 7.7) to prevent bursts
 - [x] RTT-based flow control auto-tuning
