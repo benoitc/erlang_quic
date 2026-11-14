@@ -3498,10 +3498,8 @@ send_new_session_ticket(
 %%====================================================================
 
 %% RFC 9002 Section 2: a packet is in flight when it is ack-eliciting or
-%% carries PADDING. ACK and CONNECTION_CLOSE are neither, so an ACK-only
-%% Initial is not in flight and must not arm a probe. The PADDING that
-%% brings an Initial to 1200 bytes does not count: an ACK-only packet
-%% is not acknowledged on its own, so its bytes would stay in flight.
+%% carries PADDING, the PADDING that brings an Initial to 1200 bytes
+%% included.
 -spec packet_flags([term()], boolean()) -> {boolean(), boolean()}.
 packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
@@ -3519,15 +3517,15 @@ packet_flags(Frames, Padded) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
-%% A packet that is not in flight is not congestion controlled
-%% (RFC 9002 Section 2), and holding one back is worse than pointless:
-%% an acknowledgement is what frees the window, so deferring it can stall
-%% the very handshake that would unblock the sender.
+%% A packet that is not ack-eliciting is not congestion controlled
+%% (RFC 9002 Section 7), padded or not, and holding one back is worse than
+%% pointless: an acknowledgement is what frees the window, so deferring it
+%% can stall the very handshake that would unblock the sender.
 admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
-admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
+admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
     {ok, State};
-admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
 admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
     case quic_cc:send_check(CCState, Size) of
@@ -3720,11 +3718,11 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    Padded = iolist_size(HPPayload) > iolist_size(Payload),
+    Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(initial, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3947,7 +3945,7 @@ send_handshake_packet(Payload, Frames, State) ->
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
     Datagram = long_datagram(handshake, Packet, false, State),
-    case gate(handshake, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(handshake, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3993,7 +3991,7 @@ send_app_packet_internal(Payload, Frames, State) ->
 
 %% RFC 9002 Section 7: an ack-eliciting packet goes out only if the window
 %% and the pacer have room for it, unless it is a PTO probe (Section 7.5).
-%% Packets that are not in flight are never held back.
+%% Packets that are not ack-eliciting are never held back.
 app_admit(Size, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> admit_in_flight(Size, State);
@@ -4252,6 +4250,10 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
 
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
+    %% RFC 9002 Section 2; a PMTU probe's PADDING shows in its frames.
+    InFlight =
+        AckEliciting orelse (iolist_size(PaddedPayload) > iolist_size(Payload)) orelse
+            lists:member(padding, Frames),
 
     %% Protect packet (encrypt + header protection in single call)
     #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
@@ -4282,10 +4284,10 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
 
     %% Track sent packet for loss detection and congestion control.
     NewLossState = quic_loss:on_packet_sent(
-        app, LossState, PN, PacketSize, AckEliciting, Frames, Now
+        app, LossState, PN, PacketSize, AckEliciting, InFlight, Frames, Now
     ),
     NewCCState =
-        case AckEliciting of
+        case InFlight of
             true -> quic_cc:on_packet_sent(CCState, PacketSize);
             false -> CCState
         end,
@@ -4617,14 +4619,14 @@ amp_account_recv(_Data, State) ->
 %% A refused probe is not queued: what it carries is still outstanding,
 %% so the next probe carries it again, and a queued copy per expiry is
 %% what filled the queue.
-gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
+gate(Space, AckEliciting, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
             {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
-            admit(Space, InFlight, Size, Payload, Frames, State)
+            admit(Space, AckEliciting, Size, Payload, Frames, State)
     end.
 
 %% RFC 9000 Section 8.1: until it has validated the peer address a
@@ -4694,7 +4696,7 @@ register_now({_Space, _PN, _Size, _Frames, _AckEliciting, false}, _Now, State) -
     State;
 register_now({Space, PN, Size, Frames, AckEliciting, true}, Now, State) ->
     LossState = quic_loss:on_packet_sent(
-        Space, State#state.loss_state, PN, Size, AckEliciting, Frames, Now
+        Space, State#state.loss_state, PN, Size, AckEliciting, true, Frames, Now
     ),
     State#state{
         loss_state = LossState,
@@ -6506,8 +6508,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             ),
             %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
             AckedBytes = maps:get(acked_bytes, AckMeta, 0),
-            LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
-            HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
+            LargestAckedSentTime = maps:get(largest_acked_sent_time, AckMeta, Now),
+            HasInFlight = maps:get(has_in_flight, AckMeta, false),
             LostBytes = maps:get(lost_bytes, AckMeta, 0),
             LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
@@ -6528,13 +6530,12 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             CCState4 = cc_after_loss(
                 Level, CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
-            %% Only ack-eliciting packets move the window: an ACK of
-            %% ACK-only packets has no send time to end recovery with.
+            %% Only in-flight packets move the window (RFC 9002 Appendix B.5).
             CCState5 = cc_after_ack(
                 CCState4,
                 AckedBytes,
                 LargestAckedSentTime,
-                HasAckEliciting,
+                HasInFlight,
                 AckedPackets,
                 Level,
                 NewLossState
@@ -10214,7 +10215,7 @@ cc_after_loss(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
         {Probes, Rest} ->
             ProbeBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Probes]),
             Largest =
-                case [TS || #sent_packet{ack_eliciting = true, time_sent = TS} <- Rest] of
+                case [TS || #sent_packet{in_flight = true, time_sent = TS} <- Rest] of
                     [] -> undefined;
                     Times -> lists:max(Times)
                 end,
