@@ -18,6 +18,7 @@ pmtu_test_() ->
         {"State creation", fun state_creation/0},
         {"Connection established", fun connection_established/0},
         {"Connection established disabled", fun connection_established_disabled/0},
+        {"Peer at the base MTU clamps the ceiling", fun connection_established_peer_at_base/0},
         {"Path change resets state", fun path_change_resets/0},
         {"Raise timer preserves MTU", fun raise_timer_preserves_mtu/0},
         {"Should probe logic", fun should_probe_logic/0},
@@ -81,6 +82,16 @@ connection_established_disabled() ->
     State1 = quic_pmtu:on_connection_established(1500, State0),
     ?assertEqual(disabled, quic_pmtu:get_state(State1)),
     ?assertNot(quic_pmtu:is_enabled(State1)).
+
+%% RFC 9000 Section 18.2: the peer's max_udp_payload_size bounds what
+%% is sent, so 1200 leaves no room to probe and caps the ceiling.
+connection_established_peer_at_base() ->
+    State1 = quic_pmtu:on_connection_established(1200, quic_pmtu:new(#{pmtu_max_mtu => 1500})),
+    ?assertEqual(disabled, quic_pmtu:get_state(State1)),
+    ?assertNot(quic_pmtu:should_probe(State1)),
+    ?assertEqual(1200, quic_pmtu:current_mtu(State1)),
+    ?assertEqual(1200, State1#pmtu_state.max_mtu),
+    ?assertEqual([1200, undefined, undefined], State1#pmtu_state.lost).
 
 path_change_resets() ->
     %% Start with search complete state
