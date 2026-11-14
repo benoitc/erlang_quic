@@ -85,6 +85,7 @@
     send_queue_full_refusals/1,
     state_for_manual_recv/2,
     state_for_peer_streams/2,
+    with_alpn_handler/2,
     manual_tracked/2,
     stream_recv/2,
     max_data_local/1,
@@ -1151,6 +1152,11 @@ state_for_peer_streams(Window, MaxWindow) ->
         max_streams_uni_local = 10,
         cfg = (S#state.cfg)#conn_cfg{max_stream_data_uni = Window, reset_stream_at_enabled = true}
     }.
+
+%% State with an alpn_handler, as a listener configures it.
+-spec with_alpn_handler(#state{}, fun()) -> #state{}.
+with_alpn_handler(#state{cfg = Cfg} = S, Fn) ->
+    S#state{cfg = Cfg#conn_cfg{alpn_handler = Fn}}.
 
 %% The stream counts as manual for connection credit.
 -spec manual_tracked(#state{}, non_neg_integer()) -> boolean().

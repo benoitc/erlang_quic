@@ -8843,7 +8843,7 @@ run_alpn_handler(undefined, State) ->
 run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
     try call_alpn_handler(Fn, ALPN, State) of
         {ok, Owner} when is_pid(Owner) ->
-            {ok, reown(State, Owner)};
+            {ok, held_by_handler(reown(State, Owner))};
         Other ->
             ?LOG_WARNING(
                 #{what => alpn_handler_rejected, alpn => ALPN, result => Other},
@@ -8863,6 +8863,15 @@ run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
                 ?QUIC_LOG_META
             ),
             {error, <<"alpn handler failed">>}
+    end.
+
+%% A hold the handler asked for (quic_h3:accept/2) is a cast to this very
+%% process, already in its mailbox: apply it before the 0-RTT packets of
+%% the same datagram open streams.
+held_by_handler(State) ->
+    receive
+        {'$gen_cast', hold_peer_bidi_streams} -> State#state{hold_peer_bidi = true}
+    after 0 -> State
     end.
 
 %% The 3-argument form also gets the current owner: the one a

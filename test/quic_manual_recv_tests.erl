@@ -149,6 +149,31 @@ opened_held(Frame) ->
     flush(),
     ?assertMatch(#{flow := manual, max := ?W}, ?S:stream_recv(S, ?PEER_BIDI)).
 
+%% quic_h3:accept/2 called from an alpn_handler runs in the connection
+%% process: its hold applies before the 0-RTT packets of the same datagram
+%% open streams, not after them.
+hold_asked_by_the_alpn_handler_applies_at_once_test() ->
+    Owner = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    Accept = fun(Conn, <<"h3">>) ->
+        ok = quic_connection:hold_peer_bidi_streams(Conn),
+        {ok, Owner}
+    end,
+    try
+        {ok, S0} = quic_connection:run_alpn_handler(<<"h3">>, ?S:with_alpn_handler(peer(), Accept)),
+        S = deliver_on(S0, ?PEER_BIDI, 0, 1000),
+        ?assertMatch(#{flow := manual, max := ?W}, ?S:stream_recv(S, ?PEER_BIDI))
+    after
+        Owner ! stop,
+        receive
+            {'$gen_cast', hold_peer_bidi_streams} -> ok
+        after 0 -> ok
+        end
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
