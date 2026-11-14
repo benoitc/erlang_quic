@@ -7137,8 +7137,20 @@ process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
 
-%% draft-ietf-quic-ack-frequency-14 Section 4: a Requested Max Ack Delay
-%% below our min_ack_delay or at 2^14 ms or more is a PROTOCOL_VIOLATION.
+%% draft-ietf-quic-ack-frequency-14 Section 4: a frame whose Sequence
+%% Number is not above the largest processed is ignored, fields and all.
+apply_ack_frequency(
+    Seq,
+    _Threshold,
+    _Delay,
+    _Reordering,
+    #state{
+        peer_ack_freq = #peer_ack_freq{seq = Last}
+    } = State
+) when Seq =< Last ->
+    State;
+%% Section 4: a Requested Max Ack Delay below our min_ack_delay or at
+%% 2^14 ms or more is a PROTOCOL_VIOLATION.
 apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
     Delay < ?MIN_ACK_DELAY_US orelse Delay >= ?MAX_REQUESTED_ACK_DELAY_US
 ->
@@ -7150,17 +7162,6 @@ apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
         <<"invalid Requested Max Ack Delay">>,
         State
     );
-%% Section 4: only a Sequence Number above the largest processed counts.
-apply_ack_frequency(
-    Seq,
-    _Threshold,
-    _Delay,
-    _Reordering,
-    #state{
-        peer_ack_freq = #peer_ack_freq{seq = Last}
-    } = State
-) when Seq =< Last ->
-    State;
 apply_ack_frequency(Seq, Threshold, DelayUs, Reordering, #state{ack_timer = Timer} = State) ->
     DelayMs = DelayUs div 1000,
     %% A timer armed for a longer delay is dropped; this ack-eliciting packet arms a new one.
