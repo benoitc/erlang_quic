@@ -138,6 +138,70 @@ late_ack_drops_the_held_handshake_packet_test() ->
     ?assertEqual(0, pending_hs_bytes(S2)).
 
 %%====================================================================
+%% Copies in flight
+%%====================================================================
+
+%% 1's data goes out again as 20, then 1 arrives late: 20 stops carrying
+%% it and stays in flight, so losing 20 resends nothing.
+late_ack_strips_the_copy_in_flight_test() ->
+    S0 = in_flight(#{0 => [data(0, 0, 100)], 1 => [data(0, 100, 100)]}),
+    S1 = ack(S0, [{4, 0}]),
+    #{?FLIGHT := #sent_packet{frames = [{stream, 0, 100, _, false}]} = Copy} = sent_app(S1),
+    InFlight = bytes_in_flight(S1),
+    S2 = ack(S1, late(1)),
+    ?assertEqual(Copy#sent_packet{frames = []}, maps:get(?FLIGHT, sent_app(S2))),
+    ?assertEqual(InFlight, bytes_in_flight(S2)),
+    %% 21..24 acknowledged: 20 is declared lost. The window opens and the
+    %% data still owed, 0's, goes out alone.
+    S3 = ack(pings(S2, 4), [{next_pn(S2) + 3, 3}]),
+    ?assertNot(maps:is_key(?FLIGHT, sent_app(S3))),
+    ?assertEqual([{0, 0, 100}], stream_frames_sent(next_pn(S2) + 4, S3)).
+
+%% The late acknowledgement and the loss of the copy, by time, in one ACK.
+late_ack_and_the_lost_copy_in_one_ack_test() ->
+    S0 = in_flight(#{0 => [data(0, 0, 100)], 1 => [data(0, 100, 100)]}),
+    S = ack(S0, [{4, 0}]),
+    #{?FLIGHT := #sent_packet{frames = [{stream, 0, 100, _, false}]}} = sent_app(S),
+    %% Past the time threshold of an RTT near 100 ms.
+    timer:sleep(300),
+    S1 = pings(S, 4),
+    %% 21..24 and 1: 20 is declared lost in the ACK that acknowledges 1.
+    S2 = ack(S1, [{next_pn(S1) - 1, 3}, {next_pn(S1) - 4 - 1 - 2, 0}]),
+    ?assertNot(maps:is_key(?FLIGHT, sent_app(S2))),
+    ?assertEqual([{0, 0, 100}], stream_frames_sent(next_pn(S1), S2)).
+
+%% The FIN's copy is in flight when the original arrives late: the send
+%% side is done without waiting for the copy.
+late_ack_of_a_fin_in_flight_completes_the_send_side_test() ->
+    Last = {stream, 0, 0, binary:copy(<<0>>, 100), true},
+    S0 = with_fin_sent(100, in_flight(#{0 => [Last]})),
+    S1 = ack(S0, [{4, 0}]),
+    ?assertMatch(#{?FLIGHT := #sent_packet{frames = [Last]}}, sent_app(S1)),
+    ?assertNot(send_done(S1)),
+    ?assert(send_done(ack(S1, late(0)))).
+
+%% With the stripped copy the oldest packet in flight, a probe is a PING.
+probe_after_a_late_ack_is_a_ping_test() ->
+    S0 = in_flight(#{1 => [data(0, 100, 100)]}),
+    S1 = ack(S0, [{4, 0}]),
+    ?assertMatch(#{?FLIGHT := #sent_packet{frames = [{stream, 0, 100, _, false}]}}, sent_app(S1)),
+    %% 1..19 acknowledged, 1 late: 20 is the oldest in flight.
+    S2 = ack(S1, [{19, 18}]),
+    ?assertMatch(
+        {ok, #sent_packet{pn = ?FLIGHT}}, quic_loss:oldest_unacked(app, S2#state.loss_state)
+    ),
+    S3 = quic_connection:handle_pto_timeout(S2#state{pto_space = app}),
+    ?assertEqual([[ping]], control_frames_sent(next_pn(S2), S3)).
+
+%% The same for CRYPTO in the Handshake space.
+late_ack_strips_the_handshake_copy_in_flight_test() ->
+    S0 = handshake_in_flight(#{0 => [crypto(0, 100)], 1 => [crypto(100, 100)]}),
+    S1 = ack(handshake, S0, [{4, 0}]),
+    #{?FLIGHT := #sent_packet{frames = [{crypto, 100, _}]} = Copy} = sent(handshake, S1),
+    S2 = ack(handshake, S1, late(1)),
+    ?assertEqual(Copy#sent_packet{frames = []}, maps:get(?FLIGHT, sent(handshake, S2))).
+
+%%====================================================================
 %% What a copy keeps
 %%====================================================================
 
@@ -205,6 +269,26 @@ ack(Level, State, Ranges) ->
 %% Acknowledge every packet sent so far, as the peer would.
 ack_all(#state{pn_app = #pn_space{next_pn = Next}} = S) ->
     ack(S, [{Next - 1, Next - 1}]).
+
+sent_app(State) ->
+    sent(app, State).
+
+sent(Space, #state{loss_state = L}) ->
+    quic_loss:sent_packets(Space, L).
+
+bytes_in_flight(#state{loss_state = L, cc_state = CC}) ->
+    {quic_loss:bytes_in_flight(L), quic_cc:bytes_in_flight(CC)}.
+
+%% N PING packets more, tracked but not charged to the window.
+pings(#state{loss_state = L0, pn_app = PN} = S, N) ->
+    Next = PN#pn_space.next_pn,
+    Now = erlang:monotonic_time(millisecond),
+    L = lists:foldl(
+        fun(P, Acc) -> quic_loss:on_packet_sent(app, Acc, P, 50, true, [ping], Now) end,
+        L0,
+        lists:seq(Next, Next + N - 1)
+    ),
+    S#state{loss_state = L, pn_app = PN#pn_space{next_pn = Next + N}}.
 
 queue_counters(#state{send_queue_bytes = Bytes, send_queue_count = Count}) ->
     {Bytes, Count}.

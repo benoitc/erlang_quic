@@ -523,6 +523,17 @@ discarded_space_forgets_its_lost_frames_test() ->
     {_, _, _, M3} = quic_loss:on_ack_received(handshake, Kept, {ack, 2, 0, 2, []}, Now),
     ?assertEqual([[stream_frame(1)], [stream_frame(2)]], late_acked(M3)).
 
+%% Rewriting the frames in flight leaves sizes, flags and bytes in flight.
+map_frames_keeps_the_accounting_test() ->
+    S1 = sent_frames(app, quic_loss:new(), lists:seq(0, 3)),
+    S2 = quic_loss:map_frames(app, fun(Fs) -> Fs -- [stream_frame(1)] end, S1),
+    Before = quic_loss:sent_packets(app, S1),
+    ?assertEqual(
+        Before#{1 := (maps:get(1, Before))#sent_packet{frames = [ping]}},
+        quic_loss:sent_packets(app, S2)
+    ),
+    ?assertEqual(quic_loss:bytes_in_flight(S1), quic_loss:bytes_in_flight(S2)).
+
 %% Packets numbered PNs, each carrying stream_frame(PN) and a PING.
 sent_frames(Space, State, PNs) ->
     sent_frames(Space, State, PNs, erlang:monotonic_time(millisecond)).

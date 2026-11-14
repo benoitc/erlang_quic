@@ -48,6 +48,7 @@
     %% Retransmission
     retransmittable_frames/1,
     stream_has_unacked_below/3,
+    map_frames/3,
 
     %% Loss detection
     detect_lost_packets/3,
@@ -1217,6 +1218,17 @@ ack_delay_to_ms(AckDelay, #loss_state{ack_delay_exponent = Exp}) ->
 -spec retransmittable_frames([term()]) -> [term()].
 retransmittable_frames(Frames) ->
     lists:filter(fun is_retransmittable/1, Frames).
+
+%% @doc Rewrite the frames of the packets in flight in Space. Sizes, flags
+%% and bytes in flight stay as they are.
+-spec map_frames(space(), fun(([term()]) -> [term()]), loss_state()) -> loss_state().
+map_frames(Space, Fun, #loss_state{} = State) ->
+    P = pn(Space, State),
+    Q = queue:from_list([
+        S#sent_packet{frames = Fun(Frames)}
+     || #sent_packet{frames = Frames} = S <- queue:to_list(P#pn_loss.sent_q)
+    ]),
+    set_pn(Space, P#pn_loss{sent_q = Q}, State).
 
 %% True if any in-flight sent packet carries STREAM data for StreamId that
 %% starts before ReliableSize. Data at/after ReliableSize is never retransmitted

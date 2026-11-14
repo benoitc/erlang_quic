@@ -7297,8 +7297,8 @@ peer_takes_ack_frequency(#state{transport_params = TP}) ->
 %% application space has streams, PMTU probes and a send queue, so the
 %% handshake spaces take the short path: replay what was lost, at their
 %% own encryption level.
-app_ack_tail(AckedPackets, LostPackets, LateAcked, State0) ->
-    State1 = drop_late_acked(app, LateAcked, State0),
+app_ack_tail(AckedPackets, LostPackets0, LateAcked, State0) ->
+    {LostPackets, State1} = drop_late_acked(app, LateAcked, LostPackets0, State0),
     %% Handle PMTU probe ACKs. Only walk the acked list when a
     %% probe is actually outstanding - the common bulk-ACK case
     %% has none and skips the per-packet fold.
@@ -7369,8 +7369,8 @@ app_ack_tail(AckedPackets, LostPackets, LateAcked, State0) ->
         _ -> flush_event(State8, rearm)
     end.
 
-handshake_ack_tail(Level, LostPackets, LateAcked, State0) ->
-    State1 = drop_late_acked(Level, LateAcked, State0),
+handshake_ack_tail(Level, LostPackets0, LateAcked, State0) ->
+    {LostPackets, State1} = drop_late_acked(Level, LateAcked, LostPackets0, State0),
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
     State3 = send_held(drain_pending_hs(note_handshake_ack(Level, State2))),
     flush_event(State3#state{pto_dirty = true}, event).
@@ -13736,13 +13736,21 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
     }.
 
 %% RFC 9000 Section 13.3: what a late ACK acknowledged is not sent again.
-drop_late_acked(_Space, [], State) ->
-    State;
-drop_late_acked(app, LateAcked, State) ->
+drop_late_acked(_Space, [], Lost, State) ->
+    {Lost, State};
+drop_late_acked(Space, LateAcked, Lost, #state{loss_state = LossState} = State) ->
     Index = acked_index(LateAcked),
+    Strip = fun(Frames) -> drop_acked(Frames, Index) end,
+    Stripped = State#state{loss_state = quic_loss:map_frames(Space, Strip, LossState)},
+    {
+        [P#sent_packet{frames = Strip(Frames)} || #sent_packet{frames = Frames} = P <- Lost],
+        drop_queued(Space, Index, Stripped)
+    }.
+
+drop_queued(app, Index, State) ->
     drop_acked_from_ctrl_queue(Index, drop_acked_from_send_queue(Index, State));
-drop_late_acked(Space, LateAcked, State) ->
-    drop_acked_from_pending_hs(Space, acked_index(LateAcked), State).
+drop_queued(Space, Index, State) ->
+    drop_acked_from_pending_hs(Space, Index, State).
 
 %% Acknowledged STREAM and CRYPTO ranges, merged, FINs and control frames.
 acked_index(FrameLists) ->
@@ -13782,7 +13790,20 @@ merge_ranges([]) ->
 
 %% Frames less what Index covers; an owed FIN stays on the piece ending at it.
 drop_acked(Frames, Index) ->
-    lists:flatmap(fun(Frame) -> drop_acked_frame(Frame, Index) end, Frames).
+    case lists:any(fun(Frame) -> touches(Frame, Index) end, Frames) of
+        true -> lists:flatmap(fun(Frame) -> drop_acked_frame(Frame, Index) end, Frames);
+        false -> Frames
+    end.
+
+%% Whether Index may cover part of Frame; the rest are left as they are.
+touches({stream, StreamId, _, _, _}, Index) ->
+    maps:is_key({stream, StreamId}, Index) orelse maps:is_key({fin, StreamId}, Index);
+touches({crypto, _, _}, Index) ->
+    maps:is_key(crypto, Index);
+touches(Frame, #{ctrl := Acked}) ->
+    lists:member(Frame, Acked);
+touches(_Frame, _Index) ->
+    false.
 
 drop_acked_frame({stream, StreamId, Offset, Data, Fin} = Frame, Index) ->
     End = Offset + iolist_size(Data),
