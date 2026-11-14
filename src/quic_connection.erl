@@ -15407,6 +15407,9 @@ probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
         true ->
             path_cid_for(Addr, false, State);
+        false when State#state.dcid =:= <<>> ->
+            %% A zero-length CID goes on every path (RFC 9000 Section 5.1.1).
+            {State, <<>>, undefined};
         false ->
             case bind_path_cid(Addr, State) of
                 {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
@@ -15806,11 +15809,12 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
 %% the peer kept its CID: the network moved it, and the current CID may
 %% stay (RFC 9000 Section 9.5). A client moving to the preferred address
 %% may keep its own address, so a change of the local socket alone is a
-%% new path too.
+%% new path too. A peer with a zero-length CID needs none: that CID goes
+%% on every path (Section 5.1.1).
 maybe_handle_path_change(Via, NewAddr, DataSize, State) ->
     Probed = lists:any(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State)),
     KeptCID = Via =:= current_via(State) andalso kept_its_cid(State),
-    case Probed orelse has_unused_cid(State) orelse KeptCID of
+    case Probed orelse has_unused_cid(State) orelse KeptCID orelse State#state.dcid =:= <<>> of
         true -> initiate_peer_path_validation(NewAddr, Via, false, DataSize, State);
         false -> State
     end.
