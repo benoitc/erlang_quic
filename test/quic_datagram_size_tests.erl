@@ -143,6 +143,27 @@ max_size_is_what_send_accepts_test_() ->
      || {Name, PeerMax, Want, AtMax, AboveMax} <- Cases
     ].
 
+%% Before the handshake completes, a client sending 0-RTT answers from the
+%% parameters remembered with the ticket (RFC 9221 Section 3), so HTTP/3
+%% can advertise its datagram setting in 0-RTT.
+queries_answer_during_the_handshake_test_() ->
+    TP = #{max_datagram_frame_size => 65535},
+    S = quic_connection_test_support:state_set(sender(65535, undefined), transport_params, TP),
+    From = {self(), make_ref()},
+    [
+        {atom_to_list(StateName), fun() ->
+            ?assertMatch(
+                {keep_state, _, [{reply, From, {ok, TP}}]},
+                quic_connection:StateName({call, From}, get_peer_transport_params, S)
+            ),
+            ?assertMatch(
+                {keep_state, _, [{reply, From, Max}]} when Max =:= 1200 - ?HEADER - ?FRAME_2,
+                quic_connection:StateName({call, From}, datagram_max_size, S)
+            )
+        end}
+     || StateName <- [idle, handshaking]
+    ].
+
 %%====================================================================
 %% Helpers
 %%====================================================================

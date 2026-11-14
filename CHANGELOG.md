@@ -76,6 +76,10 @@ All notable changes to this project will be documented in this file.
   that is gone now returns `{error, closed}`. The peer's own value is
   in `quic:get_peer_transport_params/1`. `quic_h3:max_datagram_size/2`
   follows it.
+- `quic:get_peer_transport_params/1` and `quic:datagram_max_size/1` also
+  answer before the handshake completes, from what is known of the peer
+  so far: for a client sending 0-RTT, the parameters remembered with the
+  session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
 
 ### Fixed
 - Datagrams were checked against the largest packet size path MTU

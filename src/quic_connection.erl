@@ -1595,6 +1595,12 @@ idle(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+idle({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+idle({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 idle(info, {path_validation_timeout, _}, _State) ->
@@ -1717,6 +1723,12 @@ handshaking(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+handshaking({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+handshaking({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 handshaking(info, {path_validation_timeout, _}, _State) ->

@@ -882,7 +882,9 @@ get_mtu(Conn) when is_pid(Conn) ->
 %% (e.g., checking for `reset_stream_at' transport parameter).
 %%
 %% Returns `{ok, TransportParams}' where TransportParams is a map of
-%% the peer's advertised transport parameters.
+%% the peer's advertised transport parameters. Before the handshake
+%% completes it holds what is known so far: for a client sending 0-RTT,
+%% the parameters remembered with the session ticket.
 -spec get_peer_transport_params(Conn) -> {ok, map()} | {error, term()} when
     Conn :: pid().
 get_peer_transport_params(Conn) when is_pid(Conn) ->
