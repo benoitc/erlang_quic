@@ -513,11 +513,11 @@ set_owner_sync(_Conn, _NewOwner) ->
 send_datagram(Conn, Data) ->
     call(Conn, {send_datagram, Data}).
 
-%% @doc Get maximum datagram payload size.
+%% @doc Largest datagram payload send_datagram/2 accepts now.
 %% Returns 0 if peer doesn't support datagrams.
--spec datagram_max_size(pid()) -> non_neg_integer().
+-spec datagram_max_size(pid()) -> non_neg_integer() | {error, term()}.
 datagram_max_size(Conn) ->
-    gen_statem:call(Conn, datagram_max_size).
+    call(Conn, datagram_max_size).
 
 -spec datagram_stats(pid()) ->
     #{
@@ -1595,6 +1595,12 @@ idle(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+idle({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+idle({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 idle(info, {path_validation_timeout, _}, _State) ->
@@ -1717,6 +1723,12 @@ handshaking(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+handshaking({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+handshaking({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 handshaking(info, {path_validation_timeout, _}, _State) ->
@@ -1813,8 +1825,8 @@ connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = Stat
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
-connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
-    {keep_state, State, [{reply, From, Size}]};
+connected({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 connected({call, From}, datagram_stats, State) ->
     {keep_state, State, [{reply, From, datagram_stats_snapshot(State)}]};
 connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
@@ -4215,7 +4227,8 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
         case
             AckEliciting andalso (not lists:member(immediate_ack, Frames0)) andalso
                 (probe_immediate_ack(State) orelse
-                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
+                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State)) andalso
+                immediate_ack_fits(Payload0, State)
         of
             true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
             false -> {Payload0, Frames0}
@@ -6310,9 +6323,25 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
             ),
             {ok, NewState, lists:reverse(Acc)};
         {Frame, Rest} ->
-            NewState = process_frame_track_probing(Level, Frame, State),
+            NewState =
+                case datagram_too_large(Level, Frame, byte_size(Data) - byte_size(Rest), State) of
+                    true -> send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+                    false -> process_frame_track_probing(Level, Frame, State)
+                end,
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% RFC 9221 Section 3: a DATAGRAM frame of Size bytes, type and length
+%% included, larger than the max_datagram_frame_size we sent.
+datagram_too_large(
+    Level, {Type, _}, Size, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}}
+) when
+    (Level =:= app orelse Level =:= zero_rtt) andalso
+        (Type =:= datagram orelse Type =:= datagram_with_length) andalso Max > 0
+->
+    Size > Max;
+datagram_too_large(_Level, _Frame, _Size, _State) ->
+    false.
 
 %% quic_frame:decode/1 raises on a frame cut short by the end of the
 %% packet.
@@ -7064,19 +7093,7 @@ process_frame(
     #state{cfg = #conn_cfg{max_datagram_frame_size_local = 0}} = State
 ) ->
     send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
-%% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving oversized DATAGRAM
-process_frame(
-    app, {datagram, Data}, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when
-    byte_size(Data) > Max
-->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
-process_frame(
-    app,
-    {datagram_with_length, Data},
-    #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when byte_size(Data) > Max ->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+%% A DATAGRAM larger than we advertised is refused as it is decoded.
 process_frame(app, {datagram, Data}, State) ->
     deliver_datagram(Data, State);
 process_frame(app, {datagram_with_length, Data}, State) ->
@@ -7281,6 +7298,11 @@ flight_end_immediate_ack(Bytes, More, CC, State) ->
     quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
         ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
             (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% The packet with IMMEDIATE_ACK added still fits the current MTU.
+immediate_ack_fits(Payload, #state{dcid = Dcid, pn_app = #pn_space{next_pn = PN}} = State) ->
+    Size = 1 + byte_size(Dcid) + quic_packet:pn_length(PN) + erlang:iolist_size(Payload) + 1 + 16,
+    Size =< get_current_mtu(State).
 
 %% Section 7: a PTO probe can carry IMMEDIATE_ACK, so its ACK is not
 %% held back by the peer's ACK delay.
@@ -11756,17 +11778,34 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
         ack_eliciting_since_recv = false
     }.
 
-%% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
-%%   1 byte flags
-%%   + DCID length (no length byte on short header)
-%%   + up to 4 bytes packet number
-%%   + 16 bytes AEAD tag
-%%   + 1 byte frame type (0x31 DATAGRAM_WITH_LEN)
-%%   + up to 2 bytes length varint (covers lengths up to 16383).
-%% That leaves `pmtu - datagram_overhead(State)` as the upper bound on
-%% the payload we can fit in a single UDP datagram without fragmenting.
-datagram_overhead(#state{dcid = Dcid}) ->
-    1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
+%% A 1-RTT packet around its frames: flags, DCID, the longest packet
+%% number and the AEAD tag.
+short_header_overhead(#state{dcid = Dcid}) ->
+    1 + byte_size(Dcid) + 4 + 16.
+
+%% Largest DATAGRAM payload whose packet fits the confirmed path MTU
+%% (RFC 8899 Section 3).
+datagram_path_budget(State) ->
+    datagram_frame_payload(get_current_mtu(State) - short_header_overhead(State)).
+
+%% Largest DATAGRAM payload sendable now, for both send_datagram and
+%% datagram_max_size; -1 when none fits.
+datagram_budget(#state{max_datagram_frame_size_remote = PeerMax} = State) ->
+    min(datagram_frame_payload(PeerMax), datagram_path_budget(State)).
+
+%% Largest payload whose DATAGRAM frame, type and length included, fits
+%% in Max bytes (RFC 9221 Section 3); -1 when not even an empty one does.
+datagram_frame_payload(Max) when Max < 2 ->
+    -1;
+datagram_frame_payload(Max) ->
+    datagram_frame_payload(Max, 1).
+
+datagram_frame_payload(Max, LenSize) ->
+    Payload = Max - 1 - LenSize,
+    case quic_varint:encode_len(Payload) =< LenSize of
+        true -> Payload;
+        false -> datagram_frame_payload(Max, LenSize * 2)
+    end.
 
 %% Deliver an inbound DATAGRAM to the owner, or drop it while the owner's
 %% mailbox holds more than max_owner_queue messages: DATAGRAMs are
@@ -11826,23 +11865,19 @@ datagram_stats_snapshot(State) ->
     }.
 
 %% Send a datagram (RFC 9221)
-%% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
-%% and MUST NOT send frames larger than peer's advertised value.
-%% Additionally clamp to the current PMTU budget so we don't emit a UDP
-%% payload the network will black-hole.
+%% RFC 9221 Section 3: MUST NOT send DATAGRAM frames until the peer advertised
+%% max_datagram_frame_size, nor frames (type, length and data) larger than it.
+%% RFC 8899 Section 3: the packet must also fit the confirmed path MTU.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
 do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
-    PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
+    Budget = datagram_budget(State),
+    PeerLimit = datagram_frame_payload(PeerMax),
     if
-        DataSize > PeerMax ->
-            {error, datagram_too_large};
-        DataSize > PmtuBudget ->
-            {error, datagram_too_large_for_path};
-        true ->
+        DataSize =< Budget ->
             Frame = {datagram_with_length, DataBin},
             Payload = quic_frame:encode(Frame),
             case app_admit(byte_size(Payload), [Frame], State) of
@@ -11853,7 +11888,11 @@ do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State)
                     %% Unreliable, so dropped rather than held (RFC 9221 Section 5).
                     bump(?C_DATAGRAM_SEND_DROPPED, 1, State1),
                     {error, congestion_limited, State1}
-            end
+            end;
+        DataSize > PeerLimit ->
+            {error, datagram_too_large};
+        true ->
+            {error, datagram_too_large_for_path}
     end.
 
 %% Send stream data in fragments, tracking how many bytes were actually sent
@@ -17283,14 +17322,6 @@ get_current_mtu(#state{pmtu_state = undefined}) ->
     ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 get_current_mtu(#state{pmtu_state = PMTUState}) ->
     quic_pmtu:current_mtu(PMTUState).
-
-%% @doc Get the local max UDP payload size for transport parameters.
-%% Returns the configured max MTU from PMTU state, or the default if not configured.
--spec get_local_max_udp_payload_size(#state{}) -> pos_integer().
-get_local_max_udp_payload_size(#state{pmtu_state = undefined}) ->
-    ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
-get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
-    PMTUState#pmtu_state.max_mtu.
 
 %% The `max_udp_payload_size' transport parameter (RFC 9000 §18.2): the
 %% largest UDP payload we are willing to receive. Distinct from the PMTU

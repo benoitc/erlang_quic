@@ -1230,8 +1230,10 @@ live_event(
                 0;
             true ->
                 case quic:datagram_max_size(QuicConn) of
-                    0 -> 0;
-                    Max -> max(0, Max - byte_size(quic_varint:encode(StreamId bsr 2)))
+                    Max when is_integer(Max) ->
+                        max(0, Max - byte_size(quic_varint:encode(StreamId bsr 2)));
+                    {error, _} ->
+                        0
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
@@ -1496,7 +1498,10 @@ send_settings(
     %% negotiated a non-zero max_datagram_frame_size. Advertising the
     %% setting without QUIC datagrams is an H3_SETTINGS_ERROR per spec.
     Settings =
-        case H3DatagramEnabled andalso quic:datagram_max_size(QuicConn) > 0 of
+        case
+            H3DatagramEnabled andalso
+                peer_supports_datagrams(quic:get_peer_transport_params(QuicConn))
+        of
             true -> Settings0#{h3_datagram => 1};
             false -> Settings0
         end,
@@ -5448,17 +5453,28 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
 %% RFC 9297 §2.1: peer SETTINGS_H3_DATAGRAM = 1 requires non-zero
 %% max_datagram_frame_size on the QUIC connection. Return `true' when
 %% the precondition holds, otherwise raise H3_SETTINGS_ERROR. Takes
-%% the QUIC-level max datagram size directly so the check can be
-%% unit-tested without a live connection.
-validate_peer_h3_datagram_with(0) ->
-    throw(
-        {connection_error, ?H3_SETTINGS_ERROR, <<"h3_datagram without max_datagram_frame_size">>}
-    );
-validate_peer_h3_datagram_with(_) ->
-    true.
+%% the peer's QUIC transport parameters, as quic:get_peer_transport_params/1
+%% returns them, so the check can be unit-tested without a live
+%% connection. Without them, datagrams stay off.
+validate_peer_h3_datagram_with({error, _}) ->
+    false;
+validate_peer_h3_datagram_with(PeerParams) ->
+    case peer_supports_datagrams(PeerParams) of
+        true ->
+            true;
+        false ->
+            throw(
+                {connection_error, ?H3_SETTINGS_ERROR,
+                    <<"h3_datagram without max_datagram_frame_size">>}
+            )
+    end.
 
 validate_peer_h3_datagram(#state{quic_conn = QuicConn}) ->
-    validate_peer_h3_datagram_with(quic:datagram_max_size(QuicConn)).
+    validate_peer_h3_datagram_with(quic:get_peer_transport_params(QuicConn)).
+
+%% RFC 9221 Section 3: the peer advertised a non-zero max_datagram_frame_size.
+peer_supports_datagrams({ok, #{max_datagram_frame_size := Max}}) -> Max > 0;
+peer_supports_datagrams(_) -> false.
 
 %% RFC 9297 §2.1 inbound datagram. Peel the quarter-stream-id varint
 %% and deliver the payload tagged with the full stream id to the owner.

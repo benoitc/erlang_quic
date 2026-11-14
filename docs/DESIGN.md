@@ -478,11 +478,12 @@ Datagram support is negotiated via the `max_datagram_frame_size` transport param
 | Value | Meaning |
 |-------|---------|
 | 0 or absent | Datagrams not supported (default) |
-| 1-65535 | Maximum datagram payload size accepted |
+| 1-65535 | Maximum DATAGRAM frame size accepted, frame type and length included |
 
-Both endpoints must advertise support for datagrams to work. The effective
-maximum size is the minimum of what the peer advertises and what fits in
-a QUIC packet (path MTU minus overhead).
+Each direction is negotiated on its own: an endpoint sends datagrams only
+when its peer advertised a non-zero value. The largest payload that can be
+sent is the smaller of the peer's value less the frame type and length, and
+what fits in one packet at the confirmed path MTU (RFC 8899 Section 3).
 
 ### Configuration
 
@@ -503,14 +504,15 @@ quic:start_server(my_server, Port, #{
 ### API
 
 ```erlang
-%% Check if datagrams are supported and get max size
+%% Largest payload send_datagram/2 accepts now
 MaxSize = quic:datagram_max_size(ConnRef).
-%% Returns 0 if datagrams not supported, otherwise peer's max size
+%% Returns 0 if datagrams not supported; grows with the path MTU
 
 %% Send a datagram (unreliable)
 ok = quic:send_datagram(ConnRef, Data).
 %% Returns {error, datagrams_not_supported} if peer didn't advertise
-%% Returns {error, datagram_too_large} if Data exceeds peer's limit
+%% Returns {error, datagram_too_large} if the frame exceeds peer's limit
+%% Returns {error, datagram_too_large_for_path} if the packet exceeds the path MTU
 %% Returns {error, congestion_limited} if cwnd is full (datagram dropped)
 
 %% Receive datagrams (owner process)
@@ -524,14 +526,15 @@ end.
 | Error | Cause |
 |-------|-------|
 | `{error, datagrams_not_supported}` | Peer didn't advertise `max_datagram_frame_size` |
-| `{error, datagram_too_large}` | Data exceeds peer's advertised limit |
+| `{error, datagram_too_large}` | The frame, type and length included, exceeds the peer's advertised limit |
+| `{error, datagram_too_large_for_path}` | The packet would exceed the confirmed path MTU; may fit once PMTU discovery raises it |
 | `{error, congestion_limited}` | Congestion window full (datagram dropped) |
 
 ### Protocol Violations
 
 Per RFC 9221, the following result in `PROTOCOL_VIOLATION` connection close:
 - Receiving a DATAGRAM frame when we didn't advertise support
-- Receiving a DATAGRAM frame larger than our advertised limit
+- Receiving a DATAGRAM frame, type and length included, larger than our advertised limit
 
 ## Active Migration
 

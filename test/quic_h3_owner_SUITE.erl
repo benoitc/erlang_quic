@@ -141,6 +141,17 @@ custom_owner_receives_datagram(Config) ->
             ct:fail(datagram_not_received_by_explicit_owner)
         end,
 
+        %% The largest payload reported fits one packet on the path.
+        Max = quic_h3:max_datagram_size(Conn, StreamId),
+        ?assert(Max > 0 andalso Max < 1500),
+        Full = crypto:strong_rand_bytes(Max),
+        ok = quic_h3:send_datagram(Conn, StreamId, Full),
+        receive
+            {quic_h3, _, {datagram, StreamId, Full}} -> ok
+        after 3000 ->
+            ct:fail(full_size_datagram_not_received)
+        end,
+
         quic_h3:close(Conn)
     after
         try

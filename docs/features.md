@@ -247,13 +247,13 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram
-- `quic:datagram_max_size/1` - Get max datagram size (0 if unsupported)
+- `quic:datagram_max_size/1` - Largest payload `send_datagram/2` accepts now, at the confirmed path MTU (0 if unsupported)
 - `quic:datagram_stats/1` - Delivered / dropped / sent counters (backpressure); DATAGRAMs that arrive while the owner is behind are dropped
 
 ### HTTP Datagrams (RFC 9297)
 - `quic_h3:send_datagram/3` - Send an HTTP datagram bound to a request stream
 - `quic_h3:h3_datagrams_enabled/1` - Whether both sides negotiated support
-- `quic_h3:max_datagram_size/2` - Max payload per datagram for a given stream
+- `quic_h3:max_datagram_size/2` - Largest payload per datagram for a given stream that can be sent now
 - Owner event: `{quic_h3, Conn, {datagram, StreamId, Payload}}`
 - Set `h3_datagram_enabled => true` on `connect/3` / `start_server/3` to enable.
   CONNECT-UDP (RFC 9298) builds on this in a separate library.

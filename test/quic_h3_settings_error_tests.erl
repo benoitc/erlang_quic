@@ -23,7 +23,7 @@ setup() ->
     meck:expect(quic, safe_close, fun(_) -> ok end),
     meck:expect(quic, safe_close, fun(_, _, _) -> ok end),
     %% Peer never advertised QUIC max_datagram_frame_size.
-    meck:expect(quic, datagram_max_size, fun(_) -> 0 end),
+    meck:expect(quic, get_peer_transport_params, fun(_) -> {ok, #{}} end),
     meck:expect(quic, has_early_keys, fun(_) -> true end),
     meck:expect(quic, early_data_accepted, fun(_) -> unknown end),
     UniCounter = counters:new(1, []),

@@ -966,8 +966,9 @@ send_datagram(Conn, StreamId, Data) ->
 h3_datagrams_enabled(Conn) ->
     quic_h3_connection:h3_datagrams_enabled(Conn).
 
-%% @doc Max payload we can fit in one H3 DATAGRAM for the given stream.
-%% Returns 0 if RFC 9297 isn't live or the peer advertised 0 for
+%% @doc Largest payload one H3 DATAGRAM for the given stream can carry
+%% now: `quic:datagram_max_size/1' less the quarter stream ID. Returns 0
+%% if RFC 9297 isn't live or the peer advertised 0 for
 %% `max_datagram_frame_size'.
 -spec max_datagram_size(conn(), stream_id()) -> non_neg_integer().
 max_datagram_size(Conn, StreamId) ->
