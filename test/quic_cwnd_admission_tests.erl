@@ -272,8 +272,8 @@ chunk_run_stays_within_cwnd(Pacing) ->
 %%====================================================================
 
 %% The probe goes out past the window, is charged, and carries the held
-%% control frames beside the oldest unacknowledged data (RFC 9002
-%% Sections 6.2.4 and 7.5).
+%% control frames (RFC 9002 Sections 6.2.4 and 7.5); the oldest packet's
+%% PING needs no repair (RFC 9000 Section 13.3).
 probe_carries_held_control_frames_test() ->
     S0 = in_flight(?FLIGHT),
     Token = binary:copy(<<"t">>, 16),
@@ -282,7 +282,7 @@ probe_carries_held_control_frames_test() ->
     S1 = quic_connection:send_frame(F2, quic_connection:send_frame(F1, S0)),
     S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
     ?assertEqual([], held(S2)),
-    ?assertEqual([[ping, F1, F2]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]),
+    ?assertEqual([[F1, F2]], [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)]),
     ?assert(quic_cc:bytes_in_flight(cc(S2)) > quic_cc:cwnd(cc(S2))).
 
 %% Held frames that do not fit the probe stay held, in order.
@@ -291,7 +291,7 @@ probe_leaves_what_does_not_fit_held_test() ->
     Frames = [{new_token, binary:copy(<<N>>, 400)} || N <- lists:seq(1, 4)],
     S1 = lists:foldl(fun quic_connection:send_frame/2, S0, Frames),
     S2 = quic_connection:handle_pto_timeout(S1#state{pto_space = app}),
-    [[ping | Sent]] = [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)],
+    [Sent] = [strip_immediate_ack(Fs) || Fs <- sent_frames(S2)],
     ?assertNotEqual([], Sent),
     ?assertNotEqual([], held(S2)),
     ?assertEqual(Frames, Sent ++ held(S2)).
@@ -384,6 +384,9 @@ app_state() ->
         max_data_local = 1000000,
         max_streams_bidi_local = 100,
         max_streams_uni_local = 100,
+        max_streams_bidi_remote = 10,
+        %% Sequence 1 issued, for the NEW_CONNECTION_ID frames sent below.
+        cid_pool_state = element(1, quic_cid:issue(quic_cid:new(<<"own-cid0">>, 2), 1, undefined)),
         last_activity = erlang:monotonic_time(millisecond)
     }.
 
@@ -466,13 +469,13 @@ control_frames() ->
         {max_data, S#state.max_data_local},
         {max_stream_data, 0, 1000000},
         {max_streams, bidi, S#state.max_streams_bidi_local},
-        {data_blocked, 1000},
-        {stream_data_blocked, 0, 1000},
-        {streams_blocked, bidi, 10},
+        {data_blocked, S#state.max_data_remote},
+        {stream_data_blocked, 0, 1000000},
+        {streams_blocked, bidi, S#state.max_streams_bidi_remote},
         {new_connection_id, 1, 0, <<"cid-0001">>, Token},
         {retire_connection_id, 0},
         {reset_stream, 0, 0, 0},
-        {reset_stream_at, 0, 0, 10, 5},
+        {reset_stream_at, 4, 0, 10, 5},
         {stop_sending, 0, 0},
         handshake_done,
         {new_token, Token},

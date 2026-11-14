@@ -320,9 +320,9 @@ retransmittable_filters_ack_variants_test() ->
     ?assertEqual([{stream, 0, 0, <<"data">>, false}], Result).
 
 retransmittable_filters_connection_close_test() ->
-    Frames = [{connection_close, transport, 0, undefined, <<>>}, ping],
+    Frames = [{connection_close, transport, 0, undefined, <<>>}, {max_data, 100}],
     Result = quic_loss:retransmittable_frames(Frames),
-    ?assertEqual([ping], Result).
+    ?assertEqual([{max_data, 100}], Result).
 
 retransmittable_keeps_stream_test() ->
     Frames = [{stream, 0, 100, <<"test data">>, true}],
@@ -334,10 +334,9 @@ retransmittable_keeps_crypto_test() ->
     Result = quic_loss:retransmittable_frames(Frames),
     ?assertEqual(Frames, Result).
 
-retransmittable_keeps_ping_test() ->
-    Frames = [ping],
-    Result = quic_loss:retransmittable_frames(Frames),
-    ?assertEqual([ping], Result).
+%% RFC 9000 Section 13.3: a lost PING needs no repair.
+retransmittable_drops_ping_test() ->
+    ?assertEqual([], quic_loss:retransmittable_frames([ping])).
 
 retransmittable_keeps_max_data_test() ->
     Frames = [{max_data, 1000000}],
@@ -364,8 +363,7 @@ retransmittable_mixed_test() ->
     Result = quic_loss:retransmittable_frames(Frames),
     Expected = [
         {stream, 0, 0, <<"data1">>, false},
-        {crypto, 0, <<"tls data">>},
-        ping
+        {crypto, 0, <<"tls data">>}
     ],
     ?assertEqual(Expected, Result).
 
@@ -381,10 +379,10 @@ retransmittable_filters_datagram_test() ->
 retransmittable_filters_datagram_with_length_test() ->
     Frames = [
         {datagram_with_length, <<"unreliable data">>},
-        ping
+        {max_data, 100}
     ],
     Result = quic_loss:retransmittable_frames(Frames),
-    ?assertEqual([ping], Result).
+    ?assertEqual([{max_data, 100}], Result).
 
 retransmittable_filters_all_datagrams_test() ->
     Frames = [

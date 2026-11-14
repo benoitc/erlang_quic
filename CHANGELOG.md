@@ -127,6 +127,37 @@ All notable changes to this project will be documented in this file.
   Appendix B.7). This changes NewReno and CUBIC when the peer reports
   ECN. A window cut by a CE mark is no longer undone when losses from
   the same episode later prove spurious.
+- A lost PING was sent again, although it carries nothing to repair
+  (RFC 9000 Section 13.3). It no longer is; the probe timeout still
+  sends a PING when nothing else is outstanding, so keep-alive and
+  liveness checks work as before.
+- A lost DATA_BLOCKED, STREAM_DATA_BLOCKED or STREAMS_BLOCKED was sent
+  again with its old limit even after the peer had raised that limit,
+  or the stream had been reset. It is now sent again only while the
+  connection or stream is still blocked at that limit (RFC 9000
+  Section 13.3).
+- A lost STOP_SENDING was sent again after the stream had received all
+  its data or the peer had reset it. It is now sent again only while
+  the receive side of the stream is still open (RFC 9000 Section 13.3).
+- A lost RESET_STREAM_AT was sent again even after a later reset of
+  the same stream had lowered its reliable size, so the peer could see
+  the reliable size go back up, which the draft forbids. Only the
+  reset carrying the current reliable size is sent again now
+  (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
+- A lost NEW_CONNECTION_ID was sent again even after the peer had
+  retired that connection ID, offering it a connection ID it had
+  already given up. A connection ID the peer has retired is no longer
+  sent again (RFC 9000 Section 13.3).
+- A PATH_RESPONSE sent as an ordinary frame was sent again when its
+  packet was lost, and a lost PATH_CHALLENGE would have been repeated
+  with the same data. A PATH_RESPONSE is now sent once and a
+  PATH_CHALLENGE is never repeated; the peer's next challenge gets its
+  own response (RFC 9000 Sections 8.2.2 and 13.3).
+- A path MTU probe was not counted as data in flight, so it went out
+  whatever the congestion window, and one declared lost by the loss
+  timer cut the window. Probes now count as in flight and wait for the
+  congestion window like other packets, and losing one never lowers the
+  sending rate (RFC 9000 Section 14.4, RFC 9002 Section 2).
 
 ## [2.7.0] - 2026-11-13
 

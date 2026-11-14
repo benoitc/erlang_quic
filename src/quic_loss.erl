@@ -644,9 +644,7 @@ detect_lost_q(
                     false -> LostBytes
                 end,
             %% Only ack-eliciting losses drive the congestion event
-            %% (largest_lost_sent_time feeds on_congestion_event). A lost
-            %% non-ack-eliciting packet, a PMTU probe in particular, is
-            %% not a congestion signal (RFC 9000 §14.4).
+            %% (largest_lost_sent_time feeds on_congestion_event).
             NewLL =
                 case AE of
                     false ->
@@ -1117,8 +1115,8 @@ ack_delay_to_ms(AckDelay, #loss_state{ack_delay_exponent = Exp}) ->
 %% Retransmission Helpers
 %%====================================================================
 
-%% @doc Filter frames to get only retransmittable ones.
-%% Per RFC 9002, PADDING, ACK, and CONNECTION_CLOSE frames are not retransmitted.
+%% @doc The frames of a lost packet whose information is sent again
+%% (RFC 9000 Section 13.3).
 -spec retransmittable_frames([term()]) -> [term()].
 retransmittable_frames(Frames) ->
     lists:filter(fun is_retransmittable/1, Frames).
@@ -1146,6 +1144,8 @@ stream_has_unacked_below(#loss_state{} = State, StreamId, ReliableSize) ->
     ).
 
 %% Check if a frame is retransmittable
+%% PING and PADDING carry no information to repair (RFC 9000 Section 13.3).
+is_retransmittable(ping) -> false;
 is_retransmittable(padding) -> false;
 is_retransmittable({padding, _}) -> false;
 is_retransmittable({ack, _, _, _}) -> false;
@@ -1155,6 +1155,10 @@ is_retransmittable({connection_close, _, _, _, _}) -> false;
 %% DATAGRAM frames (RFC 9221) are unreliable and never retransmitted
 is_retransmittable({datagram, _}) -> false;
 is_retransmittable({datagram_with_length, _}) -> false;
+%% A PATH_RESPONSE is sent once and a PATH_CHALLENGE never repeats its data
+%% (RFC 9000 Sections 8.2.2 and 13.3).
+is_retransmittable({path_challenge, _}) -> false;
+is_retransmittable({path_response, _}) -> false;
 %% IMMEDIATE_ACK is not retransmitted (draft-ietf-quic-ack-frequency-14 Section 5)
 is_retransmittable(immediate_ack) -> false;
 is_retransmittable(_) -> true.

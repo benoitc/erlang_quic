@@ -1,90 +1,89 @@
 %%% -*- erlang -*-
 %%%
-%%% PMTU probes must not surface as connection loss (RFC 8899 §3,
-%%% RFC 9000 §14.4).
+%%% A PMTU probe is ack-eliciting and in flight (RFC 9000 Section 14.4,
+%%% RFC 9002 Section 2): it counts in bytes_in_flight and waits for the
+%%% congestion window like any other packet. Losing one is the expected
+%%% outcome of probing past the path MTU, so it leaves the flight without
+%%% a congestion response (RFC 9000 Section 14.4, RFC 8899 Section 3).
 %%%
-%%% A probe sent past the path MTU is lost by design: its fate belongs
-%%% to the PMTUD state machine alone. The connection sends probes
-%%% tracked as non-ack-eliciting: they stay in the sent queue, which is
-%%% what the PMTU ack/lost hooks fold over, but contribute nothing to
-%%% bytes_in_flight, acked_bytes, lost_bytes, or the congestion-event
-%%% timestamp.
-%%%
-%%% Before this held, a single lost 600-second raise probe kept
-%%% bytes_in_flight above zero with no possible progress and the
-%%% disconnect timeout declared the peer dead: every long-lived
-%%% connection on an MTU-limited path died on its first periodic
-%%% re-probe, both ends at once. The end-to-end consequence is covered
-%%% by quic_pmtu_raise_probe_SUITE.
+%%% A lost probe must not let a disconnect timeout declare a healthy idle
+%%% peer dead; quic_pmtu_raise_probe_SUITE covers that end to end.
 
 -module(quic_pmtu_probe_loss_tests).
 
 -include_lib("eunit/include/eunit.hrl").
--include("quic.hrl").
+-include_lib("quic/include/quic.hrl").
+-include_lib("quic/include/quic_qlog.hrl").
+-include_lib("quic/src/quic_connection_state.hrl").
 
--define(PROBE_SIZE, 1467).
--define(DATA_SIZE, 1200).
+-define(CWND, 20000).
 
-%% An ACK frame in the shape on_ack_received/3 consumes:
-%% {ack, LargestAcked, AckDelay, FirstRange, AckRanges}.
-ack(Largest, FirstRange) ->
-    {ack, Largest, 0, FirstRange, []}.
+probe_is_in_flight_test() ->
+    S = quic_connection:send_pmtu_probe(prober(?CWND)),
+    [#sent_packet{ack_eliciting = AE, frames = Frames, size = Size}] = sent(S),
+    ?assert(AE),
+    ?assert(lists:member(padding, Frames)),
+    ?assert(Size > 1200),
+    ?assertEqual(Size, quic_loss:bytes_in_flight(S#state.loss_state)),
+    ?assertEqual(Size, quic_cc:bytes_in_flight(S#state.cc_state)),
+    ?assertNotEqual(undefined, (S#state.pmtu_state)#pmtu_state.probe_pn).
 
-now_ms() ->
-    erlang:monotonic_time(millisecond).
+%% Refused by the window, the probe is not sent and not recorded; the
+%% probe timer tries again.
+probe_waits_for_the_window_test() ->
+    S0 = prober(100),
+    S = quic_connection:send_pmtu_probe(S0),
+    ?assertEqual([], sent(S)),
+    ?assertEqual(undefined, (S#state.pmtu_state)#pmtu_state.probe_pn),
+    ?assertNotEqual(undefined, S#state.pmtu_probe_timer).
 
-%% A probe is registered with an empty frames list, exactly as
-%% send_pmtu_probe_packet does, which makes it non-ack-eliciting.
-send_probe(State, PN, Now) ->
-    quic_loss:on_packet_sent(app, State, PN, ?PROBE_SIZE, false, [], Now).
+%% Declared lost by an ACK of later packets: out of flight, window intact.
+probe_lost_on_ack_is_not_congestion_test() ->
+    S0 = quic_connection:send_pmtu_probe(prober(?CWND)),
+    S1 = lists:foldl(fun(_, Acc) -> quic_connection:send_frame(ping, Acc) end, S0, [1, 2, 3]),
+    Cwnd = quic_cc:cwnd(S1#state.cc_state),
+    S2 = quic_connection:process_frame(app, {ack, [{3, 2}], 0, undefined}, S1),
+    %% The next probe may follow; the lost one is gone.
+    Left = sent(S2),
+    ?assertNot(lists:keymember(0, #sent_packet.pn, Left)),
+    %% Slow start grows it with the acknowledged PINGs; nothing cuts it.
+    ?assert(quic_cc:cwnd(S2#state.cc_state) >= Cwnd),
+    ?assertNot(quic_cc:in_recovery(S2#state.cc_state)),
+    ?assertEqual(
+        lists:sum([Sz || #sent_packet{size = Sz} <- Left]),
+        quic_cc:bytes_in_flight(S2#state.cc_state)
+    ).
 
-send_data(State, PN, Now) ->
-    quic_loss:on_packet_sent(app, State, PN, ?DATA_SIZE, true, [{ping}], Now).
+%% Declared lost by the loss timer: the same.
+probe_lost_on_timeout_is_not_congestion_test() ->
+    S0 = quic_connection:send_pmtu_probe(prober(?CWND)),
+    [Probe] = sent(S0),
+    Cwnd = quic_cc:cwnd(S0#state.cc_state),
+    S1 = quic_connection:apply_lost_packets(app, [Probe], S0),
+    ?assertEqual(Cwnd, quic_cc:cwnd(S1#state.cc_state)),
+    ?assertNot(quic_cc:in_recovery(S1#state.cc_state)),
+    ?assertEqual(0, quic_cc:bytes_in_flight(S1#state.cc_state)).
 
-probe_adds_no_bytes_in_flight_test() ->
-    S0 = quic_loss:new(),
-    S1 = send_probe(S0, 0, now_ms()),
-    ?assertEqual(0, quic_loss:bytes_in_flight(S1)).
+%% Fence: lost data still cuts the window.
+lost_data_is_congestion_test() ->
+    S0 = quic_connection:send_frame({max_data, 1000000}, prober(?CWND)),
+    [Data] = sent(S0),
+    Cwnd = quic_cc:cwnd(S0#state.cc_state),
+    S1 = quic_connection:apply_lost_packets(app, [Data], S0),
+    ?assert(quic_cc:cwnd(S1#state.cc_state) < Cwnd).
 
-acked_probe_is_seen_but_counts_nothing_test() ->
-    Now = now_ms(),
-    S0 = send_probe(quic_loss:new(), 0, Now),
-    {S1, Acked, Lost, Meta} = quic_loss:on_ack_received(app, S0, ack(0, 0), Now + 20),
-    %% The PMTU ack hook folds over the acked list, so the probe must
-    %% appear there even though it elicits nothing locally.
-    ?assertEqual([0], [P#sent_packet.pn || P <- Acked]),
-    ?assertEqual([], Lost),
-    ?assertEqual(0, maps:get(acked_bytes, Meta)),
-    ?assertNot(maps:get(has_ack_eliciting, Meta)),
-    ?assertEqual(0, quic_loss:bytes_in_flight(S1)).
+%% A connected client ready to probe, with Room bytes of congestion window.
+prober(Room) ->
+    S = quic_connection_test_support:state_for_admission(0, 0, 1000000, 1000000),
+    CC = quic_cc:new(#{algorithm => newreno, initial_window => ?CWND}),
+    S#state{
+        loss_state = quic_loss:on_handshake_confirmed(quic_loss:new()),
+        cc_state = quic_cc:on_packet_sent(CC, ?CWND - Room),
+        owner = self(),
+        transport_params = #{},
+        max_data_local = 1000000,
+        pmtu_state = quic_pmtu:on_connection_established(1500, quic_pmtu:new())
+    }.
 
-lost_probe_is_seen_but_is_not_a_congestion_signal_test() ->
-    Now = now_ms(),
-    %% Probe as pn 0, then three real packets; acking 1..3 pushes pn 0
-    %% past the packet threshold (RFC 9002 §6.1.1) and declares it lost.
-    S0 = send_probe(quic_loss:new(), 0, Now),
-    S1 = send_data(S0, 1, Now + 1),
-    S2 = send_data(S1, 2, Now + 2),
-    S3 = send_data(S2, 3, Now + 3),
-    {S4, Acked, Lost, Meta} = quic_loss:on_ack_received(app, S3, ack(3, 2), Now + 30),
-    ?assertEqual([1, 2, 3], lists:sort([P#sent_packet.pn || P <- Acked])),
-    %% The PMTU lost hook folds over the lost list, so the probe must
-    %% appear there...
-    ?assertEqual([0], [P#sent_packet.pn || P <- Lost]),
-    %% ...while contributing neither lost bytes nor the timestamp that
-    %% drives on_congestion_event.
-    ?assertEqual(0, maps:get(lost_bytes, Meta)),
-    ?assertEqual(undefined, maps:get(largest_lost_sent_time, Meta)),
-    ?assertEqual(0, quic_loss:bytes_in_flight(S4)).
-
-%% Fence: a lost ack-eliciting packet still drives the congestion event.
-lost_data_still_signals_congestion_test() ->
-    Now = now_ms(),
-    S0 = send_data(quic_loss:new(), 0, Now),
-    S1 = send_data(S0, 1, Now + 1),
-    S2 = send_data(S1, 2, Now + 2),
-    S3 = send_data(S2, 3, Now + 3),
-    {_S4, _Acked, Lost, Meta} = quic_loss:on_ack_received(app, S3, ack(3, 2), Now + 30),
-    ?assertEqual([0], [P#sent_packet.pn || P <- Lost]),
-    ?assertEqual(?DATA_SIZE, maps:get(lost_bytes, Meta)),
-    ?assertNotEqual(undefined, maps:get(largest_lost_sent_time, Meta)).
+sent(State) ->
+    [P || {_, P} <- lists:sort(maps:to_list(quic_loss:sent_packets(app, State#state.loss_state)))].
