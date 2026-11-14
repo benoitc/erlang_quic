@@ -13100,9 +13100,18 @@ do_set_congestion_control(Algorithm, #state{cc_state = OldCC} = State) when
 ->
     #state{cfg = #conn_cfg{cc_opts = Opts}} = State,
     NewCC = quic_cc:new(Algorithm, Opts#{max_datagram_size => quic_cc:max_datagram_size(OldCC)}),
-    {ok, State#state{cc_state = NewCC}};
+    {ok, State#state{cc_state = with_flight(NewCC, State#state.loss_state)}};
 do_set_congestion_control(_Algorithm, _State) ->
     {error, invalid_algorithm}.
+
+%% A new controller takes over the packets already in flight (RFC 9002 Appendix B.4).
+with_flight(CC, undefined) ->
+    CC;
+with_flight(CC, LossState) ->
+    case quic_loss:bytes_in_flight(LossState) of
+        0 -> CC;
+        Outstanding -> quic_cc:on_packet_sent(CC, Outstanding)
+    end.
 
 %% Set stream deadline
 do_set_stream_deadline(StreamId, TimeoutMs, Opts, State) when
@@ -16302,12 +16311,7 @@ reset_path_estimates(
     NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
     %% Same algorithm and configured options, starting over.
     #state{cc_state = OldCC, cfg = #conn_cfg{cc_opts = CCOpts}} = State,
-    NewCCState0 = quic_cc:new(quic_cc:algorithm(OldCC), CCOpts),
-    NewCCState =
-        case quic_loss:bytes_in_flight(NewLossState) of
-            0 -> NewCCState0;
-            Outstanding -> quic_cc:on_packet_sent(NewCCState0, Outstanding)
-        end,
+    NewCCState = with_flight(quic_cc:new(quic_cc:algorithm(OldCC), CCOpts), NewLossState),
 
     State#state{
         pmtu_state = NewPMTUState,
