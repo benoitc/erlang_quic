@@ -6583,7 +6583,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
 
             case Level of
                 app ->
-                    app_ack_tail(AckedPackets, LostPackets, State1);
+                    LateAcked = maps:get(late_acked, AckMeta, []),
+                    app_ack_tail(AckedPackets, LostPackets, LateAcked, State1);
                 _ ->
                     handshake_ack_tail(Level, LostPackets, State1)
             end
@@ -7242,6 +7243,7 @@ send_ack_frequency({Threshold, Delay, Reordering} = Request, Now, State0) ->
 %% Section 7: a lower max_ack_delay counts once its request is acknowledged.
 ack_frequency_acked(
     Acked,
+    LateAcked,
     #state{
         ack_freq_req = #ack_freq_req{seq = Seq, pending_pto_delay = DelayMs} = Req,
         loss_state = LossState
@@ -7249,7 +7251,7 @@ ack_frequency_acked(
 ) when DelayMs =/= undefined ->
     case
         lists:any(
-            fun(#sent_packet{frames = Frames}) ->
+            fun(Frames) ->
                 lists:any(
                     fun
                         ({ack_frequency, S, _, _, _}) -> S =:= Seq;
@@ -7258,7 +7260,7 @@ ack_frequency_acked(
                     Frames
                 )
             end,
-            Acked
+            LateAcked ++ [Frames || #sent_packet{frames = Frames} <- Acked]
         )
     of
         true ->
@@ -7269,7 +7271,7 @@ ack_frequency_acked(
         false ->
             State
     end;
-ack_frequency_acked(_Acked, State) ->
+ack_frequency_acked(_Acked, _LateAcked, State) ->
     State.
 
 %% draft-ietf-quic-ack-frequency-14 Section 5: the controller may want the
@@ -7295,7 +7297,7 @@ peer_takes_ack_frequency(#state{transport_params = TP}) ->
 %% application space has streams, PMTU probes and a send queue, so the
 %% handshake spaces take the short path: replay what was lost, at their
 %% own encryption level.
-app_ack_tail(AckedPackets, LostPackets, State1) ->
+app_ack_tail(AckedPackets, LostPackets, LateAcked, State1) ->
     %% Handle PMTU probe ACKs. Only walk the acked list when a
     %% probe is actually outstanding - the common bulk-ACK case
     %% has none and skips the per-packet fold.
@@ -7334,21 +7336,24 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
     %% acked (RFC 9000 §3.1 "Data Recvd"). Reclaiming here, and
     %% not at send time, paces MAX_STREAMS credit to what the
     %% peer has actually consumed; granting at send time let a
-    %% peer run far ahead of its own completions.
+    %% peer run far ahead of its own completions. Late ACKs count too
+    %% (RFC 9000 Section 13.3).
     State4a =
         case
-            lists:usort([
-                Sid
-             || #sent_packet{frames = Fs} <- AckedPackets,
-                {stream, Sid, _O, _D, true} <- Fs
-            ])
+            lists:usort(
+                [
+                    Sid
+                 || #sent_packet{frames = Fs} <- AckedPackets,
+                    {stream, Sid, _O, _D, true} <- Fs
+                ] ++ [Sid || Fs <- LateAcked, {stream, Sid, _, _, true} <- Fs]
+            )
         of
             [] -> State4;
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
     %% Ask the peer for the ACK frequency the controller wants now.
-    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, State4a)),
+    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, LateAcked, State4a)),
 
     %% cwnd may have reopened: held handshake packets, then held control
     %% frames, then the send queue, retransmit_stream entries included.

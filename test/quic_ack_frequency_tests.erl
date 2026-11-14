@@ -200,9 +200,9 @@ pto_takes_a_smaller_delay_once_acknowledged_test() ->
     ?assertEqual(50, quic_loss:max_ack_delay(S2#state.loss_state)),
     [_, Second] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
     [First, _] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
-    S3 = quic_connection:ack_frequency_acked([First], S2),
+    S3 = quic_connection:ack_frequency_acked([First], [], S2),
     ?assertEqual(50, quic_loss:max_ack_delay(S3#state.loss_state)),
-    S4 = quic_connection:ack_frequency_acked([Second], S3),
+    S4 = quic_connection:ack_frequency_acked([Second], [], S3),
     ?assertEqual(5, quic_loss:max_ack_delay(S4#state.loss_state)).
 
 only_the_latest_request_is_resent_test() ->
