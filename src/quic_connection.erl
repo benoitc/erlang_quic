@@ -13843,8 +13843,14 @@ handle_loss_timeout(#state{loss_state = LossState, pto_space = Space} = State) -
 apply_lost_packets(_Space, [], State) ->
     State;
 apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
-    LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
-    LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
+    %% Only in-flight losses count and set the congestion event (RFC 9002 Appendix B.8).
+    InFlight = [P || #sent_packet{in_flight = true} = P <- Lost],
+    LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- InFlight]),
+    LargestLostSentTime =
+        case InFlight of
+            [] -> undefined;
+            _ -> lists:max([TS || #sent_packet{time_sent = TS} <- InFlight])
+        end,
     NewCC = cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
