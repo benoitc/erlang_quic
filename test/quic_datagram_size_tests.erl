@@ -1,7 +1,8 @@
 %%% -*- erlang -*-
 %%%
-%%% DATAGRAM sizes: a DATAGRAM goes out only in a packet that fits the
-%%% confirmed path MTU (RFC 8899 Section 3).
+%%% DATAGRAM sizes: max_datagram_frame_size bounds the whole frame, type
+%%% and length included (RFC 9221 Section 3), and a DATAGRAM goes out
+%%% only in a packet that fits the confirmed path MTU (RFC 8899 Section 3).
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau
 %%% Apache License 2.0
@@ -45,6 +46,26 @@ budget_follows_the_confirmed_mtu_test() ->
     assert_fits(1200 - ?HEADER - ?FRAME_2, sender(65535, Fallen)).
 
 %%====================================================================
+%% Peer's max_datagram_frame_size (RFC 9221 Section 3)
+%%====================================================================
+
+%% The largest payload whose frame fits the peer's maximum is sent; one
+%% more byte is refused. Past 65 the length takes 2 bytes, so 66 leaves
+%% a byte unused.
+send_checks_the_whole_frame_test_() ->
+    [
+        {integer_to_list(PeerMax), fun() -> assert_peer_limit(PeerMax, Fit) end}
+     || {PeerMax, Fit} <- [{2, 0}, {65, 63}, {66, 63}, {67, 64}, {100, 97}, {1000, 997}]
+    ].
+
+%% A peer limit too small for any frame refuses even an empty datagram.
+send_refuses_when_no_frame_fits_test() ->
+    ?assertEqual(
+        {error, datagram_too_large},
+        quic_connection:do_send_datagram(<<>>, sender(1, undefined))
+    ).
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -83,3 +104,14 @@ black_holed(PMTU) ->
     ),
     ?assertEqual(error, quic_pmtu:get_state(Fallen)),
     Fallen.
+
+assert_peer_limit(PeerMax, Fit) ->
+    S0 = sender(PeerMax, undefined),
+    {ok, S1} = quic_connection:do_send_datagram(payload(Fit), S0),
+    [{_, [Frame]}] = quic_connection_test_support:app_packets_sent(S1),
+    ?assert(byte_size(quic_frame:encode(Frame)) =< PeerMax),
+    ?assert(byte_size(quic_frame:encode({datagram_with_length, payload(Fit + 1)})) > PeerMax),
+    ?assertEqual(
+        {error, datagram_too_large},
+        quic_connection:do_send_datagram(payload(Fit + 1), S0)
+    ).

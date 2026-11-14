@@ -11768,6 +11768,20 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
 datagram_overhead(#state{dcid = Dcid}) ->
     1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
 
+%% Largest payload whose DATAGRAM frame, type and length included, fits
+%% in Max bytes (RFC 9221 Section 3); -1 when not even an empty one does.
+datagram_frame_payload(Max) when Max < 2 ->
+    -1;
+datagram_frame_payload(Max) ->
+    datagram_frame_payload(Max, 1).
+
+datagram_frame_payload(Max, LenSize) ->
+    Payload = Max - 1 - LenSize,
+    case quic_varint:encode_len(Payload) =< LenSize of
+        true -> Payload;
+        false -> datagram_frame_payload(Max, LenSize * 2)
+    end.
+
 %% Deliver an inbound DATAGRAM to the owner, or drop it while the owner's
 %% mailbox holds more than max_owner_queue messages: DATAGRAMs are
 %% unreliable (RFC 9221 Section 5), and nothing else stops a peer from
@@ -11826,8 +11840,8 @@ datagram_stats_snapshot(State) ->
     }.
 
 %% Send a datagram (RFC 9221)
-%% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
-%% and MUST NOT send frames larger than peer's advertised value.
+%% RFC 9221 Section 3: MUST NOT send DATAGRAM frames until the peer advertised
+%% max_datagram_frame_size, nor frames (type, length and data) larger than it.
 %% RFC 8899 Section 3: the packet must also fit the confirmed path MTU.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
@@ -11835,9 +11849,10 @@ do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
 do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
+    PeerLimit = datagram_frame_payload(PeerMax),
     PmtuBudget = max(0, get_current_mtu(State) - datagram_overhead(State)),
     if
-        DataSize > PeerMax ->
+        DataSize > PeerLimit ->
             {error, datagram_too_large};
         DataSize > PmtuBudget ->
             {error, datagram_too_large_for_path};
