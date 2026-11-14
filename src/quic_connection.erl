@@ -12991,16 +12991,20 @@ trim_entry(_Entry, _StreamId, _ReliableSize) ->
     keep.
 
 %% RFC 9000 Section 4.5: the final size of a stream we reset covers what
-%% we sent. New data still queued is dropped with the reset; retransmits
-%% in the queue were sent already. A stream's new data goes out in
-%% offset order, so what is queued is a tail.
-reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ} = State) ->
+%% we sent, and a FIN already sent fixed it. New data still queued is
+%% dropped with the reset, but a later write, its FIN included, can go out
+%% ahead of it: send_highest is the highest offset sent.
+reset_final_size(
+    StreamId,
+    #stream_state{send_offset = Offset, send_highest = Highest},
+    #state{send_queue = PQ} = State
+) ->
     Sent =
         case State#state.send_parked of
             #{StreamId := Q} -> min(Offset, element(3, queue:get(Q)));
             _ -> Offset
         end,
-    lists:foldl(
+    Unsent = lists:foldl(
         fun(I, Acc) ->
             queue:fold(
                 fun
@@ -13015,7 +13019,8 @@ reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queu
         end,
         Sent,
         lists:seq(1, 8)
-    ).
+    ),
+    max(Unsent, Highest).
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).

@@ -69,6 +69,11 @@ All notable changes to this project will be documented in this file.
   implements it.
 
 ### Fixed
+- A stream reset could give a smaller final size than the stream's end
+  had already given, when that end went out ahead of data still waiting
+  to be sent. The peer then closed the whole connection, as RFC 9000
+  Section 4.5 requires. This happened when a server stopped reading an
+  upload early. A reset now keeps the final size already sent.
 - When the network reordered packets, a packet could be acknowledged
   after it had been declared lost, and what it carried was still sent
   again: stream data, control frames and handshake data waiting to be
