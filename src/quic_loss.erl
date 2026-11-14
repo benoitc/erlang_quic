@@ -163,7 +163,7 @@
     time_of_last_ack = undefined :: non_neg_integer() | undefined,
 
     %% When the current outstanding burst started: set whenever an
-    %% ack-eliciting packet is sent while nothing was in flight. Used
+    %% ack-eliciting packet is sent while none was outstanding. Used
     %% together with time_of_last_ack as the anchor for the disconnect
     %% timeout, so a fresh send after a quiet period cannot trip it.
     outstanding_since = undefined :: non_neg_integer() | undefined,
