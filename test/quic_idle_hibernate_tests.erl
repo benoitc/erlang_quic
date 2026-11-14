@@ -70,6 +70,20 @@ explicit_hibernate_after_is_passed_through_test() ->
 default_hibernate_after_test() ->
     ?assertEqual([{hibernate_after, 5000}], quic_connection:statem_opts(#{})).
 
+fullsweep_after_is_passed_as_a_spawn_option_test() ->
+    ?assertEqual(
+        [{spawn_opt, [{fullsweep_after, 0}]}, {hibernate_after, 5000}],
+        quic_connection:statem_opts(#{fullsweep_after => 0})
+    ).
+
+fullsweep_after_reaches_the_connection_process_test_() ->
+    {timeout, 30, fun() ->
+        with_connection(#{fullsweep_after => 7}, fun(Conn) ->
+            {garbage_collection, GC} = process_info(Conn, garbage_collection),
+            ?assertEqual(7, proplists:get_value(fullsweep_after, GC))
+        end)
+    end}.
+
 %% Echo enough data to leave real garbage on the heap, and report the
 %% largest heap seen while it was in flight. A single sample taken once
 %% the echo has arrived can be a heap that already collapsed: the transfer

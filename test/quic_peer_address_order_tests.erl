@@ -42,6 +42,17 @@ second_rebinding_during_validation_is_followed_test() ->
     S4 = give_up(S3),
     ?assertEqual(?OLD, S4#state.remote_addr).
 
+%% A pass on the current path records the CID the peer addressed, and a
+%% further one from there has nothing to change.
+pass_on_the_current_path_changes_nothing_test() ->
+    S1 = recv(5, ?OLD, state()),
+    ?assertEqual((S1#state.cfg)#conn_cfg.scid, (S1#state.mig)#mig.peer_dcid),
+    S2 = recv(6, ?OLD, S1),
+    ?assertEqual(S1#state.mig, S2#state.mig),
+    ?assertEqual({false, []}, {S2#state.hold_pass_frames, S2#state.pass_frames}),
+    S3 = recv(7, ?A, S2),
+    ?assertEqual(?A, S3#state.remote_addr).
+
 recv(PN, From, State) ->
     quic_connection:server_recv_pass([packet(PN, State)], From, undefined, State).
 

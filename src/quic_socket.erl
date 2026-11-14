@@ -47,6 +47,7 @@
     start_shared_sender/1,
     close/1,
     send/4,
+    send_run/4,
     send_immediate/4,
     flush/1,
     recv/2,
@@ -84,6 +85,7 @@
 -define(IP_MTU_DISCOVER, 10).
 -define(IPV6_MTU_DISCOVER, 23).
 -define(PMTUDISC_PROBE, 3).
+-define(RECV_QUEUE_CHECK_INTERVAL, 16).
 
 -record(socket_state, {
     %% The underlying socket. For the `adapter' backend this is an
@@ -528,6 +530,44 @@ send(#socket_state{} = State, IP, Port, Packet) ->
             Error
     end.
 
+%% @doc Send a run of packets to one destination, as send/4 would one
+%% at a time. Returns the positions in the run (from 0) whose send
+%% failed, with the reason.
+-spec send_run(socket_state(), inet:ip_address(), inet:port_number(), [packet_view()]) ->
+    {socket_state(), [{non_neg_integer(), term()}]}.
+send_run(State, IP, Port, Packets) ->
+    send_run(State, IP, Port, Packets, 0, []).
+
+send_run(State, _IP, _Port, [], _I, Failed) ->
+    {State, Failed};
+send_run(
+    #socket_state{batching_enabled = true, batch_addr = Addr} = State, IP, Port, Packets, I, Failed
+) when Addr =:= undefined; Addr =:= {IP, Port} ->
+    #socket_state{batch_buffer = Buffer, batch_count = Count, max_batch_packets = Max} = State,
+    {Rest, Buffer1, N} = batch_take(Packets, max(1, Max - Count), Buffer, 0),
+    State1 = State#socket_state{
+        batch_addr = {IP, Port}, batch_buffer = Buffer1, batch_count = Count + N
+    },
+    case Count + N >= Max andalso flush(State1) of
+        false ->
+            send_run(State1, IP, Port, Rest, I + N, Failed);
+        {ok, State2} ->
+            send_run(State2, IP, Port, Rest, I + N, Failed);
+        {error, Reason, State2} ->
+            send_run(State2, IP, Port, Rest, I + N, [{I + N - 1, Reason} | Failed])
+    end;
+send_run(State, IP, Port, [Packet | Rest], I, Failed) ->
+    case send(State, IP, Port, Packet) of
+        {ok, State1} -> send_run(State1, IP, Port, Rest, I + 1, Failed);
+        {error, Reason, State1} -> send_run(State1, IP, Port, Rest, I + 1, [{I, Reason} | Failed]);
+        {error, Reason} -> send_run(State, IP, Port, Rest, I + 1, [{I, Reason} | Failed])
+    end.
+
+batch_take([Packet | Rest], Room, Buffer, N) when Room > 0 ->
+    batch_take(Rest, Room - 1, [Packet | Buffer], N + 1);
+batch_take(Rest, _Room, Buffer, N) ->
+    {Rest, Buffer, N}.
+
 %% @doc Flush all buffered packets. On hard send error the batch is
 %% cleared in the returned state so callers thread a clean buffer;
 %% PTO-driven retransmission owns recovery of any packets the CC has
@@ -685,7 +725,7 @@ get_fd(#socket_state{backend = adapter}) ->
 start_client_receiver(#socket_state{backend = socket} = SocketState, Owner, QueueMax) when
     is_pid(Owner)
 ->
-    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax) end),
+    Pid = spawn_link(fun() -> client_recv_loop(SocketState, Owner, QueueMax, 0) end),
     {ok, Pid};
 start_client_receiver(#socket_state{backend = gen_udp}, _Owner, _QueueMax) ->
     {error, not_supported_on_gen_udp};
@@ -718,22 +758,19 @@ stop_client_receiver(Pid) when is_pid(Pid) ->
 %% Blocking recvfrom loop. Forwards each datagram as a gen_udp-shaped
 %% `{udp, Socket, IP, Port, Data}' tuple so the owner's existing
 %% receive handlers work unchanged — `Socket' here matches the OTP
-%% socket handle stored in `#state.socket'. Uses a 100ms timeout so
-%% exit signals from the linked owner are processed promptly rather
-%% than blocking forever in the NIF.
-client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) ->
+%% socket handle stored in `#state.socket'. The wait for a datagram is
+%% an Erlang receive, so the linked owner's exit signal ends it.
+client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax, Unchecked) ->
     %% recv_gro splits GRO-coalesced trains and sizes the read buffer
     %% for a maximal train; a plain recvfrom with the default 8 KiB
     %% buffer would silently truncate coalesced input. A multi-packet
     %% train goes to the owner as ONE message so the mailbox holds
     %% trains, not packets, and the whole train is processed in one
     %% receive pass.
-    case recv_gro(Socket, 100) of
+    case recv_gro(Socket, infinity) of
         {ok, {IP, Port}, Packets} ->
-            forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax),
-            client_recv_loop(SocketState, Owner, QueueMax);
-        {error, timeout} ->
-            client_recv_loop(SocketState, Owner, QueueMax);
+            Unchecked1 = forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax, Unchecked),
+            client_recv_loop(SocketState, Owner, QueueMax, Unchecked1);
         {error, closed} ->
             ok;
         {error, Reason} ->
@@ -742,18 +779,29 @@ client_recv_loop(#socket_state{socket = Socket} = SocketState, Owner, QueueMax) 
     end.
 
 %% Bench diagnostic: client-receiver tail-drop counter.
-%% Tail-drop over QueueMax, see recv_queue_max/1.
-forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax) ->
+%% Tail-drop over QueueMax, see recv_queue_max/1. The owner's mailbox is
+%% read once per ?RECV_QUEUE_CHECK_INTERVAL forwarded messages, and on
+%% every message while it is over the bound. Returns the number of
+%% messages forwarded since the last read.
+forward_to_owner(Owner, Socket, IP, Port, Packets, _QueueMax, Unchecked) when
+    Unchecked < ?RECV_QUEUE_CHECK_INTERVAL
+->
+    forward(Owner, Socket, IP, Port, Packets),
+    Unchecked + 1;
+forward_to_owner(Owner, Socket, IP, Port, Packets, QueueMax, Unchecked) ->
     case erlang:process_info(Owner, message_queue_len) of
         {message_queue_len, QLen} when QLen > QueueMax ->
-            count_client_recv_drop(length(Packets));
+            count_client_recv_drop(length(Packets)),
+            Unchecked;
         _ ->
-            case Packets of
-                [Single] -> Owner ! {udp, Socket, IP, Port, Single};
-                _ -> Owner ! {udp_batch, Socket, IP, Port, Packets}
-            end,
-            ok
+            forward(Owner, Socket, IP, Port, Packets),
+            0
     end.
+
+forward(Owner, Socket, IP, Port, [Single]) ->
+    Owner ! {udp, Socket, IP, Port, Single};
+forward(Owner, Socket, IP, Port, Packets) ->
+    Owner ! {udp_batch, Socket, IP, Port, Packets}.
 
 count_client_recv_drop(N) ->
     Ref =

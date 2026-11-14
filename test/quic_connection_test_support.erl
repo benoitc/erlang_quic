@@ -533,6 +533,7 @@ state_sending(State) ->
 %% Minimal #state{} carrying a caller-supplied loss tracker, for tests
 %% that need to observe what an incoming frame does to it.
 state_get(#state{} = S, pto_timer) -> S#state.pto_timer;
+state_get(#state{} = S, loss_state) -> S#state.loss_state;
 state_get(#state{} = S, pto_scheduled_at) -> S#state.pto_scheduled_at;
 state_get(#state{} = S, dcid) -> S#state.dcid;
 state_get(#state{} = S, app_keys) -> S#state.app_keys;
@@ -846,7 +847,7 @@ requeued_offsets(Where) ->
     {S2, 0} = quic_connection:send_stream_chunked_step(0, 0, <<0:8000>>, false, S1, 0, Ctx),
     %% The step arms a zero-delay continuation by messaging this process.
     receive
-        {pacing_timeout, _} -> ok
+        {timeout, _, pacing_timeout} -> ok
     after 0 -> ok
     end,
     queued_offsets(S2#state.send_queue).

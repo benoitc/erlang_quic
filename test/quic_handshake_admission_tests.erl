@@ -219,7 +219,7 @@ pacing_timeout_is_handled_before_connected_test() ->
         1 = queued(handshake, S1),
         timer:sleep(?REFILL_MS),
         {keep_state, S2} = quic_connection:handle_common_event(
-            info, {pacing_timeout, pacing_timer(S1)}, StateName, S1
+            info, {timeout, pacing_timer(S1), pacing_timeout}, StateName, S1
         ),
         queued(handshake, S2)
     end,
