@@ -117,8 +117,8 @@ All notable changes to this project will be documented in this file.
 - Packets that carry padding but nothing that needs an acknowledgment,
   such as a client's Initial packets that only acknowledge, were not
   counted as data in flight. They now count until they are acknowledged,
-  declared lost or discarded (RFC 9002 Section 2), and they still go out
-  when the congestion window is full, as acknowledgments do (Section 7).
+  declared lost or discarded (RFC 9002 Section 2), and like other data
+  in flight they wait for room in the congestion window (Section 7).
 - The loss tracker and the congestion controller could disagree about
   the data in flight: discarding the Initial or Handshake keys removed
   bytes that had never been counted, which could take the count of

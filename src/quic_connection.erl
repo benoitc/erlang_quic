@@ -3528,8 +3528,8 @@ packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
     {AckEliciting, AckEliciting orelse Padded orelse lists:member(padding, Frames)}.
 
-%% RFC 9002 Section 7: a handshake packet counts against the congestion
-%% window like any other. A refusal holds the frames rather than the
+%% RFC 9002 Section 7: a handshake packet in flight, ack-eliciting or
+%% padded (Section 2), counts against the congestion window like any other. A refusal holds the frames rather than the
 %% encoded packet, so the packet number is not spent and the packet is
 %% rebuilt when the window reopens.
 %%
@@ -3540,18 +3540,23 @@ packet_flags(Frames, Padded) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
-%% A packet that is not ack-eliciting is not congestion controlled
-%% (RFC 9002 Section 7), padded or not, and holding one back is worse than
-%% pointless: an acknowledgement is what frees the window, so deferring it
-%% can stall the very handshake that would unblock the sender.
+%% Only a packet holding nothing but ACK frames is not congestion
+%% controlled. A padded ACK-only Initial waits like the rest: the window
+%% reopens on the peer's acknowledgements, which do not depend on ours.
 admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
-admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
     {ok, State};
-admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
 admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
-    case quic_cc:send_check(CCState, Size) of
+    case closes(Frames) of
+        true -> {ok, State};
+        false -> admit_cwnd(Space, quic_cc:send_check(CCState, Size), Payload, Frames, State)
+    end.
+
+admit_cwnd(Space, Check, Payload, Frames, State) ->
+    case Check of
         {ok, NewCC} ->
             {ok, State#state{cc_state = NewCC}};
         {blocked_cwnd, _Avail} ->
@@ -3565,6 +3570,12 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
             %% schedule its own retry.
             {deferred, maybe_set_pacing_timer(Delay, enqueue_hs(Space, Payload, Frames, State))}
     end.
+
+%% A closing endpoint may drop all but what it needs to send
+%% CONNECTION_CLOSE (RFC 9000 Section 10.2) and stops reading ACKs, so a
+%% full window would never reopen for the close.
+closes(Frames) ->
+    lists:keymember(connection_close, 1, Frames).
 
 %% A queue, so both ends are cheap: a sustained refusal appends and the
 %% drain takes from the head.
@@ -3745,7 +3756,7 @@ send_initial_packet(Payload, Frames, State) ->
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3968,7 +3979,7 @@ send_handshake_packet(Payload, Frames, State) ->
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
     Datagram = long_datagram(handshake, Packet, false, State),
-    case gate(handshake, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(handshake, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -4014,7 +4025,8 @@ send_app_packet_internal(Payload, Frames, State) ->
 
 %% RFC 9002 Section 7: an ack-eliciting packet goes out only if the window
 %% and the pacer have room for it, unless it is a PTO probe (Section 7.5).
-%% Packets that are not ack-eliciting are never held back.
+%% The only padded 1-RTT packet that is not ack-eliciting is a short
+%% CONNECTION_CLOSE, which is exempt like the handshake ones (closes/1).
 app_admit(Size, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> admit_in_flight(Size, State);
@@ -4643,14 +4655,14 @@ amp_account_recv(_Data, State) ->
 %% A refused probe is not queued: what it carries is still outstanding,
 %% so the next probe carries it again, and a queued copy per expiry is
 %% what filled the queue.
-gate(Space, AckEliciting, Size, Datagram, Payload, Frames, State) ->
+gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
             {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
-            admit(Space, AckEliciting, Size, Payload, Frames, State)
+            admit(Space, InFlight, Size, Payload, Frames, State)
     end.
 
 %% RFC 9000 Section 8.1: until it has validated the peer address a
