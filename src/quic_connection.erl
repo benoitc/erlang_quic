@@ -4652,9 +4652,10 @@ amp_account_recv(_Data, State) ->
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
 %%
-%% A refused probe is not queued: what it carries is still outstanding,
-%% so the next probe carries it again, and a queued copy per expiry is
-%% what filled the queue.
+%% A refused probe that replays sent data is not queued: what it carries
+%% is still outstanding, so the next probe carries it again, and a queued
+%% copy per expiry is what filled the queue. One taken from the queue goes
+%% back there (send_pending_hs_probe/2).
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
@@ -14287,8 +14288,28 @@ send_pending_hs_probe(
                     pending_hs_bytes = Bytes#{Space => Held}
                 }
             },
-            {sent, send_at_level(Space, Payload, Frames, State1)}
+            State2 = send_at_level(Space, Payload, Frames, State1),
+            {sent, keep_unsent_probe(Space, next_hs_pn(Space, State), State, State2)}
     end.
+
+%% A refused probe from the queue was never sent, so nothing else would
+%% resend it: it goes back to the head of the queue (RFC 9000 Section 13.3).
+keep_unsent_probe(Space, PN, #state{hs = #hs{pending_hs = Pending, pending_hs_bytes = Bytes}}, S) ->
+    case next_hs_pn(Space, S) of
+        PN ->
+            #state{hs = #hs{pending_hs = Pending1, pending_hs_bytes = Bytes1} = HS} = S,
+            S#state{
+                hs = HS#hs{
+                    pending_hs = Pending1#{Space => maps:get(Space, Pending)},
+                    pending_hs_bytes = Bytes1#{Space => maps:get(Space, Bytes, 0)}
+                }
+            };
+        _ ->
+            S
+    end.
+
+next_hs_pn(initial, #state{hs = #hs{pn_initial = #pn_space{next_pn = PN}}}) -> PN;
+next_hs_pn(handshake, #state{hs = #hs{pn_handshake = #pn_space{next_pn = PN}}}) -> PN.
 
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
