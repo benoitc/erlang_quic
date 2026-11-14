@@ -5926,11 +5926,11 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     },
 
     %% Reset packet number space for Initial
-    State4 = reset_initial_pn_space(State3),
+    {State4, EarlyData} = reset_initial_pn_space(State3),
 
     %% Resend the ClientHello using send_client_hello
     %% (the retry_token field is now set, so send_initial_packet will use it)
-    State5 = send_client_hello(State4),
+    State5 = replay_early_data(EarlyData, send_client_hello(State4)),
 
     %% Return state with retry info, no frames to process
     {ok, retry_handled, [], <<>>, State5}.
@@ -5949,10 +5949,9 @@ reset_initial_pn_space(#state{hs = #hs{pn_initial = #pn_space{next_pn = NextPN}}
         ack_eliciting_in_flight = 0
     },
     %% RFC 9002 Section 6.3: a Retry resets recovery and congestion state,
-    %% including the timers. RFC 9000 Section 17.2.5.3: the data that
-    %% carried is resent, under packet numbers that keep climbing. The
-    %% Initial flight is rebuilt from the retained TLS state with the
-    %% Retry token in it, so only 0-RTT is replayed from here.
+    %% including the timers. The Initial flight is rebuilt from the
+    %% retained TLS state with the Retry token in it; the 0-RTT packets
+    %% discarded here are returned to be sent again.
     cancel_timer(State#state.pto_timer),
     {NewLossState, Discarded} = quic_loss:reset_for_retry(
         State#state.loss_state, erlang:monotonic_time(millisecond)
@@ -5967,21 +5966,24 @@ reset_initial_pn_space(#state{hs = #hs{pn_initial = #pn_space{next_pn = NextPN}}
             pn_initial = PNSpace
         }
     },
-    requeue_early_data(maps:get(app, Discarded, []), State1).
+    {State1, maps:get(app, Discarded, [])}.
 
-%% Replay 0-RTT a Retry discarded. It goes back through the
-%% retransmission path, not the fresh-send path: this data already
-%% consumed its flow-control credit when it first went out.
-requeue_early_data([], State) ->
+%% RFC 9000 Section 17.2.5.3: 0-RTT data a Retry discarded goes out again
+%% as 0-RTT, to the new connection ID, under packet numbers that keep
+%% climbing, after the new Initial. It is repaired like lost data (Section
+%% 13.3): its flow-control credit was counted when it first went out.
+replay_early_data([], State) ->
     State;
-requeue_early_data(Packets, State) ->
-    lists:foldl(
-        fun(#sent_packet{frames = Frames}, Acc) ->
-            send_retransmit_frames_cc(quic_loss:retransmittable_frames(Frames), Acc)
-        end,
-        State,
-        Packets
-    ).
+replay_early_data(Packets, State) ->
+    Sent = lists:append([F || #sent_packet{frames = F} <- lists:keysort(#sent_packet.pn, Packets)]),
+    Frames = repair_frames(Sent, State),
+    case State#state.hs of
+        #hs{early_keys = {EarlyKeys, _}} ->
+            MaxPayload = get_max_stream_data_per_packet(State),
+            send_zero_rtt_packets(pack_frames(Frames, MaxPayload), EarlyKeys, State);
+        #hs{} ->
+            hold_frames(Frames, State)
+    end.
 
 %% Check if a packet is a stateless reset (RFC 9000 Section 10.3)
 check_stateless_reset(Data, _State) when byte_size(Data) < 21 ->
@@ -13535,11 +13537,14 @@ cert_alert_code(_) -> ?TLS_ALERT_BAD_CERTIFICATE.
 retransmit_lost_packets([], State) ->
     State;
 retransmit_lost_packets([#sent_packet{frames = Frames} | Rest], State) ->
-    RetransmitFrames = quic_loss:retransmittable_frames(Frames),
-    FilteredFrames = filter_reset_stream_at_data(RetransmitFrames, State),
-    CurrentFrames = lists:filter(fun(F) -> is_current_limit(F, State) end, FilteredFrames),
-    State1 = send_retransmit_frames_cc(CurrentFrames, State),
+    State1 = send_retransmit_frames_cc(repair_frames(Frames, State), State),
     retransmit_lost_packets(Rest, State1).
+
+%% The frames of a lost packet that are still worth sending
+%% (RFC 9000 Section 13.3).
+repair_frames(Frames, State) ->
+    Filtered = filter_reset_stream_at_data(quic_loss:retransmittable_frames(Frames), State),
+    [F || F <- Filtered, is_current_limit(F, State)].
 
 %% Whether a lost or held frame still carries current information
 %% (RFC 9000 Section 13.3). A MAX_DATA, MAX_STREAM_DATA or MAX_STREAMS is
