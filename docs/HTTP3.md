@@ -219,9 +219,15 @@ handle_request(Conn, StreamId, <<"POST">>, _Path, _Headers) ->
     end.
 ```
 
-Register promptly. Until you do, the connection holds that stream's body
-for you, and what it holds counts against `max_buffered_body`: the total
-one connection will hold across all of its streams, 16 MiB by default. A
+Register promptly. Until you do, the peer can send at most one stream
+window on that request (`max_stream_data_bidi_remote`), and the
+connection holds what it sent for you. If you send the complete response
+without registering and your process then ends, the client is asked to
+stop sending the rest of the body (STOP_SENDING with `H3_NO_ERROR`) and
+what was held is dropped. To read a body after answering, register
+before your process ends. What it holds counts against
+`max_buffered_body`: the total one connection will hold across all of
+its streams, 16 MiB by default. A
 stream whose body would cross the budget is reset with `H3_EXCESSIVE_LOAD`
 and the connection carries on; you are told with
 `{stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}`, so nothing is left waiting
@@ -284,8 +290,9 @@ On a client, pass the option to `request/3` instead. Notes:
 - The peer can send at most one stream window past what you consumed:
   `max_stream_data_bidi_remote` for a request the peer opened,
   `max_stream_data_bidi_local` for one you opened, capped at
-  `max_receive_window`. Unconsumed bytes earn no connection credit
-  either.
+  `max_receive_window`. A request the peer opens gets no credit before
+  you register, so this holds from its first byte. Unconsumed bytes earn
+  no connection credit either.
 - Data buffered before you registered is handed to you like any other
   and has to be consumed too.
 - If the handler exits or calls `unset_stream_handler/2`, the stream goes

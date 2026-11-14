@@ -239,6 +239,19 @@ All notable changes to this project will be documented in this file.
   timer cut the window. Probes now count as in flight and wait for the
   congestion window like other packets, and losing one never lowers the
   sending rate (RFC 9000 Section 14.4, RFC 9002 Section 2).
+- An HTTP/3 request stream received receive credit with its first
+  packet, before its handler could register. A handler that then chose
+  `flow_control => manual` was not holding the client to one window:
+  the client could send several windows ahead of what the handler had
+  consumed, up to `max_receive_window`. A stream the peer opens now
+  keeps its initial window until its handler registers, so a manual
+  handler gets exactly one window past what it consumed, and a handler
+  in the default mode gets credit as before once it registers
+  (RFC 9000 Section 4.1). When a handler answers in full and ends
+  without registering, as the default 404 handler does, the client is
+  asked to stop sending the rest of the body with `H3_NO_ERROR` and what
+  was buffered for it is dropped (RFC 9114 Section 4.1). Such a body
+  used to be buffered up to `max_buffered_body` and its stream reset.
 
 ## [2.7.0] - 2026-11-13
 
