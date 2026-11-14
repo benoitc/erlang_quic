@@ -6310,9 +6310,25 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
             ),
             {ok, NewState, lists:reverse(Acc)};
         {Frame, Rest} ->
-            NewState = process_frame_track_probing(Level, Frame, State),
+            NewState =
+                case datagram_too_large(Level, Frame, byte_size(Data) - byte_size(Rest), State) of
+                    true -> send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+                    false -> process_frame_track_probing(Level, Frame, State)
+                end,
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% RFC 9221 Section 3: a DATAGRAM frame of Size bytes, type and length
+%% included, larger than the max_datagram_frame_size we sent.
+datagram_too_large(
+    Level, {Type, _}, Size, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}}
+) when
+    (Level =:= app orelse Level =:= zero_rtt) andalso
+        (Type =:= datagram orelse Type =:= datagram_with_length) andalso Max > 0
+->
+    Size > Max;
+datagram_too_large(_Level, _Frame, _Size, _State) ->
+    false.
 
 %% quic_frame:decode/1 raises on a frame cut short by the end of the
 %% packet.
@@ -7064,19 +7080,7 @@ process_frame(
     #state{cfg = #conn_cfg{max_datagram_frame_size_local = 0}} = State
 ) ->
     send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
-%% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving oversized DATAGRAM
-process_frame(
-    app, {datagram, Data}, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when
-    byte_size(Data) > Max
-->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
-process_frame(
-    app,
-    {datagram_with_length, Data},
-    #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when byte_size(Data) > Max ->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+%% A DATAGRAM larger than we advertised is refused as it is decoded.
 process_frame(app, {datagram, Data}, State) ->
     deliver_datagram(Data, State);
 process_frame(app, {datagram_with_length, Data}, State) ->

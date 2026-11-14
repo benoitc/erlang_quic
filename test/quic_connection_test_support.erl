@@ -90,7 +90,8 @@
     send_ready_wanted/1,
     handshake_with_timeouts/3,
     state_for_datagram/2,
-    app_packets_sent/1
+    app_packets_sent/1,
+    state_receiving_datagrams/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -1179,3 +1180,10 @@ state_for_datagram(PeerMax, PMTU) ->
 app_packets_sent(#state{loss_state = L}) ->
     Sent = lists:sort(maps:to_list(quic_loss:sent_packets(app, L))),
     [{Size, Frames} || {_PN, #sent_packet{size = Size, frames = Frames}} <- Sent].
+
+%% A connected client that advertised LocalMax as its
+%% max_datagram_frame_size, owned by the caller.
+-spec state_receiving_datagrams(non_neg_integer()) -> #state{}.
+state_receiving_datagrams(LocalMax) ->
+    S = state_for_datagram(65535, undefined),
+    S#state{cfg = (S#state.cfg)#conn_cfg{max_datagram_frame_size_local = LocalMax}}.

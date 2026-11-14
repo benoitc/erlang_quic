@@ -9,6 +9,7 @@
 -module(quic_datagram_size_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("quic/include/quic.hrl").
 
 %% Short header with the 8-byte test DCID, a 4-byte packet number and
 %% the AEAD tag.
@@ -65,6 +66,33 @@ send_refuses_when_no_frame_fits_test() ->
         quic_connection:do_send_datagram(<<>>, sender(1, undefined))
     ).
 
+%% A received frame, type and length included, at our maximum is
+%% delivered; one byte more closes with PROTOCOL_VIOLATION. A length
+%% encoded on 2 bytes where 1 would do counts as sent.
+receive_checks_the_whole_frame_test_() ->
+    Cases = [
+        {"0x30 at max", 100, <<16#30, (payload(99))/binary>>, delivered},
+        {"0x30 above max", 100, <<16#30, (payload(100))/binary>>, closed},
+        {"0x31 at max", 100, quic_frame:encode({datagram_with_length, payload(97)}), delivered},
+        {"0x31 above max", 100, quic_frame:encode({datagram_with_length, payload(98)}), closed},
+        {"0x31 long length at max", 65, <<16#31, 16#40, 62, (payload(62))/binary>>, delivered},
+        {"0x31 long length above max", 65, <<16#31, 16#40, 63, (payload(63))/binary>>, closed}
+    ],
+    [
+        {Name, fun() -> assert_received(Max, Frame, Want) end}
+     || {Name, Max, Frame, Want} <- Cases
+    ].
+
+%% Fence: without our support any DATAGRAM is unexpected, whatever its size.
+receive_without_support_is_unexpected_test() ->
+    S0 = quic_connection_test_support:state_receiving_datagrams(0),
+    Frame = quic_frame:encode({datagram_with_length, payload(10)}),
+    {ok, S1, _} = quic_connection:decode_and_process_streaming(app, Frame, S0),
+    ?assertMatch(
+        {transport, ?QUIC_PROTOCOL_VIOLATION, <<"unexpected DATAGRAM frame">>},
+        quic_connection_test_support:close_reason(S1)
+    ).
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -115,3 +143,26 @@ assert_peer_limit(PeerMax, Fit) ->
         {error, datagram_too_large},
         quic_connection:do_send_datagram(payload(Fit + 1), S0)
     ).
+
+assert_received(LocalMax, Frame, Want) ->
+    S0 = quic_connection_test_support:state_receiving_datagrams(LocalMax),
+    {ok, S1, _} = quic_connection:decode_and_process_streaming(app, Frame, S0),
+    Delivered = maps:get(delivered, quic_connection:datagram_stats_snapshot(S1)),
+    Reason = quic_connection_test_support:close_reason(S1),
+    case Want of
+        delivered ->
+            ?assertEqual(undefined, Reason),
+            ?assertEqual(1, Delivered);
+        closed ->
+            ?assertMatch(
+                {transport, ?QUIC_PROTOCOL_VIOLATION, <<"DATAGRAM frame too large">>}, Reason
+            ),
+            ?assertEqual(0, Delivered)
+    end,
+    flush_datagrams().
+
+flush_datagrams() ->
+    receive
+        {quic, _, {datagram, _}} -> flush_datagrams()
+    after 0 -> ok
+    end.
