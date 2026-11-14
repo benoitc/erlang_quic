@@ -67,8 +67,37 @@ All notable changes to this project will be documented in this file.
   congestion control callback are removed. Persistent congestion is now
   decided by the loss tracker, so a congestion control module no longer
   implements it.
+- Breaking: `quic:datagram_max_size/1` now returns the largest payload
+  `quic:send_datagram/2` accepts right now, not the limit the peer
+  advertised. That is the peer's limit less the frame overhead, or what
+  fits in one packet at the confirmed path MTU, whichever is smaller,
+  so it grows as path MTU discovery confirms larger packets. It is
+  still 0 when the peer does not support datagrams, and a connection
+  that is gone now returns `{error, closed}`. The peer's own value is
+  in `quic:get_peer_transport_params/1`. `quic_h3:max_datagram_size/2`
+  follows it.
 
 ### Fixed
+- Datagrams were checked against the largest packet size path MTU
+  discovery may try, not the size it has confirmed. A datagram between
+  the two was accepted and sent, and lost on a path that does not carry
+  it; those losses could also make the connection fall back to the
+  smallest packet size. A peer that limits UDP payloads to 1200 bytes
+  could also be sent datagrams larger than it accepts (RFC 9000 Section
+  18.2). A datagram now has to fit the confirmed path MTU, as RFC 8899
+  Section 3 requires, and is refused with `datagram_too_large_for_path`
+  until a larger one is confirmed.
+- The peer's `max_datagram_frame_size` was applied to the datagram
+  payload alone, so a datagram up to a few bytes over the peer's limit
+  was sent. The limit covers the whole frame (RFC 9221 Section 3), and
+  datagrams are now checked that way.
+- A received datagram up to a few bytes larger than our
+  `max_datagram_frame_size` was accepted. The connection now closes
+  with PROTOCOL_VIOLATION, as RFC 9221 Section 3 requires.
+- A datagram of more than 16383 bytes, on a path whose MTU allows it,
+  could be sent in a packet 2 bytes larger than the path MTU. A packet
+  that ended a flight could also be made 1 byte too large by the
+  immediate acknowledgment request added to it.
 - A stream reset could give a smaller final size than the stream's end
   had already given, when that end went out ahead of data still waiting
   to be sent. The peer then closed the whole connection, as RFC 9000

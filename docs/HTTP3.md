@@ -776,8 +776,9 @@ The owner process receives one event per inbound datagram:
 | `{datagram, StreamId, Payload}` | H3 datagram delivered on the given request stream |
 
 Datagrams for unknown stream ids are dropped silently per RFC 9297 §5.
-`quic_h3:max_datagram_size/2` reports the largest payload that fits
-under the peer's cap minus the quarter-stream-id prefix. Everything
+`quic_h3:max_datagram_size/2` reports the largest payload that can be
+sent now: `quic:datagram_max_size/1` minus the quarter-stream-id
+prefix. Everything
 else — loss, congestion drops, PMTU clamping — surfaces as the
 RFC 9221 error atoms from the QUIC layer (`datagram_too_large`,
 `datagram_too_large_for_path`, `congestion_limited`, etc.).
