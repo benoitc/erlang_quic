@@ -56,7 +56,7 @@ ack(Space, L0, CC0, PN, Now) ->
 ack_ranges(Space, L0, CC0, Ack, Now) ->
     {L, _Acked, Lost, Meta} = quic_loss:on_ack_received(Space, L0, Ack, Now),
     CC1 = quic_cc:on_packets_acked(CC0, maps:get(acked_bytes, Meta), Now),
-    CC = quic_connection:cc_after_loss(
+    {CC, _Persistent} = quic_connection:cc_after_loss(
         Space,
         CC1,
         maps:get(lost_bytes, Meta, 0),
@@ -138,6 +138,93 @@ rfc_example_test() ->
     ],
     ?assert(pc(Lost, L)),
     ?assertNot(pc(lists:keydelete(5, #sent_packet.pn, Lost), L)).
+
+%%====================================================================
+%% Losses declared in separate events
+%%====================================================================
+
+%% Packets 1 to 6 are declared lost by the ACK of 9, too close together
+%% for persistent congestion. 7 and 8, sent later, are still too recent
+%% and follow with the ACK of 10. 1 to 8 is one period, longer than the
+%% duration (RFC 9002 Section 7.6.2).
+losses_declared_apart_are_one_period_test() ->
+    {L1, CC1, D} = first_losses(),
+    {_L, Lost, CC} = ack_ranges(
+        app, sent_at(app, L1, 0, [D + 160], 10), CC1, ack_of([10]), D + 210
+    ),
+    ?assertEqual([7, 8], pns(Lost)),
+    ?assertEqual(minimum_window(), quic_cc:cwnd(CC)).
+
+%% Packet 7 acknowledged with 10 ends the period at 6.
+acknowledged_after_the_first_losses_test() ->
+    {L1, CC1, D} = first_losses(),
+    {_L, Lost, CC} = ack_ranges(
+        app, sent_at(app, L1, 0, [D + 160], 10), CC1, ack_of([10, 7]), D + 210
+    ),
+    ?assertEqual([8], pns(Lost)),
+    ?assert(quic_cc:cwnd(CC) > minimum_window()).
+
+%% Packet 6, declared lost, turns out acknowledged: 1 to 5 and 7 to 8 are
+%% two periods, neither long enough.
+late_acknowledged_loss_ends_the_period_test() ->
+    {L1, CC1, D} = first_losses(),
+    {_L, Lost, CC} = ack_ranges(
+        app, sent_at(app, L1, 0, [D + 160], 10), CC1, ack_of([10, 6]), D + 210
+    ),
+    ?assertEqual([7, 8], pns(Lost)),
+    ?assert(quic_cc:cwnd(CC) > minimum_window()).
+
+%% Once declared, the same losses start no other period.
+declared_losses_start_no_other_period_test() ->
+    {L1, _CC1, D} = first_losses(),
+    Later = [lost(7, 100 + D + 4), lost(8, 100 + D + 5)],
+    ?assert(pc(Later, L1)),
+    ?assertNot(pc(Later, quic_loss:on_persistent_congestion(L1))).
+
+%% Losses whose neighbours are both acknowledged can join no later loss,
+%% so a long run of them leaves nothing behind.
+isolated_losses_are_not_kept_test() ->
+    ?assert(
+        erts_debug:flat_size(isolated_losses(60)) - erts_debug:flat_size(isolated_losses(5)) < 100
+    ).
+
+%% N rounds of five packets, a second apart: the first is lost and the
+%% others acknowledged.
+isolated_losses(N) ->
+    lists:foldl(
+        fun(I, Acc0) ->
+            Base = 5 * I,
+            At = 1000 * I,
+            Acc1 = sent_at(app, Acc0, 0, lists:duplicate(5, At), Base),
+            {Acc, [_], _} = ack_ranges(
+                app, Acc1, quic_cc:new(), {ack, Base + 4, 0, 3, []}, At + 50
+            ),
+            Acc
+        end,
+        sampled(),
+        lists:seq(1, N)
+    ).
+
+%% Sampled at 50 with a 50 ms RTT, packets 1 to 6 are sent at 100 to 105,
+%% 7 to 9 just past the duration D; the ACK of 9 declares 1 to 6 lost.
+first_losses() ->
+    L0 = sampled(),
+    D = duration(L0),
+    L1 = sent_at(app, L0, 0, [100, 101, 102, 103, 104, 105, D + 104, D + 105, D + 106], 1),
+    {L, Lost, CC} = ack_ranges(app, L1, quic_cc:new(), ack_of([9]), D + 156),
+    [1, 2, 3, 4, 5, 6] = pns(Lost),
+    true = quic_cc:cwnd(CC) > minimum_window(),
+    {L, CC, D}.
+
+%% An ACK frame for the packet numbers given, newest first.
+ack_of([Largest | Rest]) ->
+    {ack, Largest, 0, 0, gaps(Largest, Rest)}.
+
+gaps(_Prev, []) -> [];
+gaps(Prev, [PN | Rest]) -> [{Prev - PN - 2, 0} | gaps(PN, Rest)].
+
+pns(Packets) ->
+    lists:sort([PN || #sent_packet{pn = PN} <- Packets]).
 
 %% A first RTT sample at 50 from packet 0 of the application space.
 sampled() ->

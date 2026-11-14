@@ -68,6 +68,7 @@
     get_pto_time_and_space/3,
     persistent_congestion_pto/1,
     persistent_congestion/3,
+    on_persistent_congestion/1,
     after_first_rtt_sample/2,
     on_pto_expired/1,
     keep_pto_backoff/2,
@@ -105,6 +106,11 @@
 -define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 % RFC 9002 default is 333ms, but 100ms is more aggressive for faster ramp-up
 -define(DEFAULT_INITIAL_RTT, 100).
+
+%% {FromPN, ToPN, FirstEnd, LastEnd}: the send times of the first and last
+%% packets in the range that can end a persistent congestion period.
+-type lost_run() ::
+    {non_neg_integer(), non_neg_integer(), integer() | undefined, integer() | undefined}.
 
 %% Loss detection state.
 %%
@@ -145,7 +151,11 @@
     recent_lost = [] :: [{non_neg_integer(), integer(), packet | time, [term()]}],
     %% Set when one of the current losses aged out unacknowledged: that
     %% episode was a real loss and its window cut stays.
-    loss_confirmed = false :: boolean()
+    loss_confirmed = false :: boolean(),
+    %% Packet numbers declared lost, oldest first, kept while a later loss
+    %% can still extend them into a persistent congestion period (RFC 9002
+    %% Section 7.6.2).
+    lost_runs = [] :: [lost_run()]
 }).
 
 -record(loss_state, {
@@ -501,12 +511,13 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
     PApp = remember_lost(LostList, LargestAcked, Now, P0),
     NewState2 = set_pn(
         Space,
-        PApp#pn_loss{
+        record_lost_runs(Space, LostList, NewState1, PApp#pn_loss{
             sent_q = NewQ,
             largest_acked = newest(PApp#pn_loss.largest_acked, LargestAcked),
             largest_acked_sent = newest_sent(AckedList, PApp#pn_loss.largest_acked_sent),
-            ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled)
-        },
+            ae_in_flight = max(0, PApp#pn_loss.ae_in_flight - Settled),
+            lost_runs = unacked_runs(PApp#pn_loss.lost_runs, AckedRanges)
+        }),
         newly_acked(AckedList, Now, NewState1#loss_state{bytes_in_flight = NewInFlight})
     ),
 
@@ -617,10 +628,12 @@ detect_lost_packets(
     LostAE = length([L || #sent_packet{ack_eliciting = true} = L <- LostPackets]),
     NewState = set_pn(
         Space,
-        (remember_lost(LostPackets, LargestAcked, Now, P))#pn_loss{
+        record_lost_runs(Space, LostPackets, State, (remember_lost(
+            LostPackets, LargestAcked, Now, P
+        ))#pn_loss{
             sent_q = SurvQ,
             ae_in_flight = max(0, P#pn_loss.ae_in_flight - LostAE)
-        },
+        }),
         State#loss_state{
             bytes_in_flight = max(0, State#loss_state.bytes_in_flight - LostBytes)
         }
@@ -998,34 +1011,131 @@ after_first_rtt_sample(#loss_state{first_rtt_sample = T}, #sent_packet{time_sent
     Sent > T.
 
 %% @doc Whether the packets just declared lost in Space establish
-%% persistent congestion (RFC 9002 Section 7.6.2). A packet number neither
-%% lost nor queued counts as acknowledged; another space blocks every
-%% packet sent before the newest one it acknowledged.
+%% persistent congestion (RFC 9002 Section 7.6.2). The two packets need not
+%% be declared lost together: the space's earlier losses count too. A
+%% packet number neither lost nor queued counts as acknowledged; another
+%% space blocks every packet sent before the newest one it acknowledged.
 -spec persistent_congestion(space(), [#sent_packet{}], loss_state()) -> boolean().
+persistent_congestion(_Space, [], _State) ->
+    false;
 persistent_congestion(_Space, _Lost, #loss_state{first_rtt_sample = undefined}) ->
     false;
 persistent_congestion(Space, Lost, #loss_state{} = State) ->
     Since = acked_elsewhere(Space, State),
-    Declared = lists:keysort(1, [
-        {PN, TS, run_end(Space, P, Since, State)}
-     || #sent_packet{pn = PN, time_sent = TS} = P <- Lost
-    ]),
+    #pn_loss{lost_runs = Runs0, sent_q = Q} = pn(Space, State),
+    Runs = add_runs(lists:sort([as_run(Space, P, State) || P <- Lost]), Runs0),
+    {First, _, _, _} = hd(Runs),
+    {_, Last, _, _} = lists:last(Runs),
+    Kept = kept_between(Q, First, Last, []),
+    Entries = [clip(R, Since) || R <- lists:merge(Runs, Kept)],
     Duration = persistent_congestion_pto(State) * ?PERSISTENT_CONGESTION_THRESHOLD,
-    case (spans([TS || {_, TS, true} <- Declared]) > Duration) of
-        false ->
-            false;
-        true ->
-            [{First, _, _} | _] = Declared,
-            {Last, _, _} = lists:last(Declared),
-            Kept = kept_between((pn(Space, State))#pn_loss.sent_q, First, Last, []),
-            in_one_run(lists:merge(Declared, Kept), undefined, undefined, Duration)
+    in_one_run(Entries, undefined, undefined, undefined, Duration).
+
+%% @doc Persistent congestion has been declared: the losses behind it
+%% start no other period.
+-spec on_persistent_congestion(loss_state()) -> loss_state().
+on_persistent_congestion(#loss_state{initial = I, handshake = H, app = A} = State) ->
+    State#loss_state{
+        initial = I#pn_loss{lost_runs = []},
+        handshake = H#pn_loss{lost_runs = []},
+        app = A#pn_loss{lost_runs = []}
+    }.
+
+%% Add the packets just declared lost to the space's runs, and drop the
+%% runs no later loss can reach: both neighbours acknowledged. A run
+%% holding one of these losses stays until it has been evaluated.
+record_lost_runs(_Space, [], _State, P) ->
+    P;
+record_lost_runs(Space, Lost, State, #pn_loss{lost_runs = Runs0, sent_q = Q} = P) ->
+    New = lists:sort([as_run(Space, L, State) || L <- Lost]),
+    Runs = add_runs(New, Runs0),
+    Live = live_runs(Runs, queued_neighbours(Runs, Q), [PN || {PN, _, _, _} <- New], P),
+    P#pn_loss{lost_runs = lists:nthtail(max(0, length(Live) - ?MAX_RECENT_LOST), Live)}.
+
+as_run(Space, #sent_packet{pn = PN} = P, State) ->
+    End = end_time(Space, P, State),
+    {PN, PN, End, End}.
+
+%% A packet can end a period when it is ack-eliciting, was sent after the
+%% first RTT sample and on the current path, and is no PMTU probe, whose
+%% loss is no congestion signal (RFC 8899 Section 3).
+end_time(Space, #sent_packet{ack_eliciting = true, time_sent = TS, frames = Frames} = P, State) ->
+    case
+        after_first_rtt_sample(State, P) andalso
+            not (Space =:= app andalso
+                (on_earlier_path(State, P) orelse lists:member(padding, Frames)))
+    of
+        true -> TS;
+        false -> undefined
+    end;
+end_time(_Space, #sent_packet{}, _State) ->
+    undefined.
+
+%% Merge two sorted run lists, joining runs that touch.
+add_runs(New, Old) ->
+    join_runs(lists:merge(New, Old), []).
+
+join_runs([], Acc) ->
+    lists:reverse(Acc);
+join_runs([{F2, T2, FE2, LE2} | Rest], [{F1, T1, FE1, LE1} | Acc]) when F2 =< T1 + 1 ->
+    join_runs(Rest, [{F1, max(T1, T2), earliest(FE1, FE2), latest(LE1, LE2)} | Acc]);
+join_runs([R | Rest], Acc) ->
+    join_runs(Rest, [R | Acc]).
+
+earliest(undefined, B) -> B;
+earliest(A, undefined) -> A;
+earliest(A, B) -> min(A, B).
+
+latest(undefined, B) -> B;
+latest(A, undefined) -> A;
+latest(A, B) -> max(A, B).
+
+%% A run an acknowledgement covers holds a packet that was not lost
+%% after all, so it can no longer stand for an unbroken loss.
+unacked_runs(Runs, AckedRanges) ->
+    [R || {F, T, _, _} = R <- Runs, not overlaps(F, T, AckedRanges)].
+
+overlaps(_F, _T, []) -> false;
+overlaps(F, T, [{Start, End} | _]) when F =< End, T >= Start -> true;
+overlaps(F, T, [_ | Rest]) -> overlaps(F, T, Rest).
+
+%% The packet numbers next to a run that are still queued.
+queued_neighbours(Runs, Q) ->
+    Wanted = lists:append([[F - 1, T + 1] || {F, T, _, _} <- Runs]),
+    queued_among(Q, sets:from_list(Wanted), lists:max(Wanted), sets:new()).
+
+queued_among(Q, Wanted, Max, Acc) ->
+    case queue:out(Q) of
+        {{value, #sent_packet{pn = PN}}, Q1} when PN =< Max ->
+            case sets:is_element(PN, Wanted) of
+                true -> queued_among(Q1, Wanted, Max, sets:add_element(PN, Acc));
+                false -> queued_among(Q1, Wanted, Max, Acc)
+            end;
+        _ ->
+            Acc
     end.
 
-run_end(Space, #sent_packet{ack_eliciting = true, time_sent = TS} = P, Since, State) ->
-    after_first_rtt_sample(State, P) andalso (Since =:= undefined orelse TS > Since) andalso
-        not (Space =:= app andalso on_earlier_path(State, P));
-run_end(_Space, #sent_packet{}, _Since, _State) ->
-    false.
+%% A run is live while a neighbour is still queued, or the packet after
+%% it has not been sent yet.
+live_runs(Runs, Queued, Fresh, #pn_loss{sent_q = Q, largest_acked = LargestAcked}) ->
+    Newest =
+        case queue:peek_r(Q) of
+            {value, #sent_packet{pn = PN}} -> PN;
+            empty -> -1
+        end,
+    Sent = max(
+        Newest,
+        case LargestAcked of
+            undefined -> -1;
+            LA -> LA
+        end
+    ),
+    [
+        R
+     || {F, T, _, _} = R <- Runs,
+        sets:is_element(F - 1, Queued) orelse sets:is_element(T + 1, Queued) orelse T >= Sent orelse
+            lists:any(fun(PN) -> PN >= F andalso PN =< T end, Fresh)
+    ].
 
 %% Send time of the newest packet another space acknowledged.
 acked_elsewhere(Space, State) ->
@@ -1041,35 +1151,42 @@ acked_elsewhere(Space, State) ->
         [S || S <- [initial, handshake, app], S =/= Space]
     ).
 
-spans([]) -> 0;
-spans(Times) -> lists:max(Times) - lists:min(Times).
+%% Only packets sent after Since can end a period.
+clip(Run, undefined) ->
+    Run;
+clip({F, T, FE, LE}, Since) when FE =/= undefined, FE > Since ->
+    {F, T, FE, LE};
+clip({F, T, _FE, LE}, Since) when LE =/= undefined, LE > Since ->
+    {F, T, LE, LE};
+clip({F, T, _, _}, _Since) ->
+    {F, T, undefined, undefined}.
 
-%% The queued packets numbered First to Last, oldest first, as run entries.
+%% The queued packets numbered First to Last, oldest first, as runs that
+%% end no period.
 kept_between(Q, First, Last, Acc) ->
     case queue:out(Q) of
         {{value, #sent_packet{pn = PN}}, _} when PN > Last ->
             lists:reverse(Acc);
-        {{value, #sent_packet{pn = PN, time_sent = TS}}, Q1} when PN > First ->
-            kept_between(Q1, First, Last, [{PN, TS, false} | Acc]);
+        {{value, #sent_packet{pn = PN}}, Q1} when PN > First ->
+            kept_between(Q1, First, Last, [{PN, PN, undefined, undefined} | Acc]);
         {{value, _}, Q1} ->
             kept_between(Q1, First, Last, Acc);
         {empty, _} ->
             lists:reverse(Acc)
     end.
 
-%% Walk {PN, TS, IsEnd} in packet number order; a gap starts a new run.
-in_one_run([], _Prev, _Start, _Duration) ->
-    false;
-in_one_run([{PN, _, _} | _] = Entries, Prev, _Start, Duration) when
-    Prev =/= undefined, PN =/= Prev + 1
+%% Walk the runs in packet number order; a gap starts a new period.
+in_one_run([], _Prev, Start, End, Duration) ->
+    spans(Start, End, Duration);
+in_one_run([{F, _, _, _} | _] = Runs, Prev, Start, End, Duration) when
+    Prev =/= undefined, F =/= Prev + 1
 ->
-    in_one_run(Entries, undefined, undefined, Duration);
-in_one_run([{PN, TS, true} | Rest], _Prev, undefined, Duration) ->
-    in_one_run(Rest, PN, TS, Duration);
-in_one_run([{_PN, TS, true} | _], _Prev, Start, Duration) when TS - Start > Duration ->
-    true;
-in_one_run([{PN, _, _} | Rest], _Prev, Start, Duration) ->
-    in_one_run(Rest, PN, Start, Duration).
+    spans(Start, End, Duration) orelse in_one_run(Runs, undefined, undefined, undefined, Duration);
+in_one_run([{_, T, FE, LE} | Rest], _Prev, Start, End, Duration) ->
+    in_one_run(Rest, T, earliest(Start, FE), latest(End, LE), Duration).
+
+spans(Start, End, Duration) when is_integer(Start), is_integer(End) -> End - Start > Duration;
+spans(_Start, _End, _Duration) -> false.
 
 pto(#loss_state{rtt = RTT, pto_count = PTOCount}, MaxAckDelay) ->
     PTO = quic_rtt:smoothed(RTT) + max(4 * quic_rtt:var(RTT), ?GRANULARITY) + MaxAckDelay,

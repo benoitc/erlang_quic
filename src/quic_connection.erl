@@ -6579,9 +6579,10 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             {CCState3, NewLossState1, State0a} = process_ecn(
                 Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
             ),
-            CCState4 = cc_after_loss(
+            {CCState4, Persistent} = cc_after_loss(
                 Level, CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
+            NewLossState2 = after_persistent_congestion(Persistent, NewLossState1),
             %% Only in-flight packets move the window (RFC 9002 Appendix B.5).
             CCState5 = cc_after_ack(
                 CCState4,
@@ -6606,7 +6607,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 end,
 
             State1 = State0a#state{
-                loss_state = NewLossState1,
+                loss_state = NewLossState2,
                 cc_state = CCState6,
                 pto_dirty = true
             },
@@ -10293,7 +10294,8 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
 
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
-%% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
+%% congestion event, then persistent congestion (RFC 9002 Appendix B.8),
+%% and whether it was declared.
 -spec loss_response(
     quic_loss:space(),
     quic_cc:cc_state(),
@@ -10301,7 +10303,7 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
     non_neg_integer() | undefined,
     [#sent_packet{}],
     quic_loss:loss_state()
-) -> quic_cc:cc_state().
+) -> {quic_cc:cc_state(), boolean()}.
 loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
@@ -10318,9 +10320,12 @@ loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, Loss
 %% RFC 9002 Section 7.6.2: the window drops to its minimum.
 check_persistent_congestion(Space, LostPackets, LossState, CCState) ->
     case quic_loss:persistent_congestion(Space, LostPackets, LossState) of
-        true -> quic_cc:on_persistent_congestion(CCState);
-        false -> CCState
+        true -> {quic_cc:on_persistent_congestion(CCState), true};
+        false -> {CCState, false}
     end.
+
+after_persistent_congestion(true, LossState) -> quic_loss:on_persistent_congestion(LossState);
+after_persistent_congestion(false, LossState) -> LossState.
 
 %% Generate a connection ID
 %% Uses LB config if available, otherwise random 8 bytes
@@ -14133,7 +14138,9 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
             [] -> undefined;
             _ -> lists:max([TS || #sent_packet{time_sent = TS} <- InFlight])
         end,
-    NewCC = cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState),
+    {NewCC, Persistent} = cc_after_loss(
+        Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState
+    ),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -14142,7 +14149,9 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
         end,
         Lost
     ),
-    retransmit_for_space(Space, Lost, State#state{cc_state = NewCC}).
+    retransmit_for_space(Space, Lost, State#state{
+        cc_state = NewCC, loss_state = after_persistent_congestion(Persistent, LossState)
+    }).
 
 retransmit_for_space(app, Lost, State) -> retransmit_lost_packets(Lost, State);
 retransmit_for_space(Space, Lost, State) -> retransmit_lost_handshake(Space, Lost, State).
