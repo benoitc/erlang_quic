@@ -3528,8 +3528,8 @@ packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
     {AckEliciting, AckEliciting orelse Padded orelse lists:member(padding, Frames)}.
 
-%% RFC 9002 Section 7: a handshake packet counts against the congestion
-%% window like any other. A refusal holds the frames rather than the
+%% RFC 9002 Section 7: a handshake packet in flight, ack-eliciting or
+%% padded (Section 2), counts against the congestion window like any other. A refusal holds the frames rather than the
 %% encoded packet, so the packet number is not spent and the packet is
 %% rebuilt when the window reopens.
 %%
@@ -3540,18 +3540,23 @@ packet_flags(Frames, Padded) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
-%% A packet that is not ack-eliciting is not congestion controlled
-%% (RFC 9002 Section 7), padded or not, and holding one back is worse than
-%% pointless: an acknowledgement is what frees the window, so deferring it
-%% can stall the very handshake that would unblock the sender.
+%% Only a packet holding nothing but ACK frames is not congestion
+%% controlled. A padded ACK-only Initial waits like the rest: the window
+%% reopens on the peer's acknowledgements, which do not depend on ours.
 admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
-admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
     {ok, State};
-admit(_Space, _AckEliciting, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
+admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
 admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
-    case quic_cc:send_check(CCState, Size) of
+    case closes(Frames) of
+        true -> {ok, State};
+        false -> admit_cwnd(Space, quic_cc:send_check(CCState, Size), Payload, Frames, State)
+    end.
+
+admit_cwnd(Space, Check, Payload, Frames, State) ->
+    case Check of
         {ok, NewCC} ->
             {ok, State#state{cc_state = NewCC}};
         {blocked_cwnd, _Avail} ->
@@ -3565,6 +3570,12 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
             %% schedule its own retry.
             {deferred, maybe_set_pacing_timer(Delay, enqueue_hs(Space, Payload, Frames, State))}
     end.
+
+%% A closing endpoint may drop all but what it needs to send
+%% CONNECTION_CLOSE (RFC 9000 Section 10.2) and stops reading ACKs, so a
+%% full window would never reopen for the close.
+closes(Frames) ->
+    lists:keymember(connection_close, 1, Frames).
 
 %% A queue, so both ends are cheap: a sustained refusal appends and the
 %% drain takes from the head.
@@ -3745,7 +3756,7 @@ send_initial_packet(Payload, Frames, State) ->
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
-    case gate(initial, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(initial, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -3968,7 +3979,7 @@ send_handshake_packet(Payload, Frames, State) ->
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Meta = {handshake, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
     Datagram = long_datagram(handshake, Packet, false, State),
-    case gate(handshake, AckEliciting, byte_size(Packet), Datagram, Payload, Frames, State) of
+    case gate(handshake, InFlight, byte_size(Packet), Datagram, Payload, Frames, State) of
         {deferred, Deferred} ->
             Deferred;
         {ok, Admitted} ->
@@ -4014,7 +4025,8 @@ send_app_packet_internal(Payload, Frames, State) ->
 
 %% RFC 9002 Section 7: an ack-eliciting packet goes out only if the window
 %% and the pacer have room for it, unless it is a PTO probe (Section 7.5).
-%% Packets that are not ack-eliciting are never held back.
+%% The only padded 1-RTT packet that is not ack-eliciting is a short
+%% CONNECTION_CLOSE, which is exempt like the handshake ones (closes/1).
 app_admit(Size, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> admit_in_flight(Size, State);
@@ -4643,14 +4655,14 @@ amp_account_recv(_Data, State) ->
 %% A refused probe is not queued: what it carries is still outstanding,
 %% so the next probe carries it again, and a queued copy per expiry is
 %% what filled the queue.
-gate(Space, AckEliciting, Size, Datagram, Payload, Frames, State) ->
+gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
             {deferred, State#state{hs = (State#state.hs)#hs{amp_probe_blocked = true}}};
         false ->
             {deferred, enqueue_hs(Space, Payload, Frames, State)};
         true ->
-            admit(Space, AckEliciting, Size, Payload, Frames, State)
+            admit(Space, InFlight, Size, Payload, Frames, State)
     end.
 
 %% RFC 9000 Section 8.1: until it has validated the peer address a
@@ -6567,9 +6579,10 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             {CCState3, NewLossState1, State0a} = process_ecn(
                 Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
             ),
-            CCState4 = cc_after_loss(
+            {CCState4, Persistent} = cc_after_loss(
                 Level, CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
+            NewLossState2 = after_persistent_congestion(Persistent, NewLossState1),
             %% Only in-flight packets move the window (RFC 9002 Appendix B.5).
             CCState5 = cc_after_ack(
                 CCState4,
@@ -6594,7 +6607,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 end,
 
             State1 = State0a#state{
-                loss_state = NewLossState1,
+                loss_state = NewLossState2,
                 cc_state = CCState6,
                 pto_dirty = true
             },
@@ -7137,8 +7150,20 @@ process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
 
-%% draft-ietf-quic-ack-frequency-14 Section 4: a Requested Max Ack Delay
-%% below our min_ack_delay or at 2^14 ms or more is a PROTOCOL_VIOLATION.
+%% draft-ietf-quic-ack-frequency-14 Section 4: a frame whose Sequence
+%% Number is not above the largest processed is ignored, fields and all.
+apply_ack_frequency(
+    Seq,
+    _Threshold,
+    _Delay,
+    _Reordering,
+    #state{
+        peer_ack_freq = #peer_ack_freq{seq = Last}
+    } = State
+) when Seq =< Last ->
+    State;
+%% Section 4: a Requested Max Ack Delay below our min_ack_delay or at
+%% 2^14 ms or more is a PROTOCOL_VIOLATION.
 apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
     Delay < ?MIN_ACK_DELAY_US orelse Delay >= ?MAX_REQUESTED_ACK_DELAY_US
 ->
@@ -7150,17 +7175,6 @@ apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
         <<"invalid Requested Max Ack Delay">>,
         State
     );
-%% Section 4: only a Sequence Number above the largest processed counts.
-apply_ack_frequency(
-    Seq,
-    _Threshold,
-    _Delay,
-    _Reordering,
-    #state{
-        peer_ack_freq = #peer_ack_freq{seq = Last}
-    } = State
-) when Seq =< Last ->
-    State;
 apply_ack_frequency(Seq, Threshold, DelayUs, Reordering, #state{ack_timer = Timer} = State) ->
     DelayMs = DelayUs div 1000,
     %% A timer armed for a longer delay is dropped; this ack-eliciting packet arms a new one.
@@ -10280,7 +10294,8 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
 
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
-%% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
+%% congestion event, then persistent congestion (RFC 9002 Appendix B.8),
+%% and whether it was declared.
 -spec loss_response(
     quic_loss:space(),
     quic_cc:cc_state(),
@@ -10288,7 +10303,7 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
     non_neg_integer() | undefined,
     [#sent_packet{}],
     quic_loss:loss_state()
-) -> quic_cc:cc_state().
+) -> {quic_cc:cc_state(), boolean()}.
 loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
@@ -10305,9 +10320,12 @@ loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, Loss
 %% RFC 9002 Section 7.6.2: the window drops to its minimum.
 check_persistent_congestion(Space, LostPackets, LossState, CCState) ->
     case quic_loss:persistent_congestion(Space, LostPackets, LossState) of
-        true -> quic_cc:on_persistent_congestion(CCState);
-        false -> CCState
+        true -> {quic_cc:on_persistent_congestion(CCState), true};
+        false -> {CCState, false}
     end.
+
+after_persistent_congestion(true, LossState) -> quic_loss:on_persistent_congestion(LossState);
+after_persistent_congestion(false, LossState) -> LossState.
 
 %% Generate a connection ID
 %% Uses LB config if available, otherwise random 8 bytes
@@ -14120,7 +14138,9 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
             [] -> undefined;
             _ -> lists:max([TS || #sent_packet{time_sent = TS} <- InFlight])
         end,
-    NewCC = cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState),
+    {NewCC, Persistent} = cc_after_loss(
+        Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState
+    ),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -14129,7 +14149,9 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
         end,
         Lost
     ),
-    retransmit_for_space(Space, Lost, State#state{cc_state = NewCC}).
+    retransmit_for_space(Space, Lost, State#state{
+        cc_state = NewCC, loss_state = after_persistent_congestion(Persistent, LossState)
+    }).
 
 retransmit_for_space(app, Lost, State) -> retransmit_lost_packets(Lost, State);
 retransmit_for_space(Space, Lost, State) -> retransmit_lost_handshake(Space, Lost, State).

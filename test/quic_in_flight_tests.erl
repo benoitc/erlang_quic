@@ -88,15 +88,39 @@ client_ack_only_initial_is_in_flight_test() ->
     ?assertEqual(1200, Size),
     ?assertEqual({Size, Size}, counts(S1)).
 
-%% It is still not congestion controlled (RFC 9002 Section 7): it goes out
-%% with the window full.
-padded_ack_only_initial_goes_out_with_a_full_window_test() ->
-    CC = quic_cc:on_packet_sent(quic_cc:new(#{initial_window => 12000}), 12000),
-    S = ?S:state_set(?S:state_sending(owing_initial_ack(?S:state_with_keys(client))), cc_state, CC),
+%% Being in flight, it waits for the congestion window (RFC 9002 Section
+%% 7): with the window full it is held, not sent and not counted.
+padded_ack_only_initial_waits_for_a_full_window_test() ->
+    S1 = quic_connection:send_initial_ack(full_window(owing_initial_ack(client()))),
+    ?assertEqual(0, ?S:state_get(S1, initial_next_pn)),
+    ?assertMatch([_], ?S:pending_hs(S1, initial)),
+    ?assertEqual({0, 12000}, counts(S1)).
+
+%% Once the window has room it goes out padded and counts in flight.
+held_ack_only_initial_goes_out_when_the_window_opens_test() ->
+    S1 = quic_connection:send_initial_ack(full_window(owing_initial_ack(client()))),
+    S2 = quic_connection:drain_pending_hs(?S:state_set(S1, cc_state, quic_cc:new(#{}))),
+    ?assertEqual([], ?S:pending_hs(S2, initial)),
+    #sent_packet{ack_eliciting = false, in_flight = true, size = 1200} =
+        sent(initial, 0, loss(S2)),
+    ?assertEqual({1200, 1200}, counts(S2)).
+
+%% A PTO probe is exempt (Section 7).
+padded_ack_only_initial_probe_goes_out_with_a_full_window_test() ->
+    S = ?S:state_set(full_window(owing_initial_ack(client())), hs_probe, true),
     S1 = quic_connection:send_initial_ack(S),
     ?assertEqual(1, ?S:state_get(S1, initial_next_pn)),
-    ?assertEqual([], ?S:pending_hs(S1, initial)),
-    ?assertEqual(12000 + 1200, quic_cc:bytes_in_flight(?S:state_get(S1, cc_state))).
+    ?assertEqual([], ?S:pending_hs(S1, initial)).
+
+%% So is a CONNECTION_CLOSE: a closing endpoint no longer reads the ACKs
+%% that would reopen the window (RFC 9000 Section 10.2).
+initial_close_goes_out_with_a_full_window_test() ->
+    Close = {connection_close, transport, 0, 0, <<>>},
+    S1 = quic_connection:send_initial_packet(
+        quic_frame:encode(Close), [Close], full_window(client())
+    ),
+    ?assertEqual(1, ?S:state_get(S1, initial_next_pn)),
+    ?assertEqual([], ?S:pending_hs(S1, initial)).
 
 acknowledged_ack_only_initial_leaves_both_counts_test() ->
     S1 = quic_connection:send_initial_ack(?S:state_sending(owing_initial_ack(client()))),
@@ -144,6 +168,11 @@ owing_initial_ack(S) ->
 
 loss(S) ->
     ?S:loss_state(S).
+
+%% A sending client whose 12000-byte window is already full.
+full_window(S) ->
+    CC = quic_cc:on_packet_sent(quic_cc:new(#{initial_window => 12000}), 12000),
+    ?S:state_set(?S:state_sending(S), cc_state, CC).
 
 %% {loss tracker, congestion controller} bytes in flight.
 counts(S) ->

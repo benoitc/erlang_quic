@@ -20,6 +20,7 @@
     new/0,
     new/1,
     reset/1,
+    reset_min/1,
     update/3,
     latest/1,
     smoothed/1,
@@ -60,6 +61,15 @@ new(InitialRTT) ->
 -spec reset(state()) -> state().
 reset(#rtt_state{}) ->
     new().
+
+%% @doc Set the minimum to the latest sample, as after persistent
+%% congestion, so a path whose RTT rose is not judged by its old minimum
+%% (RFC 9002 Section 5.2).
+-spec reset_min(state()) -> state().
+reset_min(#rtt_state{first_sample = false} = State) ->
+    State;
+reset_min(#rtt_state{latest = L} = State) ->
+    State#rtt_state{min = L}.
 
 %% @doc Take a sample. `AckDelay' is what the caller has already decided
 %% to subtract, in milliseconds.

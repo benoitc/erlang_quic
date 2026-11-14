@@ -117,8 +117,8 @@ All notable changes to this project will be documented in this file.
 - Packets that carry padding but nothing that needs an acknowledgment,
   such as a client's Initial packets that only acknowledge, were not
   counted as data in flight. They now count until they are acknowledged,
-  declared lost or discarded (RFC 9002 Section 2), and they still go out
-  when the congestion window is full, as acknowledgments do (Section 7).
+  declared lost or discarded (RFC 9002 Section 2), and like other data
+  in flight they wait for room in the congestion window (Section 7).
 - The loss tracker and the congestion controller could disagree about
   the data in flight: discarding the Initial or Handshake keys removed
   bytes that had never been counted, which could take the count of
@@ -140,6 +140,10 @@ All notable changes to this project will be documented in this file.
   packets that needed an acknowledgment, sent after the first RTT
   sample and more than the persistent congestion duration apart, with
   no packet sent between them acknowledged in any packet number space.
+  The two packets no longer have to be declared lost at the same time,
+  and once persistent congestion is declared the minimum RTT restarts
+  from the newest sample, so a path whose RTT rose is not declared
+  congested again and again (Section 5.2).
 - A client that had sent 0-RTT data could not complete a connection
   when the server answered with a Retry: processing the Retry failed
   each time and the connection timed out. The 0-RTT data now goes out
