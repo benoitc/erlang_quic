@@ -65,6 +65,12 @@ All notable changes to this project will be documented in this file.
   urgency argument.
 
 ### Fixed
+- A client that had sent 0-RTT data could not complete a connection
+  when the server answered with a Retry: processing the Retry failed
+  each time and the connection timed out. The 0-RTT data now goes out
+  again as 0-RTT after the new Initial, to the connection ID the Retry
+  gave (RFC 9000 Section 17.2.5.3), without data the stream no longer
+  needs (Section 13.3).
 - Control frames were sent even when the congestion window was full,
   and still counted as in flight: MAX_DATA, MAX_STREAM_DATA,
   MAX_STREAMS, the BLOCKED frames, NEW_CONNECTION_ID,
