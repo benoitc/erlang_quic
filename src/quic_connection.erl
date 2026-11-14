@@ -513,11 +513,11 @@ set_owner_sync(_Conn, _NewOwner) ->
 send_datagram(Conn, Data) ->
     call(Conn, {send_datagram, Data}).
 
-%% @doc Get maximum datagram payload size.
+%% @doc Largest datagram payload send_datagram/2 accepts now.
 %% Returns 0 if peer doesn't support datagrams.
--spec datagram_max_size(pid()) -> non_neg_integer().
+-spec datagram_max_size(pid()) -> non_neg_integer() | {error, term()}.
 datagram_max_size(Conn) ->
-    gen_statem:call(Conn, datagram_max_size).
+    call(Conn, datagram_max_size).
 
 -spec datagram_stats(pid()) ->
     #{
@@ -1813,8 +1813,8 @@ connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = Stat
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
-connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
-    {keep_state, State, [{reply, From, Size}]};
+connected({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 connected({call, From}, datagram_stats, State) ->
     {keep_state, State, [{reply, From, datagram_stats_snapshot(State)}]};
 connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
@@ -11776,6 +11776,11 @@ short_header_overhead(#state{dcid = Dcid}) ->
 datagram_path_budget(State) ->
     datagram_frame_payload(get_current_mtu(State) - short_header_overhead(State)).
 
+%% Largest DATAGRAM payload sendable now, for both send_datagram and
+%% datagram_max_size; -1 when none fits.
+datagram_budget(#state{max_datagram_frame_size_remote = PeerMax} = State) ->
+    min(datagram_frame_payload(PeerMax), datagram_path_budget(State)).
+
 %% Largest payload whose DATAGRAM frame, type and length included, fits
 %% in Max bytes (RFC 9221 Section 3); -1 when not even an empty one does.
 datagram_frame_payload(Max) when Max < 2 ->
@@ -11857,14 +11862,10 @@ do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
 do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
+    Budget = datagram_budget(State),
     PeerLimit = datagram_frame_payload(PeerMax),
-    PmtuBudget = datagram_path_budget(State),
     if
-        DataSize > PeerLimit ->
-            {error, datagram_too_large};
-        DataSize > PmtuBudget ->
-            {error, datagram_too_large_for_path};
-        true ->
+        DataSize =< Budget ->
             Frame = {datagram_with_length, DataBin},
             Payload = quic_frame:encode(Frame),
             case app_admit(byte_size(Payload), [Frame], State) of
@@ -11875,7 +11876,11 @@ do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State)
                     %% Unreliable, so dropped rather than held (RFC 9221 Section 5).
                     bump(?C_DATAGRAM_SEND_DROPPED, 1, State1),
                     {error, congestion_limited, State1}
-            end
+            end;
+        DataSize > PeerLimit ->
+            {error, datagram_too_large};
+        true ->
+            {error, datagram_too_large_for_path}
     end.
 
 %% Send stream data in fragments, tracking how many bytes were actually sent

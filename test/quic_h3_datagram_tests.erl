@@ -72,11 +72,27 @@ id_to_setting_h3_datagram_test() ->
 
 %% Peer advertising SETTINGS_H3_DATAGRAM=1 without a non-zero QUIC
 %% max_datagram_frame_size MUST be treated as H3_SETTINGS_ERROR.
-peer_h3_datagram_without_quic_datagram_is_settings_error_test() ->
-    ?assertThrow(
-        {connection_error, ?H3_SETTINGS_ERROR, _},
-        quic_h3_connection:validate_peer_h3_datagram_with(0)
-    ).
+peer_h3_datagram_without_quic_datagram_is_settings_error_test_() ->
+    [
+        ?_assertThrow(
+            {connection_error, ?H3_SETTINGS_ERROR, _},
+            quic_h3_connection:validate_peer_h3_datagram_with(Params)
+        )
+     || Params <- [{ok, #{}}, {ok, #{max_datagram_frame_size => 0}}]
+    ].
 
-peer_h3_datagram_with_quic_datagram_ok_test() ->
-    ?assertEqual(true, quic_h3_connection:validate_peer_h3_datagram_with(1200)).
+%% Any non-zero limit is support, even one too small for a payload.
+peer_h3_datagram_with_quic_datagram_ok_test_() ->
+    [
+        ?_assertEqual(
+            true,
+            quic_h3_connection:validate_peer_h3_datagram_with(
+                {ok, #{max_datagram_frame_size => Max}}
+            )
+        )
+     || Max <- [1, 1200, 65535]
+    ].
+
+%% Without the peer's parameters, datagrams stay off and nothing closes.
+peer_h3_datagram_without_quic_parameters_stays_off_test() ->
+    ?assertEqual(false, quic_h3_connection:validate_peer_h3_datagram_with({error, closed})).

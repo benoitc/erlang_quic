@@ -123,6 +123,27 @@ receive_without_support_is_unexpected_test() ->
     ).
 
 %%====================================================================
+%% datagram_max_size/1
+%%====================================================================
+
+%% The size reported is the one send_datagram enforces: the smaller of
+%% the peer's frame limit and the path budget, 0 without peer support.
+max_size_is_what_send_accepts_test_() ->
+    Path = {error, datagram_too_large_for_path},
+    Peer = {error, datagram_too_large},
+    None = {error, datagrams_not_supported},
+    Cases = [
+        {"path bound", 65535, 1200 - ?HEADER - ?FRAME_2, ok, Path},
+        {"peer bound", 100, 97, ok, Peer},
+        {"nothing fits", 1, 0, Peer, Peer},
+        {"no support", 0, 0, None, None}
+    ],
+    [
+        {Name, fun() -> assert_max_size(PeerMax, Want, AtMax, AboveMax) end}
+     || {Name, PeerMax, Want, AtMax, AboveMax} <- Cases
+    ].
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -214,3 +235,15 @@ assert_fills_the_mtu(Mtu, Fit) ->
 %% The next packet number takes 4 bytes.
 long_pn(S) ->
     quic_connection_test_support:state_set(S, app_next_pn, 16#1000000).
+
+assert_max_size(PeerMax, Want, AtMax, AboveMax) ->
+    S = sender(PeerMax, undefined),
+    From = {self(), make_ref()},
+    {keep_state, S, [{reply, From, Max}]} =
+        quic_connection:connected({call, From}, datagram_max_size, S),
+    ?assertEqual(Want, Max),
+    ?assertEqual(AtMax, sent(quic_connection:do_send_datagram(payload(Max), S))),
+    ?assertEqual(AboveMax, sent(quic_connection:do_send_datagram(payload(Max + 1), S))).
+
+sent({ok, _}) -> ok;
+sent(Error) -> Error.

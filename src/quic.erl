@@ -634,9 +634,14 @@ set_owner_sync(Conn, NewOwner) when is_pid(Conn), is_pid(NewOwner) ->
 send_datagram(Conn, Data) when is_pid(Conn) ->
     quic_connection:send_datagram(Conn, Data).
 
-%% @doc Get maximum datagram payload size.
-%% Returns 0 if peer doesn't support datagrams (RFC 9221).
-%% The returned size is the peer's advertised max_datagram_frame_size.
+%% @doc Get the largest datagram payload `send_datagram/2' accepts now.
+%%
+%% This is the smaller of the peer's `max_datagram_frame_size' less the
+%% frame type and length (RFC 9221 Section 3), and what fits in one
+%% packet at the confirmed path MTU (RFC 8899 Section 3). It grows when
+%% PMTU discovery confirms a larger MTU and can fall back when a black
+%% hole is detected. Returns 0 if the peer doesn't support datagrams,
+%% and `{error, closed}' once the connection is gone.
 -spec datagram_max_size(Conn) -> non_neg_integer() | {error, term()} when
     Conn :: pid().
 datagram_max_size(Conn) when is_pid(Conn) ->
