@@ -544,8 +544,8 @@ no_content_ended_streams_are_remembered_and_bounded_test() ->
         {error, unknown_stream},
         quic_h3_connection:do_send_trailers(1000, [{<<"x">>, <<"1">>}], State1)
     ),
-    %% no_content_ended, the last #state field
-    {Ended, Order} = element(tuple_size(State1), State1),
+    %% no_content_ended, the #state field before answered_unread
+    {Ended, Order} = element(tuple_size(State1) - 1, State1),
     ?assertEqual({128, 128}, {sets:size(Ended), queue:len(Order)}).
 
 %% A cancelled stream is unknown again, though its response ended it.
@@ -3858,7 +3858,8 @@ make_test_state(Overrides) ->
         reset_final_size => false,
         notify_streams => false,
         streams_wanted => [],
-        no_content_ended => {sets:new([{version, 2}]), queue:new()}
+        no_content_ended => {sets:new([{version, 2}]), queue:new()},
+        answered_unread => #{}
     },
     Merged = maps:merge(Default, Overrides),
     %% Build the state tuple in the same order as the record definition
@@ -3896,7 +3897,8 @@ make_test_state(Overrides) ->
         maps:get(deferred_requests, Merged), maps:get(held_streams, Merged),
         maps:get(held_data, Merged), maps:get(held_bytes, Merged),
         maps:get(reset_final_size, Merged), maps:get(notify_streams, Merged),
-        maps:get(streams_wanted, Merged), maps:get(no_content_ended, Merged)}.
+        maps:get(streams_wanted, Merged), maps:get(no_content_ended, Merged),
+        maps:get(answered_unread, Merged)}.
 
 %%====================================================================
 %% WT_STREAM placement (draft-ietf-webtrans-http3-17 §4.3)

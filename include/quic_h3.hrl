@@ -173,11 +173,12 @@
 
     %% Receive credit. `manual': QUIC grants it only for what the reader
     %% returns with quic_h3:consume/3. `held': a stream the peer opened,
-    %% kept to its initial window until its reader picks a mode.
+    %% kept to its initial window until its reader picks a mode;
+    %% `abandoned' one answered in full with no reader to come.
     %% `received' counts QUIC stream bytes handed to the parser,
     %% `unconsumed' payload delivered but not yet consumed,
     %% `consumed_sent' the offset last reported to QUIC.
-    flow = auto :: auto | manual | held,
+    flow = auto :: auto | manual | held | abandoned,
     received = 0 :: non_neg_integer(),
     unconsumed = 0 :: non_neg_integer(),
     consumed_sent = 0 :: non_neg_integer()

@@ -351,7 +351,9 @@
     streams_wanted = [] :: [request | bidi | uni],
     %% Streams and pushes whose response ended on its HEADERS, oldest first in the queue.
     no_content_ended = {sets:new([{version, 2}]), queue:new()} ::
-        {sets:set(no_content_key()), queue:queue(no_content_key())}
+        {sets:set(no_content_key()), queue:queue(no_content_key())},
+    %% Held streams answered in full, by monitor on the answering process.
+    answered_unread = #{} :: #{reference() => stream_id()}
 }).
 
 %%====================================================================
@@ -1260,7 +1262,7 @@ live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
 live_event({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     case do_send_response(StreamId, Status, Headers, State) of
         {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
+            {keep_state, watch_answered(StreamId, From, State1), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]};
         {error, Reason, State1} ->
@@ -3082,6 +3084,9 @@ process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
             %% it, the rest of a DATA frame included.
             {Closed, State1} = fail_request_stream(SId, Code, Fin, Stream, State),
             {ok, <<>>, Closed, State1};
+        {error, {stop_reading, SId}} ->
+            {Closed, State1} = abandon_reading(SId, Stream, State),
+            {ok, <<>>, Closed, State1};
         {error, Reason} ->
             {error, Reason}
     end.
@@ -4667,8 +4672,8 @@ stop_reading(_StreamId, _ErrorCode, _Stream, _State) ->
 
 %% Reply to a write on StreamId. A send_queue_full refusal is remembered
 %% so the stream is told `send_ready' once the queue drains.
-write_reply(From, _StreamId, {ok, State1}, _State) ->
-    {keep_state, State1, [{reply, From, ok}]};
+write_reply(From, StreamId, {ok, State1}, _State) ->
+    {keep_state, watch_answered(StreamId, From, State1), [{reply, From, ok}]};
 write_reply(From, StreamId, {error, Reason}, State) ->
     {keep_state, note_refusal(StreamId, Reason, From, State), [{reply, From, {error, Reason}}]};
 write_reply(From, StreamId, {error, Reason, State1}, _State) ->
@@ -4806,15 +4811,21 @@ set_flow(StreamId, Opts, Pending, #state{streams = Streams} = State) ->
     #{StreamId := #h3_stream{flow = Flow} = Stream} = Streams,
     Stream1 =
         case {maps:get(flow_control, Opts, chosen_flow(Flow)), Flow} of
-            {manual, manual} -> Stream;
-            {manual, _} -> make_manual(StreamId, Stream, Pending, State);
-            {auto, _} -> make_auto(StreamId, Stream, State);
-            {_, held} -> make_auto(StreamId, Stream, State);
-            _ -> Stream
+            {manual, manual} ->
+                Stream;
+            {manual, _} ->
+                make_manual(StreamId, Stream, Pending, State);
+            {auto, _} ->
+                make_auto(StreamId, Stream, State);
+            {_, Unread} when Unread =:= held; Unread =:= abandoned ->
+                make_auto(StreamId, Stream, State);
+            _ ->
+                Stream
         end,
     State#state{streams = Streams#{StreamId => Stream1}}.
 
 chosen_flow(held) -> auto;
+chosen_flow(abandoned) -> auto;
 chosen_flow(Flow) -> Flow.
 
 drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
@@ -4837,9 +4848,77 @@ handler_down(Ref, #state{stream_handlers = Handlers} = State) ->
         {ok, StreamId} ->
             {keep_state, do_unset_stream_handler(StreamId, State)};
         error ->
-            %% Unknown monitor, ignore
+            answerer_down(Ref, State)
+    end.
+
+%% An answered held stream stays readable while its answerer may still register.
+watch_answered(StreamId, {Pid, _Tag}, #state{role = server} = State) ->
+    case answered_unread(StreamId, State) of
+        true ->
+            Ref = erlang:monitor(process, Pid),
+            Live = prune_answered(State),
+            State#state{answered_unread = Live#{Ref => StreamId}};
+        false ->
+            State
+    end;
+watch_answered(_StreamId, _From, State) ->
+    State.
+
+answered_unread(StreamId, #state{streams = Streams}) ->
+    case Streams of
+        #{StreamId := #h3_stream{flow = held, state = half_closed_local, reset = false}} -> true;
+        _ -> false
+    end.
+
+%% Entries for streams that registered, ended or were reset meanwhile.
+prune_answered(#state{answered_unread = Answered} = State) ->
+    maps:filter(
+        fun(Ref, StreamId) ->
+            case answered_unread(StreamId, State) of
+                true ->
+                    true;
+                false ->
+                    erlang:demonitor(Ref, [flush]),
+                    false
+            end
+        end,
+        Answered
+    ).
+
+answerer_down(Ref, #state{answered_unread = Answered} = State) ->
+    case maps:take(Ref, Answered) of
+        {StreamId, Rest} ->
+            {keep_state, settle_unread(StreamId, State#state{answered_unread = Rest})};
+        error ->
             keep_state_and_data
     end.
+
+%% Nobody will read the body: stopped now if it has started, else once it
+%% does, so a stream that only carries datagrams is left alone.
+settle_unread(StreamId, #state{streams = Streams} = State) ->
+    case answered_unread(StreamId, State) of
+        true ->
+            #{StreamId := Stream} = Streams,
+            {Stream1, State1} =
+                case body_started(Stream) of
+                    true -> abandon_reading(StreamId, Stream, State);
+                    false -> {Stream#h3_stream{flow = abandoned}, State}
+                end,
+            State1#state{streams = (State1#state.streams)#{StreamId => Stream1}};
+        false ->
+            State
+    end.
+
+%% RFC 9114 Section 4.1: the response is complete, so the client is asked
+%% to stop sending with H3_NO_ERROR, and what it sent is dropped.
+abandon_reading(StreamId, Stream, State) ->
+    State1 = release_buffered(StreamId, State),
+    _ = stop_reading(StreamId, ?H3_NO_ERROR, Stream, State1),
+    Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
+    {Closed, State1#state{stream_buffers = maps:remove(StreamId, State1#state.stream_buffers)}}.
+
+body_started(#h3_stream{body_received = Received, data_remaining = Remaining}) ->
+    (Received > 0) orelse (Remaining > 0).
 
 %% Unregister a stream handler
 do_unset_stream_handler(StreamId, #state{stream_handlers = Handlers} = State) ->
@@ -4881,6 +4960,10 @@ find_handler_by_ref_iter(Ref, Iter) ->
 %% not what a stream carries: with a handler registered a body of any size
 %% streams through. A piece that would take the connection past its budget
 %% resets that stream with H3_EXCESSIVE_LOAD; the connection carries on.
+deliver_body(StreamId, Payload, false, #h3_stream{flow = abandoned}, _State) when
+    Payload =/= <<>>
+->
+    {error, {stop_reading, StreamId}};
 deliver_body(StreamId, Payload, Fin, Stream, State) ->
     case body_fits(StreamId, Payload, State) of
         true ->
