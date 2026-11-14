@@ -69,6 +69,13 @@ All notable changes to this project will be documented in this file.
   implements it.
 
 ### Fixed
+- When the network reordered packets, a packet could be acknowledged
+  after it had been declared lost, and what it carried was still sent
+  again: stream data, control frames and handshake data waiting to be
+  resent, or already resent and lost again. A stream whose last data
+  was in such a packet also waited for the copy to be acknowledged
+  before it finished. A late acknowledgment now stops those copies, and
+  the stream no longer waits for them (RFC 9000 Section 13.3).
 - Packets that carry padding but nothing that needs an acknowledgment,
   such as a client's Initial packets that only acknowledge, were not
   counted as data in flight. They now count until they are acknowledged,

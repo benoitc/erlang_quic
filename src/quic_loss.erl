@@ -48,6 +48,7 @@
     %% Retransmission
     retransmittable_frames/1,
     stream_has_unacked_below/3,
+    map_frames/3,
 
     %% Loss detection
     detect_lost_packets/3,
@@ -139,9 +140,9 @@
     %% 5/4 RTT if time declared it.
     reorder_threshold = ?PACKET_THRESHOLD :: pos_integer(),
     time_shift = ?TIME_SHIFT :: pos_integer(),
-    %% Ack-eliciting packets declared lost, newest first, as
-    %% {PN, DeclaredAt, packet | time}, kept about two RTTs.
-    recent_lost = [] :: [{non_neg_integer(), integer(), packet | time}],
+    %% Ack-eliciting packets declared lost, newest first, as {PN,
+    %% DeclaredAt, packet | time, Frames to repair}, kept about two RTTs.
+    recent_lost = [] :: [{non_neg_integer(), integer(), packet | time, [term()]}],
     %% Set when one of the current losses aged out unacknowledged: that
     %% episode was a real loss and its window cut stays.
     loss_confirmed = false :: boolean()
@@ -431,6 +432,8 @@ on_packets_sent_run(Space, #loss_state{bytes_in_flight = InFlight} = State, Trac
 %%   - acked_bytes: total bytes from in-flight packets that were acknowledged
 %%   - largest_acked_sent_time: sent_time of the largest in-flight packet acknowledged
 %%   - has_in_flight: whether any in-flight packet was acknowledged
+%%   - late_acked: the repairable frames of each packet acknowledged after
+%%     it was declared lost, oldest first (RFC 9000 Section 13.3)
 %%
 %% Implementation: three passes over the sent queue.
 %%   1. classify_ack_q: split queue into (acked, kept-unacked) by the
@@ -472,7 +475,7 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
     KeptList = lists:reverse(KeptAccList),
     %% Late acknowledgements of packets already declared lost
     %% adapt the thresholds before this ACK's own loss pass.
-    {P0, Spurious, Undo} = spurious_losses(
+    {P0, Spurious, Undo, LateAcked} = spurious_losses(
         pn(Space, NewState1), AckedRanges, LargestAcked, Now, NewState1
     ),
     {LostList, SurvHeadQ, LostBytes, LargestLostSentTime} =
@@ -519,7 +522,8 @@ on_ack_received(Space, State, {ack, LargestAcked, AckDelay, FirstRange, AckRange
         lost_bytes => LostBytes,
         largest_lost_sent_time => LargestLostSentTime,
         spurious_losses => Spurious,
-        spurious_congestion => Undo
+        spurious_congestion => Undo,
+        late_acked => LateAcked
     },
 
     {NewState2, AckedList, LostList, AckMeta};
@@ -700,11 +704,11 @@ ceil_shift(RTT, Shift) ->
 
 %% Remember the ack-eliciting packets just declared lost, so a late
 %% acknowledgement can show the loss was spurious. A loss after the
-%% previous ones all settled starts a new episode.
+%% previous ones all settled starts a new episode. Lost is newest first.
 remember_lost(Lost, LargestAcked, Now, #pn_loss{recent_lost = Recent} = P) ->
     New = [
-        {PN, Now, loss_kind(PN, LargestAcked, P)}
-     || #sent_packet{pn = PN, ack_eliciting = true} <- lists:reverse(Lost)
+        {PN, Now, loss_kind(PN, LargestAcked, P), retransmittable_frames(Frames)}
+     || #sent_packet{pn = PN, ack_eliciting = true, frames = Frames} <- Lost
     ],
     case New of
         [] ->
@@ -742,21 +746,25 @@ confirm_losses(Space, State) ->
 %% Split the remembered losses into those this ACK covers (spurious) and
 %% the rest, raise the thresholds for the spurious ones, and age out
 %% losses older than two RTTs as real. Returns the updated space, the
-%% number of spurious losses, and whether the whole episode proved
-%% spurious, in which case the window cut it caused can be undone.
+%% number of spurious losses, whether the whole episode proved spurious,
+%% in which case the window cut it caused can be undone, and the
+%% repairable frames of the spurious ones, oldest first.
 spurious_losses(#pn_loss{recent_lost = []} = P, _Ranges, _LargestAcked, _Now, _State) ->
-    {P, 0, false};
+    {P, 0, false, []};
 spurious_losses(#pn_loss{recent_lost = Recent} = P, Ranges, LargestAcked, Now, State) ->
-    {Spurious, Rest} = lists:partition(fun({PN, _, _}) -> pn_in_ranges(PN, Ranges) end, Recent),
+    {Spurious, Rest} = lists:partition(
+        fun({PN, _, _, _}) -> pn_in_ranges(PN, Ranges) end, Recent
+    ),
     Window = 2 * loss_delay_rtt(State) + State#loss_state.max_ack_delay,
-    {Kept, Aged} = lists:partition(fun({_, At, _}) -> Now - At =< Window end, Rest),
+    {Kept, Aged} = lists:partition(fun({_, At, _, _}) -> Now - At =< Window end, Rest),
     Confirmed = P#pn_loss.loss_confirmed orelse Aged =/= [],
     P1 = lists:foldl(fun(L, Acc) -> adapt(L, LargestAcked, Acc) end, P, Spurious),
     Undo = Spurious =/= [] andalso Kept =:= [] andalso not Confirmed,
     P2 = P1#pn_loss{recent_lost = Kept, loss_confirmed = Kept =/= [] andalso Confirmed},
-    {P2, length(Spurious), Undo}.
+    LateAcked = [Frames || {_, _, _, Frames} <- lists:reverse(Spurious), Frames =/= []],
+    {P2, length(Spurious), Undo, LateAcked}.
 
-adapt({PN, _, Kind}, LargestAcked, #pn_loss{reorder_threshold = PT, time_shift = Shift} = P) ->
+adapt({PN, _, Kind, _}, LargestAcked, #pn_loss{reorder_threshold = PT, time_shift = Shift} = P) ->
     Seen = min(LargestAcked - PN + 1, ?MAX_REORDER_THRESHOLD),
     P#pn_loss{
         reorder_threshold = max(PT, Seen),
@@ -1210,6 +1218,17 @@ ack_delay_to_ms(AckDelay, #loss_state{ack_delay_exponent = Exp}) ->
 -spec retransmittable_frames([term()]) -> [term()].
 retransmittable_frames(Frames) ->
     lists:filter(fun is_retransmittable/1, Frames).
+
+%% @doc Rewrite the frames of the packets in flight in Space. Sizes, flags
+%% and bytes in flight stay as they are.
+-spec map_frames(space(), fun(([term()]) -> [term()]), loss_state()) -> loss_state().
+map_frames(Space, Fun, #loss_state{} = State) ->
+    P = pn(Space, State),
+    Q = queue:from_list([
+        S#sent_packet{frames = Fun(Frames)}
+     || #sent_packet{frames = Frames} = S <- queue:to_list(P#pn_loss.sent_q)
+    ]),
+    set_pn(Space, P#pn_loss{sent_q = Q}, State).
 
 %% True if any in-flight sent packet carries STREAM data for StreamId that
 %% starts before ReliableSize. Data at/after ReliableSize is never retransmitted
