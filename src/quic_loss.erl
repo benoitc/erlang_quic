@@ -1032,10 +1032,12 @@ persistent_congestion(Space, Lost, #loss_state{} = State) ->
     in_one_run(Entries, undefined, undefined, undefined, Duration).
 
 %% @doc Persistent congestion has been declared: the losses behind it
-%% start no other period.
+%% start no other period, and min_rtt restarts from the newest sample
+%% (RFC 9002 Section 5.2).
 -spec on_persistent_congestion(loss_state()) -> loss_state().
-on_persistent_congestion(#loss_state{initial = I, handshake = H, app = A} = State) ->
+on_persistent_congestion(#loss_state{initial = I, handshake = H, app = A, rtt = RTT} = State) ->
     State#loss_state{
+        rtt = quic_rtt:reset_min(RTT),
         initial = I#pn_loss{lost_runs = []},
         handshake = H#pn_loss{lost_runs = []},
         app = A#pn_loss{lost_runs = []}

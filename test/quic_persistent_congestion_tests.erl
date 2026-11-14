@@ -181,6 +181,13 @@ declared_losses_start_no_other_period_test() ->
     ?assert(pc(Later, L1)),
     ?assertNot(pc(Later, quic_loss:on_persistent_congestion(L1))).
 
+%% RFC 9002 Section 5.2: min_rtt restarts from the newest sample.
+min_rtt_restarts_after_persistent_congestion_test() ->
+    L0 = sent_at(app, sampled(), 0, [100], 1),
+    {L, [_], [], _} = quic_loss:on_ack_received(app, L0, {ack, 1, 0, 0, []}, 300),
+    ?assertEqual(50, quic_rtt:min(quic_loss:rtt(L))),
+    ?assertEqual(200, quic_rtt:min(quic_loss:rtt(quic_loss:on_persistent_congestion(L)))).
+
 %% Losses whose neighbours are both acknowledged can join no later loss,
 %% so a long run of them leaves nothing behind.
 isolated_losses_are_not_kept_test() ->

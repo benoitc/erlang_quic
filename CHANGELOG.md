@@ -140,7 +140,10 @@ All notable changes to this project will be documented in this file.
   packets that needed an acknowledgment, sent after the first RTT
   sample and more than the persistent congestion duration apart, with
   no packet sent between them acknowledged in any packet number space.
-  The two packets no longer have to be declared lost at the same time.
+  The two packets no longer have to be declared lost at the same time,
+  and once persistent congestion is declared the minimum RTT restarts
+  from the newest sample, so a path whose RTT rose is not declared
+  congested again and again (Section 5.2).
 - A client that had sent 0-RTT data could not complete a connection
   when the server answered with a Retry: processing the Retry failed
   each time and the connection timed out. The 0-RTT data now goes out
