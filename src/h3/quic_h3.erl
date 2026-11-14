@@ -426,6 +426,7 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
     ),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
+            ok = quic_connection:hold_peer_bidi_streams(QuicConn),
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
             %% With Happy Eyeballs the connection can already be `connected'
@@ -1122,8 +1123,15 @@ start_h3_connection(QuicConnPid, H3Opts, Owner) ->
             {error, Reason}
     end.
 
+%% A request stream gets credit once its reader is known (RFC 9000 Section 4.1).
 start_h3_process(QuicConnPid, H3Opts, Owner) ->
-    gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []).
+    case gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []) of
+        {ok, _} = Started ->
+            ok = quic_connection:hold_peer_bidi_streams(QuicConnPid),
+            Started;
+        Error ->
+            Error
+    end.
 
 %% The per-connection map, validated, with the keys the connection reads.
 build_h3_opts(Opts) ->

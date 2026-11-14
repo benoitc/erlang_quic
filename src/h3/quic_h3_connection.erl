@@ -1563,6 +1563,15 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
             end
     end.
 
+%% QUIC holds a peer's stream until its reader is known (hold_peer_bidi_streams/1).
+new_request_stream(StreamId, State) ->
+    Flow =
+        case ?IS_PEER_STREAM(StreamId, State) of
+            true -> held;
+            false -> auto
+        end,
+    #h3_stream{id = StreamId, type = request, state = open, flow = Flow}.
+
 open_bidi_request_stream(
     StreamId, #state{streams = Streams, role = Role} = State
 ) ->
@@ -1573,11 +1582,7 @@ open_bidi_request_stream(
             #{StreamId := _} ->
                 State;
             _ ->
-                State#state{
-                    streams = Streams#{
-                        StreamId => #h3_stream{id = StreamId, type = request, state = open}
-                    }
-                }
+                State#state{streams = Streams#{StreamId => new_request_stream(StreamId, State)}}
         end,
     case Role of
         server ->
@@ -1872,6 +1877,8 @@ stream_type_varint(qpack_decoder) -> ?H3_STREAM_QPACK_DECODER;
 stream_type_varint({unknown, V}) -> V.
 
 claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
+    %% The owner reads it without consuming: credit follows delivery.
+    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
     Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
     State#state{
         bidi_type_buffers = maps:remove(StreamId, State#state.bidi_type_buffers),
@@ -2228,11 +2235,7 @@ retry_blocked_streams_fold([], State) ->
     {ok, State};
 retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State) ->
     %% Get stream record with proper defaults
-    Stream = maps:get(
-        StreamId,
-        State#state.streams,
-        #h3_stream{id = StreamId, type = request, state = open}
-    ),
+    Stream = maps:get(StreamId, State#state.streams, new_request_stream(StreamId, State)),
     %% Fin is the stream's; it ends the field section only when nothing
     %% was held behind it.
     Held = maps:get(StreamId, State#state.stream_buffers, <<>>),
@@ -2857,7 +2860,11 @@ handle_request_stream_data(
     Fin,
     #state{streams = Streams, stream_buffers = Buffers} = State
 ) ->
-    Stream0 = maps:get(StreamId, Streams, #h3_stream{id = StreamId, type = request, state = open}),
+    Stream0 =
+        case Streams of
+            #{StreamId := Known} -> Known;
+            _ -> new_request_stream(StreamId, State)
+        end,
     Stream = Stream0#h3_stream{received = Stream0#h3_stream.received + byte_size(Data)},
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
@@ -4733,13 +4740,15 @@ report_consumed(StreamId, #h3_stream{consumed_sent = Sent} = Stream, State) ->
 
 %% After a parse pass: when everything delivered has been consumed, the
 %% framing just parsed is credited here, since no consume/3 will follow it.
-report_overhead(StreamId, #h3_stream{flow = manual, unconsumed = 0} = Stream, State) ->
+report_overhead(StreamId, #h3_stream{flow = Flow, unconsumed = 0} = Stream, State) when
+    Flow =/= auto
+->
     report_consumed(StreamId, Stream, State);
 report_overhead(_StreamId, Stream, _State) ->
     Stream.
 
-%% Payload handed to the reader of a manual stream is owed until consumed.
-owe(#h3_stream{flow = manual, unconsumed = Owed} = Stream, Payload) ->
+%% Payload handed to a manual or held stream is owed until consumed.
+owe(#h3_stream{flow = Flow, unconsumed = Owed} = Stream, Payload) when Flow =/= auto ->
     Stream#h3_stream{unconsumed = Owed + byte_size(Payload)};
 owe(Stream, _Payload) ->
     Stream.
@@ -4752,7 +4761,7 @@ make_manual(StreamId, Stream, Pending, State) ->
     quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, {manual, Offset}),
     Stream1#h3_stream{consumed_sent = Offset}.
 
-make_auto(StreamId, #h3_stream{flow = manual} = Stream, State) ->
+make_auto(StreamId, #h3_stream{flow = Flow} = Stream, State) when Flow =/= auto ->
     quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
     Stream#h3_stream{flow = auto, unconsumed = 0};
 make_auto(_StreamId, Stream, _State) ->
@@ -4792,16 +4801,21 @@ register_stream_handler(
             drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State2)
     end.
 
-%% Apply a `flow_control' option; without one the stream keeps its mode.
+%% Apply `flow_control'; without it a held stream goes auto, others keep their mode.
 set_flow(StreamId, Opts, Pending, #state{streams = Streams} = State) ->
-    #{StreamId := Stream} = Streams,
+    #{StreamId := #h3_stream{flow = Flow} = Stream} = Streams,
     Stream1 =
-        case {maps:get(flow_control, Opts, Stream#h3_stream.flow), Stream#h3_stream.flow} of
-            {manual, auto} -> make_manual(StreamId, Stream, Pending, State);
-            {auto, manual} -> make_auto(StreamId, Stream, State);
+        case {maps:get(flow_control, Opts, chosen_flow(Flow)), Flow} of
+            {manual, manual} -> Stream;
+            {manual, _} -> make_manual(StreamId, Stream, Pending, State);
+            {auto, _} -> make_auto(StreamId, Stream, State);
+            {_, held} -> make_auto(StreamId, Stream, State);
             _ -> Stream
         end,
     State#state{streams = Streams#{StreamId => Stream1}}.
+
+chosen_flow(held) -> auto;
+chosen_flow(Flow) -> Flow.
 
 drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
     OrderedChunks = lists:reverse(Chunks),
@@ -4870,11 +4884,21 @@ find_handler_by_ref_iter(Ref, Iter) ->
 deliver_body(StreamId, Payload, Fin, Stream, State) ->
     case body_fits(StreamId, Payload, State) of
         true ->
+            Stream1 = release_for_owner(StreamId, Stream, State),
             State1 = notify_stream_data(StreamId, Payload, Fin, State),
-            {ok, finish_on_fin(owe(Stream, Payload), Fin), State1};
+            {ok, finish_on_fin(owe(Stream1, Payload), Fin), State1};
         false ->
             {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}}
     end.
+
+%% A client hands a held stream's body to its owner, who does not consume.
+release_for_owner(StreamId, #h3_stream{flow = held} = Stream, #state{role = client} = State) ->
+    case maps:is_key(StreamId, State#state.stream_handlers) of
+        true -> Stream;
+        false -> make_auto(StreamId, Stream, State)
+    end;
+release_for_owner(_StreamId, Stream, _State) ->
+    Stream.
 
 finish_on_fin(Stream, true) ->
     close_half(remote, Stream#h3_stream{frame_state = complete});

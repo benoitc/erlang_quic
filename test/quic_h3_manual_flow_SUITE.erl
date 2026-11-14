@@ -25,6 +25,8 @@
     a_response_stops_while_the_client_does_not_consume/1,
     data_buffered_before_the_claim_is_consumed_like_any_other/1,
     auto_streams_are_unchanged/1,
+    an_unread_body_takes_one_window_of_a_large_connection/1,
+    claimed_streams_carry_more_than_a_window/1,
     consume_on_a_finished_stream_is_an_error/1,
     consume_on_a_reset_stream_is_an_error/1,
     consume_on_an_auto_stream_is_a_no_op/1,
@@ -39,6 +41,7 @@
 -define(PIECE, (16 * ?KIB)).
 -define(PROBE, quic_h3_manual_flow_probe).
 -define(WAIT_MS, 10000).
+-define(WT_STREAM, 16#41).
 %% What a stalled transfer may still deliver: the manual window, plus what
 %% the stream was granted before the handler claimed it. The transfer is
 %% many times larger, so a receiver that keeps granting blows through it.
@@ -54,6 +57,8 @@ all() ->
         a_response_stops_while_the_client_does_not_consume,
         data_buffered_before_the_claim_is_consumed_like_any_other,
         auto_streams_are_unchanged,
+        an_unread_body_takes_one_window_of_a_large_connection,
+        claimed_streams_carry_more_than_a_window,
         consume_on_a_finished_stream_is_an_error,
         consume_on_a_reset_stream_is_an_error,
         consume_on_an_auto_stream_is_a_no_op,
@@ -170,6 +175,53 @@ auto_streams_are_unchanged(Config) ->
         ok = quic_h3:close(Conn)
     end).
 
+%% A 64 KiB stream window next to a 16 MiB connection window (#554): a
+%% handler in manual mode that has consumed nothing holds one stream
+%% window of body, not what the connection would allow.
+an_unread_body_takes_one_window_of_a_large_connection(Config) ->
+    with_server(Config, large_connection(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, StreamId} = upload(Conn, <<"/upload/unread">>, body(?UPLOAD)),
+        Handler = claimed(),
+        Stalled = stalled_at(),
+        ?assert(Stalled > 0),
+        ?assert(Stalled =< ?WINDOW),
+        Handler ! consume_from_now_on,
+        ?assertEqual(
+            {200, integer_to_binary(erlang:phash2(body(?UPLOAD)))}, response(Conn, StreamId)
+        ),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% A stream claimed for an extension, as WebTransport claims its data
+%% streams, is read without consume/3: it carries many windows, whichever
+%% side opened it.
+claimed_streams_carry_more_than_a_window(Config) ->
+    Test = self(),
+    Owner = spawn_link(fun() -> count_claimed(Test, #{}) end),
+    Extra = #{
+        stream_type_handler => fun claim_wt/3,
+        connection_handler => fun(_Conn) -> #{owner => Owner} end
+    },
+    with_server(Config, small_window(), Extra, fun(Port) ->
+        Conn = connect(Port, small_window(), #{stream_type_handler => fun claim_wt/3}),
+        {ok, Up} = quic_h3:open_bidi_stream(Conn, ?WT_STREAM),
+        ok = raw_send(quic_h3:get_quic_conn(Conn), Up, wt_stream(body(?UPLOAD))),
+        ?assertEqual(
+            {claimed, Up, ?UPLOAD},
+            receive
+                {claimed, Up, _} = Got -> Got
+            after ?WAIT_MS -> timeout
+            end
+        ),
+        {ok, Req} = quic_h3:request(Conn, headers(<<"GET">>, <<"/open-wt">>)),
+        {200, _} = response(Conn, Req),
+        ?assertEqual(?UPLOAD, claimed_from_server(Conn, 0)),
+        ok = quic_h3:close(Conn)
+    end),
+    unlink(Owner),
+    exit(Owner, kill).
+
 consume_on_a_finished_stream_is_an_error(Config) ->
     with_server(Config, #{}, fun(Port) ->
         Conn = connect(Port, #{}),
@@ -256,9 +308,20 @@ small_window() ->
         max_receive_window => ?MAX_WINDOW
     }.
 
+%% A small stream window next to a large connection window.
+large_connection() ->
+    #{
+        max_stream_data_bidi_remote => ?WINDOW,
+        max_data => 16 * ?MIB,
+        max_receive_window => 16 * ?MIB
+    }.
+
 with_server(Config, QuicOpts, F) ->
+    with_server(Config, QuicOpts, #{}, F).
+
+with_server(Config, QuicOpts, Extra, F) ->
     Name = list_to_atom("h3_manual_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
+    {ok, _} = quic_h3:start_server(Name, 0, Extra#{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
         handler => fun handle/5,
@@ -288,6 +351,16 @@ handle(Conn, StreamId, <<"POST">>, <<"/upload/held">>, _Headers) ->
     Buffered = claim(Conn, StreamId, #{flow_control => manual}),
     ?PROBE ! {claimed, self()},
     ok = consume(Conn, StreamId, Buffered),
+    upload_loop(Conn, StreamId, held, Buffered);
+handle(Conn, StreamId, <<"GET">>, <<"/open-wt">>, _Headers) ->
+    {ok, Down} = quic_h3:open_bidi_stream(Conn, ?WT_STREAM),
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    ok = quic_h3:send_data(Conn, StreamId, <<>>, true),
+    ok = raw_send(quic_h3:get_quic_conn(Conn), Down, wt_stream(body(?UPLOAD)));
+handle(Conn, StreamId, <<"POST">>, <<"/upload/unread">>, _Headers) ->
+    Buffered = claim(Conn, StreamId, #{flow_control => manual}),
+    ?PROBE ! {claimed, self()},
+    ?PROBE ! {got, iolist_size([D || {D, _} <- Buffered])},
     upload_loop(Conn, StreamId, held, Buffered);
 handle(Conn, StreamId, <<"POST">>, <<"/upload/late">>, _Headers) ->
     %% Let part of the body arrive and be buffered before claiming.
@@ -338,6 +411,51 @@ finish_upload(Conn, StreamId, Acc) ->
     Body = iolist_to_binary([D || {D, _} <- Acc]),
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     quic_h3:send_data(Conn, StreamId, integer_to_binary(erlang:phash2(Body)), true).
+
+claim_wt(bidi, _StreamId, ?WT_STREAM) -> claim;
+claim_wt(_Dir, _StreamId, _Type) -> ignore.
+
+%% The server's owner: bytes per claimed stream, reported at its end.
+count_claimed(Test, Counts) ->
+    receive
+        {quic_h3, _Conn, {stream_type_data, bidi, Id, Data, Fin}} ->
+            N = maps:get(Id, Counts, 0) + byte_size(Data),
+            Fin andalso (Test ! {claimed, Id, N}),
+            count_claimed(Test, Counts#{Id => N});
+        _ ->
+            count_claimed(Test, Counts)
+    end.
+
+%% What a claimed stream the server opened carried to the client.
+claimed_from_server(Conn, Got) ->
+    receive
+        {quic_h3, Conn, {stream_type_data, bidi, _Id, Data, true}} ->
+            Got + byte_size(Data);
+        {quic_h3, Conn, {stream_type_data, bidi, _Id, Data, false}} ->
+            claimed_from_server(Conn, Got + byte_size(Data))
+    after ?WAIT_MS -> {stalled, Got}
+    end.
+
+%% The WebTransport stream signal, then the payload.
+wt_stream(Payload) ->
+    <<(quic_varint:encode(?WT_STREAM))/binary, Payload/binary>>.
+
+%% Straight onto the QUIC stream, in pieces, retrying a refused one.
+raw_send(QC, StreamId, Data) when byte_size(Data) =< ?PIECE ->
+    raw_piece(QC, StreamId, Data, true);
+raw_send(QC, StreamId, Data) ->
+    <<Piece:?PIECE/binary, Rest/binary>> = Data,
+    ok = raw_piece(QC, StreamId, Piece, false),
+    raw_send(QC, StreamId, Rest).
+
+raw_piece(QC, StreamId, Data, Fin) ->
+    case quic:send_data(QC, StreamId, Data, Fin) of
+        {error, send_queue_full} ->
+            timer:sleep(10),
+            raw_piece(QC, StreamId, Data, Fin);
+        Result ->
+            Result
+    end.
 
 %%====================================================================
 %% Helpers
@@ -414,7 +532,10 @@ send(Conn, StreamId, Data, Fin) ->
     end.
 
 connect(Port, QuicOpts) ->
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+    connect(Port, QuicOpts, #{}).
+
+connect(Port, QuicOpts, Extra) ->
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, Extra#{
         verify => false, sync => true, quic_opts => QuicOpts
     }),
     Conn.

@@ -5172,3 +5172,54 @@ receiving_push(Quic) ->
         local_max_field_section_size => 1024,
         received_pushes => #{0 => Push}
     }).
+
+%%====================================================================
+%% Held request streams (RFC 9000 Section 4.1, #554)
+%%====================================================================
+
+%% QUIC holds a request stream the peer opens until a reader registers,
+%% so the HEADERS parsed meanwhile are reported consumed.
+held_request_stream_reports_its_headers_test() ->
+    Quic = cast_recorder(),
+    State0 = make_test_state(#{role => server, quic_conn => Quic}),
+    Headers = request_frame(<<"POST">>, <<"/upload">>),
+    {ok, State1} = quic_h3_connection:handle_stream_data(0, Headers, false, State0),
+    ?assertMatch(#h3_stream{flow = held}, quic_h3_connection:test_stream(0, State1)),
+    ?assertEqual([{stream_consumed, 0, byte_size(Headers)}], recorded_casts(Quic)),
+    flush_owner_events().
+
+%% A client hands a held stream's body to its owner, who never consumes,
+%% so the stream goes back to automatic credit first.
+held_stream_given_to_the_client_owner_is_released_test() ->
+    Quic = cast_recorder(),
+    State0 = make_test_state(#{role => client, quic_conn => Quic}),
+    Response = <<
+        (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary
+    >>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(1, Response, false, State0),
+    ?assertMatch(#h3_stream{flow = auto}, quic_h3_connection:test_stream(1, State1)),
+    ?assert(lists:member({set_stream_flow_control, 1, auto}, recorded_casts(Quic))),
+    flush_owner_events().
+
+cast_recorder() ->
+    spawn_link(fun() -> cast_recorder([]) end).
+
+cast_recorder(Casts) ->
+    receive
+        {'$gen_cast', Cast} ->
+            cast_recorder([Cast | Casts]);
+        {'$gen_call', From, _Call} ->
+            gen:reply(From, ok),
+            cast_recorder(Casts);
+        {casts, From} ->
+            From ! {casts, self(), lists:reverse(Casts)},
+            cast_recorder(Casts)
+    end.
+
+recorded_casts(Recorder) ->
+    Recorder ! {casts, self()},
+    receive
+        {casts, Recorder, Casts} -> Casts
+    after 1000 -> timeout
+    end.
