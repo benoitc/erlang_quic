@@ -6581,12 +6581,12 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 LostPackets
             ),
 
+            LateAcked = maps:get(late_acked, AckMeta, []),
             case Level of
                 app ->
-                    LateAcked = maps:get(late_acked, AckMeta, []),
                     app_ack_tail(AckedPackets, LostPackets, LateAcked, State1);
                 _ ->
-                    handshake_ack_tail(Level, LostPackets, State1)
+                    handshake_ack_tail(Level, LostPackets, LateAcked, State1)
             end
         %% close outer case (Ranges)
     end;
@@ -7297,7 +7297,8 @@ peer_takes_ack_frequency(#state{transport_params = TP}) ->
 %% application space has streams, PMTU probes and a send queue, so the
 %% handshake spaces take the short path: replay what was lost, at their
 %% own encryption level.
-app_ack_tail(AckedPackets, LostPackets, LateAcked, State1) ->
+app_ack_tail(AckedPackets, LostPackets, LateAcked, State0) ->
+    State1 = drop_late_acked(app, LateAcked, State0),
     %% Handle PMTU probe ACKs. Only walk the acked list when a
     %% probe is actually outstanding - the common bulk-ACK case
     %% has none and skips the per-packet fold.
@@ -7368,7 +7369,8 @@ app_ack_tail(AckedPackets, LostPackets, LateAcked, State1) ->
         _ -> flush_event(State8, rearm)
     end.
 
-handshake_ack_tail(Level, LostPackets, State1) ->
+handshake_ack_tail(Level, LostPackets, LateAcked, State0) ->
+    State1 = drop_late_acked(Level, LateAcked, State0),
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
     State3 = send_held(drain_pending_hs(note_handshake_ack(Level, State2))),
     flush_event(State3#state{pto_dirty = true}, event).
@@ -13732,6 +13734,179 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
         send_queue_count = QueueCount + 1,
         send_queue_version = Version + 1
     }.
+
+%% RFC 9000 Section 13.3: what a late ACK acknowledged is not sent again.
+drop_late_acked(_Space, [], State) ->
+    State;
+drop_late_acked(app, LateAcked, State) ->
+    Index = acked_index(LateAcked),
+    drop_acked_from_ctrl_queue(Index, drop_acked_from_send_queue(Index, State));
+drop_late_acked(Space, LateAcked, State) ->
+    drop_acked_from_pending_hs(Space, acked_index(LateAcked), State).
+
+%% Acknowledged STREAM and CRYPTO ranges, merged, FINs and control frames.
+acked_index(FrameLists) ->
+    Index = lists:foldl(fun index_acked/2, #{}, lists:append(FrameLists)),
+    maps:map(
+        fun
+            ({fin, _}, End) -> End;
+            (ctrl, Frames) -> Frames;
+            (_Key, Ranges) -> merge_ranges(lists:sort(Ranges))
+        end,
+        Index
+    ).
+
+index_acked({stream, StreamId, Offset, Data, Fin}, Acc) ->
+    End = Offset + iolist_size(Data),
+    Acc1 = add_range({stream, StreamId}, Offset, End, Acc),
+    case Fin of
+        true -> Acc1#{{fin, StreamId} => End};
+        false -> Acc1
+    end;
+index_acked({crypto, Offset, Data}, Acc) ->
+    add_range(crypto, Offset, Offset + iolist_size(Data), Acc);
+index_acked(Frame, Acc) ->
+    maps:update_with(ctrl, fun(Frames) -> [Frame | Frames] end, [Frame], Acc).
+
+add_range(_Key, Offset, Offset, Acc) ->
+    Acc;
+add_range(Key, Offset, End, Acc) ->
+    maps:update_with(Key, fun(Ranges) -> [{Offset, End} | Ranges] end, [{Offset, End}], Acc).
+
+merge_ranges([{S1, E1}, {S2, E2} | Rest]) when S2 =< E1 ->
+    merge_ranges([{S1, max(E1, E2)} | Rest]);
+merge_ranges([Range | Rest]) ->
+    [Range | merge_ranges(Rest)];
+merge_ranges([]) ->
+    [].
+
+%% Frames less what Index covers; an owed FIN stays on the piece ending at it.
+drop_acked(Frames, Index) ->
+    lists:flatmap(fun(Frame) -> drop_acked_frame(Frame, Index) end, Frames).
+
+drop_acked_frame({stream, StreamId, Offset, Data, Fin} = Frame, Index) ->
+    End = Offset + iolist_size(Data),
+    FinOwed = Fin andalso not maps:is_key({fin, StreamId}, Index),
+    case uncovered(Offset, End, maps:get({stream, StreamId}, Index, [])) of
+        [{Offset, End}] when FinOwed =:= Fin ->
+            [Frame];
+        Pieces ->
+            Parts = [
+                {stream, StreamId, S, slice(Data, S - Offset, E - S), FinOwed andalso E =:= End}
+             || {S, E} <- Pieces
+            ],
+            case FinOwed andalso not lists:keymember(End, 2, Pieces) of
+                true -> Parts ++ [{stream, StreamId, End, <<>>, true}];
+                false -> Parts
+            end
+    end;
+drop_acked_frame({crypto, Offset, Data} = Frame, Index) ->
+    End = Offset + iolist_size(Data),
+    case uncovered(Offset, End, maps:get(crypto, Index, [])) of
+        [{Offset, End}] -> [Frame];
+        Pieces -> [{crypto, S, slice(Data, S - Offset, E - S)} || {S, E} <- Pieces]
+    end;
+drop_acked_frame(Frame, #{ctrl := Acked}) ->
+    case lists:member(Frame, Acked) of
+        true -> [];
+        false -> [Frame]
+    end;
+drop_acked_frame(Frame, _Index) ->
+    [Frame].
+
+%% The parts of [Start, End) outside the sorted, merged Ranges.
+uncovered(Start, End, _Ranges) when Start >= End ->
+    [];
+uncovered(Start, End, []) ->
+    [{Start, End}];
+uncovered(Start, End, [{_, E} | Rest]) when E =< Start ->
+    uncovered(Start, End, Rest);
+uncovered(Start, End, [{S, _} | _]) when S >= End ->
+    [{Start, End}];
+uncovered(Start, End, [{S, E} | Rest]) when S > Start ->
+    [{Start, S} | uncovered(E, End, Rest)];
+uncovered(_Start, End, [{_, E} | Rest]) ->
+    uncovered(E, End, Rest).
+
+slice(Data, Pos, Len) ->
+    binary:part(iolist_to_binary(Data), Pos, Len).
+
+%% Only retransmissions: parked and stream_data entries were never sent.
+drop_acked_from_send_queue(Index, #state{send_queue = PQ} = State) ->
+    {Buckets, Bytes, Count} = lists:foldl(
+        fun(I, {Acc, B, C}) ->
+            {Q, DB, DC} = drop_acked_bucket(element(I, PQ), Index),
+            {[Q | Acc], B + DB, C + DC}
+        end,
+        {[], 0, 0},
+        lists:seq(1, 8)
+    ),
+    State#state{
+        send_queue = list_to_tuple(lists:reverse(Buckets)),
+        send_queue_bytes = max(0, State#state.send_queue_bytes - Bytes),
+        send_queue_count = max(0, State#state.send_queue_count - Count),
+        send_queue_version = State#state.send_queue_version + 1
+    }.
+
+drop_acked_bucket(Q, Index) ->
+    case queue:any(fun(Entry) -> acked_retransmit(Entry, Index) end, Q) of
+        false ->
+            {Q, 0, 0};
+        true ->
+            lists:foldl(
+                fun(Entry, {QAcc, DB, DC}) ->
+                    case acked_retransmit(Entry, Index) of
+                        false ->
+                            {queue:in(Entry, QAcc), DB, DC};
+                        true ->
+                            {retransmit_stream, StreamId, Offset, Data, Fin, Size} = Entry,
+                            Kept = [
+                                {retransmit_stream, StreamId, O, D, F, iolist_size(D)}
+                             || {stream, _, O, D, F} <- drop_acked_frame(
+                                    {stream, StreamId, Offset, Data, Fin}, Index
+                                )
+                            ],
+                            {
+                                lists:foldl(fun queue:in/2, QAcc, Kept),
+                                DB + Size - lists:sum([element(6, K) || K <- Kept]),
+                                DC + 1 - length(Kept)
+                            }
+                    end
+                end,
+                {queue:new(), 0, 0},
+                queue:to_list(Q)
+            )
+    end.
+
+acked_retransmit({retransmit_stream, StreamId, _, _, _, _}, Index) ->
+    maps:is_key({stream, StreamId}, Index) orelse maps:is_key({fin, StreamId}, Index);
+acked_retransmit(_Entry, _Index) ->
+    false.
+
+drop_acked_from_ctrl_queue(_Index, #state{ctrl_queue = {0, _}} = State) ->
+    State;
+drop_acked_from_ctrl_queue(Index, #state{ctrl_queue = {_, Q}} = State) ->
+    Kept = drop_acked(queue:to_list(Q), Index),
+    State#state{ctrl_queue = {length(Kept), queue:from_list(Kept)}}.
+
+%% A held packet is already encoded: it goes once all it repairs is acked.
+drop_acked_from_pending_hs(Space, Index, #state{hs = HS} = State) ->
+    #hs{pending_hs = Pending, pending_hs_bytes = Bytes} = HS,
+    Queued = queue:to_list(maps:get(Space, Pending, queue:new())),
+    {Dropped, Kept} = lists:partition(
+        fun({_Payload, Frames}) -> fully_acked(Frames, Index) end, Queued
+    ),
+    Held = maps:get(Space, Bytes, 0) - lists:sum([iolist_size(P) || {P, _} <- Dropped]),
+    State#state{
+        hs = HS#hs{
+            pending_hs = Pending#{Space => queue:from_list(Kept)},
+            pending_hs_bytes = Bytes#{Space => max(0, Held)}
+        }
+    }.
+
+fully_acked(Frames, Index) ->
+    Repair = quic_loss:retransmittable_frames(Frames),
+    (Repair =/= []) andalso (drop_acked(Repair, Index) =:= []).
 
 %% Drain pending local reset-at streams whose data below ReliableSize is now
 %% fully acked (no longer queued or in flight), completing the reclaim.
