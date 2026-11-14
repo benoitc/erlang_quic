@@ -84,6 +84,8 @@
     recv_max_data/2,
     send_queue_full_refusals/1,
     state_for_manual_recv/2,
+    state_for_peer_streams/2,
+    manual_tracked/2,
     stream_recv/2,
     max_data_local/1,
     state_wanting_send_ready/2,
@@ -1139,6 +1141,21 @@ state_for_manual_recv(Window, MaxWindow) ->
     }),
     {ok, 0, S2} = quic_connection:do_open_stream(S1),
     S2.
+
+%% state_for_manual_recv/2 where the peer may open bidi and uni streams
+%% with Window each, and reset them with RESET_STREAM_AT.
+-spec state_for_peer_streams(pos_integer(), pos_integer()) -> #state{}.
+state_for_peer_streams(Window, MaxWindow) ->
+    S = state_for_manual_recv(Window, MaxWindow),
+    S#state{
+        max_streams_uni_local = 10,
+        cfg = (S#state.cfg)#conn_cfg{max_stream_data_uni = Window, reset_stream_at_enabled = true}
+    }.
+
+%% The stream counts as manual for connection credit.
+-spec manual_tracked(#state{}, non_neg_integer()) -> boolean().
+manual_tracked(#state{manual_recv_streams = Manual}, StreamId) ->
+    sets:is_element(StreamId, Manual).
 
 %% A stream's receive fields.
 -spec stream_recv(#state{}, non_neg_integer()) -> map().
