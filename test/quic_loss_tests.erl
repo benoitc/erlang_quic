@@ -472,6 +472,74 @@ reordered_losses_are_spurious_test() ->
     {_, _, Lost2, _} = quic_loss:on_ack_received(app, S4, {ack, 20, 0, 0, []}, Now),
     ?assertEqual([], Lost2).
 
+%% RFC 9000 Section 13.3: a packet acknowledged after it was declared
+%% lost hands back the frames repair would resend, oldest first, once.
+late_ack_returns_the_lost_frames_test() ->
+    S1 = sent_frames(app, quic_loss:new(), lists:seq(0, 10)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, Lost, M1} = quic_loss:on_ack_received(app, S1, {ack, 5, 0, 0, []}, Now),
+    ?assertEqual([0, 1, 2], pns(Lost)),
+    ?assertMatch(#{late_acked := []}, M1),
+    {S3, _, [], M2} = quic_loss:on_ack_received(app, S2, {ack, 10, 0, 10, []}, Now),
+    ?assertEqual([[stream_frame(0)], [stream_frame(1)], [stream_frame(2)]], late_acked(M2)),
+    {_, _, [], M3} = quic_loss:on_ack_received(app, S3, {ack, 10, 0, 10, []}, Now),
+    ?assertMatch(#{late_acked := []}, M3).
+
+%% A loss aged out as real is forgotten: its late acknowledgement brings
+%% nothing back, while one still inside the window does.
+late_ack_after_the_window_returns_nothing_test() ->
+    S1 = sent_frames(app, quic_loss:new(), lists:seq(0, 10)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, [_, _, _], _} = quic_loss:on_ack_received(app, S1, {ack, 5, 0, 0, []}, Now),
+    {S3, _, _, M1} = quic_loss:on_ack_received(app, S2, {ack, 1, 0, 0, []}, Now),
+    ?assertEqual([[stream_frame(1)]], late_acked(M1)),
+    Later = Now + 10000,
+    S4 = sent_frames(app, S3, [11], Later - 1),
+    %% 3..11 acknowledged long after: 0 and 2 age out.
+    {S5, _, [], M2} = quic_loss:on_ack_received(app, S4, {ack, 11, 0, 8, []}, Later),
+    ?assertMatch(#{late_acked := []}, M2),
+    {_, _, _, M3} = quic_loss:on_ack_received(app, S5, {ack, 11, 0, 11, []}, Later),
+    ?assertMatch(#{late_acked := []}, M3).
+
+%% Only the newest 64 losses are remembered.
+late_ack_past_the_cap_returns_the_newest_test() ->
+    S1 = sent_frames(app, quic_loss:new(), lists:seq(0, 80)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, Lost, _} = quic_loss:on_ack_received(app, S1, {ack, 80, 0, 0, []}, Now),
+    ?assertEqual(lists:seq(0, 77), pns(Lost)),
+    {_, _, _, M} = quic_loss:on_ack_received(app, S2, {ack, 80, 0, 80, []}, Now),
+    ?assertEqual([[stream_frame(PN)] || PN <- lists:seq(14, 77)], late_acked(M)).
+
+%% Dropping a space's keys forgets its losses too.
+discarded_space_forgets_its_lost_frames_test() ->
+    S1 = sent_frames(handshake, quic_loss:new(), lists:seq(0, 10)),
+    Now = erlang:monotonic_time(millisecond),
+    {S2, _, [_, _, _], _} = quic_loss:on_ack_received(handshake, S1, {ack, 5, 0, 0, []}, Now),
+    {Kept, _, _, M1} = quic_loss:on_ack_received(handshake, S2, {ack, 0, 0, 0, []}, Now),
+    ?assertEqual([[stream_frame(0)]], late_acked(M1)),
+    {S3, _} = quic_loss:discard_space(handshake, S2),
+    {_, _, _, M2} = quic_loss:on_ack_received(handshake, S3, {ack, 10, 0, 10, []}, Now),
+    ?assertMatch(#{late_acked := []}, M2),
+    {_, _, _, M3} = quic_loss:on_ack_received(handshake, Kept, {ack, 2, 0, 2, []}, Now),
+    ?assertEqual([[stream_frame(1)], [stream_frame(2)]], late_acked(M3)).
+
+%% Packets numbered PNs, each carrying stream_frame(PN) and a PING.
+sent_frames(Space, State, PNs) ->
+    sent_frames(Space, State, PNs, erlang:monotonic_time(millisecond)).
+
+sent_frames(Space, State, PNs, T) ->
+    lists:foldl(
+        fun(PN, Acc) ->
+            quic_loss:on_packet_sent(Space, Acc, PN, 1000, true, [stream_frame(PN), ping], T)
+        end,
+        State,
+        PNs
+    ).
+
+stream_frame(PN) -> {stream, 0, PN * 10, binary:copy(<<PN>>, 10), false}.
+
+late_acked(#{late_acked := Late}) -> Late.
+
 %% Without reordering seen, the same gap is a loss.
 packet_threshold_default_test() ->
     S1 = sent(quic_loss:new(), lists:seq(11, 20)),
