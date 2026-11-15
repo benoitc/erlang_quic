@@ -4728,11 +4728,18 @@ do_consume(StreamId, Bytes, #state{streams = Streams} = State) ->
             {{error, unknown_stream}, State}
     end.
 
-%% The stream offset the reader has accounted for: everything parsed,
-%% less payload it has not consumed yet.
+%% The stream offset the reader has accounted for: everything received,
+%% less payload it has not consumed yet. The unparsed tail is a frame
+%% still arriving, framing like the rest, except behind a field section
+%% waiting on the encoder stream, where it can hold body.
 consumed_offset(StreamId, #h3_stream{received = Received, unconsumed = Owed}, State) ->
-    Tail = byte_size(maps:get(StreamId, State#state.stream_buffers, <<>>)),
-    Received - Tail - Owed.
+    Received - blocked_tail(StreamId, State) - Owed.
+
+blocked_tail(StreamId, #state{blocked_streams = Blocked, stream_buffers = Buffers}) ->
+    case is_map_key(StreamId, Blocked) of
+        true -> byte_size(maps:get(StreamId, Buffers, <<>>));
+        false -> 0
+    end.
 
 report_consumed(StreamId, #h3_stream{consumed_sent = Sent} = Stream, State) ->
     case consumed_offset(StreamId, Stream, State) of

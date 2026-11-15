@@ -2310,6 +2310,46 @@ credit_follows_the_consumed_payload_test() ->
         stop_conn(Conn)
     end.
 
+%% A frame still arriving is framing: its bytes are credited as they come,
+%% so a HEADERS frame larger than the stream window can complete.
+partial_frame_is_credited_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        Frame = quic_h3_frame:encode_headers(binary:copy(<<"h">>, 3000)),
+        <<Part:1000/binary, _/binary>> = Frame,
+        {ok, _} = quic_h3_connection:handle_stream_data(0, Part, false, manual_stream_state(Conn)),
+        ?assertEqual([1000], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
+%% Bytes held behind a field section waiting on the encoder stream can be
+%% body, so they are not credited before they are parsed.
+tail_behind_a_blocked_section_is_not_credited_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        State = make_test_state(#{
+            role => server,
+            quic_conn => Conn,
+            streams => #{
+                0 => #h3_stream{
+                    id = 0,
+                    type = request,
+                    state = open,
+                    frame_state = expecting_data,
+                    flow = manual
+                }
+            },
+            stream_handlers => #{0 => {self(), make_ref()}},
+            blocked_streams => #{0 => {1, <<>>, false}}
+        }),
+        Data = quic_h3_frame:encode_data(<<"body">>),
+        {ok, _} = quic_h3_connection:handle_stream_data(0, Data, false, State),
+        ?assertEqual([], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
 %% Every state answers the per-stream calls; none leaves the caller
 %% waiting on a call it has no clause for.
 stream_calls_are_answered_in_every_state_test_() ->
