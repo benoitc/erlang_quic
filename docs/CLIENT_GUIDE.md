@@ -201,18 +201,20 @@ end.
     max_datagram_frame_size => 65535  % Accept any size
 }, self()).
 
-%% Check if datagrams are supported
+%% Largest payload send_datagram/2 accepts now (0: not supported).
+%% It can grow once PMTU discovery confirms a larger path MTU.
 MaxSize = quic:datagram_max_size(Conn),
 case MaxSize of
     0 -> io:format("Datagrams not supported~n");
-    _ -> io:format("Max datagram size: ~p~n", [MaxSize])
+    _ -> io:format("Largest datagram now: ~p~n", [MaxSize])
 end.
 
 %% Send a datagram (unreliable, not retransmitted)
 case quic:send_datagram(Conn, <<"game_state">>) of
     ok -> sent;
     {error, datagrams_not_supported} -> not_supported;
-    {error, datagram_too_large} -> too_big;
+    {error, datagram_too_large} -> too_big;             % Above the peer's limit
+    {error, datagram_too_large_for_path} -> too_big_now; % Above the path MTU
     {error, congestion_limited} -> dropped  % Normal for datagrams
 end.
 

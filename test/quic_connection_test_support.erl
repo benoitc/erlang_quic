@@ -84,11 +84,17 @@
     recv_max_data/2,
     send_queue_full_refusals/1,
     state_for_manual_recv/2,
+    state_for_peer_streams/2,
+    with_alpn_handler/2,
+    manual_tracked/2,
     stream_recv/2,
     max_data_local/1,
     state_wanting_send_ready/2,
     send_ready_wanted/1,
-    handshake_with_timeouts/3
+    handshake_with_timeouts/3,
+    state_for_datagram/2,
+    app_packets_sent/1,
+    state_receiving_datagrams/1
 ]).
 
 %% Update the spin-bit tracking state from a received 1-RTT packet.
@@ -578,6 +584,8 @@ state_set(#state{} = S, socket, V) ->
     S#state{socket = V};
 state_set(#state{} = S, remote_addr, V) ->
     S#state{remote_addr = V};
+state_set(#state{} = S, app_next_pn, V) ->
+    S#state{pn_app = (S#state.pn_app)#pn_space{next_pn = V}};
 state_set(#state{hs = #hs{pn_initial = PN} = HS} = S, initial_ack_ranges, V) ->
     S#state{hs = HS#hs{pn_initial = PN#pn_space{ack_ranges = V}}}.
 
@@ -1136,6 +1144,26 @@ state_for_manual_recv(Window, MaxWindow) ->
     {ok, 0, S2} = quic_connection:do_open_stream(S1),
     S2.
 
+%% state_for_manual_recv/2 where the peer may open bidi and uni streams
+%% with Window each, and reset them with RESET_STREAM_AT.
+-spec state_for_peer_streams(pos_integer(), pos_integer()) -> #state{}.
+state_for_peer_streams(Window, MaxWindow) ->
+    S = state_for_manual_recv(Window, MaxWindow),
+    S#state{
+        max_streams_uni_local = 10,
+        cfg = (S#state.cfg)#conn_cfg{max_stream_data_uni = Window, reset_stream_at_enabled = true}
+    }.
+
+%% State with an alpn_handler, as a listener configures it.
+-spec with_alpn_handler(#state{}, fun()) -> #state{}.
+with_alpn_handler(#state{cfg = Cfg} = S, Fn) ->
+    S#state{cfg = Cfg#conn_cfg{alpn_handler = Fn}}.
+
+%% The stream counts as manual for connection credit.
+-spec manual_tracked(#state{}, non_neg_integer()) -> boolean().
+manual_tracked(#state{manual_recv_streams = Manual}, StreamId) ->
+    sets:is_element(StreamId, Manual).
+
 %% A stream's receive fields.
 -spec stream_recv(#state{}, non_neg_integer()) -> map().
 stream_recv(#state{streams = Streams}, StreamId) ->
@@ -1158,3 +1186,30 @@ state_wanting_send_ready(QueueBytes, Wanted) ->
 
 -spec send_ready_wanted(#state{}) -> boolean().
 send_ready_wanted(#state{send_ready_wanted = W}) -> W.
+
+%% A connected client that may send DATAGRAMs: the peer advertised
+%% PeerMax as its max_datagram_frame_size, the path is PMTU.
+-spec state_for_datagram(non_neg_integer(), #pmtu_state{} | undefined) -> #state{}.
+state_for_datagram(PeerMax, PMTU) ->
+    S = state_for_admission(0, 0, 1000000, 1000000),
+    S#state{
+        loss_state = quic_loss:on_handshake_confirmed(quic_loss:new()),
+        owner = self(),
+        transport_params = #{},
+        max_datagram_frame_size_remote = PeerMax,
+        pmtu_state = PMTU,
+        last_activity = erlang:monotonic_time(millisecond)
+    }.
+
+%% Size and frames of each 1-RTT packet sent, in packet-number order.
+-spec app_packets_sent(#state{}) -> [{non_neg_integer(), [term()]}].
+app_packets_sent(#state{loss_state = L}) ->
+    Sent = lists:sort(maps:to_list(quic_loss:sent_packets(app, L))),
+    [{Size, Frames} || {_PN, #sent_packet{size = Size, frames = Frames}} <- Sent].
+
+%% A connected client that advertised LocalMax as its
+%% max_datagram_frame_size, owned by the caller.
+-spec state_receiving_datagrams(non_neg_integer()) -> #state{}.
+state_receiving_datagrams(LocalMax) ->
+    S = state_for_datagram(65535, undefined),
+    S#state{cfg = (S#state.cfg)#conn_cfg{max_datagram_frame_size_local = LocalMax}}.

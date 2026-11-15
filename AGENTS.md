@@ -125,7 +125,7 @@ Last checked: 2026-11-12.
 | RFC 8899 DPLPMTUD | PMTU probing | `quic_pmtu` |
 | RFC 9438 CUBIC, RFC 9406 HyStart++ | congestion control | `quic_cc_cubic`, `quic_cc_newreno` |
 | draft-ietf-ccwg-bbr-07 BBRv3 | congestion control | `quic_cc_bbr` |
-| draft-ietf-quic-ack-frequency-14 | `min_ack_delay`, ACK_FREQUENCY, IMMEDIATE_ACK, the receiver's ACK policy, BBR's requests | `quic_connection`, `quic_frame`, `quic_tls`, `quic_cc_bbr` |
+| draft-ietf-quic-ack-frequency-14 (latest revision, expired 2026-08-09, WG waiting for write-up) | `min_ack_delay`, ACK_FREQUENCY, IMMEDIATE_ACK, the receiver's ACK policy, BBR's requests | `quic_connection`, `quic_frame`, `quic_tls`, `quic_cc_bbr` |
 | draft-ietf-quic-reliable-stream-reset-11 | RESET_STREAM_AT, `reset_stream_at` transport parameter (both ids) | `quic_connection`, `quic_tls` |
 | draft-ietf-quic-load-balancers-22 QUIC-LB | routable connection IDs, plaintext and encrypted | `quic_lb` |
 | RFC 8305 Happy Eyeballs v2 | client address racing | `quic_happy` |

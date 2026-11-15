@@ -103,6 +103,9 @@ close_with_error_code_test_() ->
             {quic_close, Code, _} -> ?assertEqual(16#109, Code)
         after 1000 -> error(no_quic_close)
         end,
+        %% meck records the call once the mocked fun has returned, so the
+        %% message above can arrive before the history has it.
+        meck:wait(quic, safe_close, '_', 1000),
         ?assertEqual(FakeQuicConn, meck:capture(first, quic, safe_close, '_', 1)),
         expect_closed(H3Conn, normal),
         expect_down(Mon, normal)

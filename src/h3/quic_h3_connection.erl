@@ -351,7 +351,9 @@
     streams_wanted = [] :: [request | bidi | uni],
     %% Streams and pushes whose response ended on its HEADERS, oldest first in the queue.
     no_content_ended = {sets:new([{version, 2}]), queue:new()} ::
-        {sets:set(no_content_key()), queue:queue(no_content_key())}
+        {sets:set(no_content_key()), queue:queue(no_content_key())},
+    %% Held streams answered in full, by monitor on the answering process.
+    answered_unread = #{} :: #{reference() => stream_id()}
 }).
 
 %%====================================================================
@@ -1230,8 +1232,10 @@ live_event(
                 0;
             true ->
                 case quic:datagram_max_size(QuicConn) of
-                    0 -> 0;
-                    Max -> max(0, Max - byte_size(quic_varint:encode(StreamId bsr 2)))
+                    Max when is_integer(Max) ->
+                        max(0, Max - byte_size(quic_varint:encode(StreamId bsr 2)));
+                    {error, _} ->
+                        0
                 end
         end,
     {keep_state, State, [{reply, From, Reply}]};
@@ -1258,7 +1262,7 @@ live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
 live_event({call, From}, {send_response, StreamId, Status, Headers}, State) ->
     case do_send_response(StreamId, Status, Headers, State) of
         {ok, State1} ->
-            {keep_state, State1, [{reply, From, ok}]};
+            {keep_state, watch_answered(StreamId, From, State1), [{reply, From, ok}]};
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]};
         {error, Reason, State1} ->
@@ -1496,7 +1500,10 @@ send_settings(
     %% negotiated a non-zero max_datagram_frame_size. Advertising the
     %% setting without QUIC datagrams is an H3_SETTINGS_ERROR per spec.
     Settings =
-        case H3DatagramEnabled andalso quic:datagram_max_size(QuicConn) > 0 of
+        case
+            H3DatagramEnabled andalso
+                peer_supports_datagrams(quic:get_peer_transport_params(QuicConn))
+        of
             true -> Settings0#{h3_datagram => 1};
             false -> Settings0
         end,
@@ -1558,6 +1565,15 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
             end
     end.
 
+%% QUIC holds a peer's stream until its reader is known (hold_peer_bidi_streams/1).
+new_request_stream(StreamId, State) ->
+    Flow =
+        case ?IS_PEER_STREAM(StreamId, State) of
+            true -> held;
+            false -> auto
+        end,
+    #h3_stream{id = StreamId, type = request, state = open, flow = Flow}.
+
 open_bidi_request_stream(
     StreamId, #state{streams = Streams, role = Role} = State
 ) ->
@@ -1568,11 +1584,7 @@ open_bidi_request_stream(
             #{StreamId := _} ->
                 State;
             _ ->
-                State#state{
-                    streams = Streams#{
-                        StreamId => #h3_stream{id = StreamId, type = request, state = open}
-                    }
-                }
+                State#state{streams = Streams#{StreamId => new_request_stream(StreamId, State)}}
         end,
     case Role of
         server ->
@@ -1867,6 +1879,8 @@ stream_type_varint(qpack_decoder) -> ?H3_STREAM_QPACK_DECODER;
 stream_type_varint({unknown, V}) -> V.
 
 claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
+    %% The owner reads it without consuming: credit follows delivery.
+    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
     Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
     State#state{
         bidi_type_buffers = maps:remove(StreamId, State#state.bidi_type_buffers),
@@ -2223,11 +2237,7 @@ retry_blocked_streams_fold([], State) ->
     {ok, State};
 retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State) ->
     %% Get stream record with proper defaults
-    Stream = maps:get(
-        StreamId,
-        State#state.streams,
-        #h3_stream{id = StreamId, type = request, state = open}
-    ),
+    Stream = maps:get(StreamId, State#state.streams, new_request_stream(StreamId, State)),
     %% Fin is the stream's; it ends the field section only when nothing
     %% was held behind it.
     Held = maps:get(StreamId, State#state.stream_buffers, <<>>),
@@ -2852,7 +2862,11 @@ handle_request_stream_data(
     Fin,
     #state{streams = Streams, stream_buffers = Buffers} = State
 ) ->
-    Stream0 = maps:get(StreamId, Streams, #h3_stream{id = StreamId, type = request, state = open}),
+    Stream0 =
+        case Streams of
+            #{StreamId := Known} -> Known;
+            _ -> new_request_stream(StreamId, State)
+        end,
     Stream = Stream0#h3_stream{received = Stream0#h3_stream.received + byte_size(Data)},
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
@@ -3069,6 +3083,9 @@ process_request_frame(StreamId, Frame, FrameFin, Rest, Fin, Stream, State) ->
             %% Stream-level error: reset it, and drop what else arrives on
             %% it, the rest of a DATA frame included.
             {Closed, State1} = fail_request_stream(SId, Code, Fin, Stream, State),
+            {ok, <<>>, Closed, State1};
+        {error, {stop_reading, SId}} ->
+            {Closed, State1} = abandon_reading(SId, Stream, State),
             {ok, <<>>, Closed, State1};
         {error, Reason} ->
             {error, Reason}
@@ -4655,8 +4672,8 @@ stop_reading(_StreamId, _ErrorCode, _Stream, _State) ->
 
 %% Reply to a write on StreamId. A send_queue_full refusal is remembered
 %% so the stream is told `send_ready' once the queue drains.
-write_reply(From, _StreamId, {ok, State1}, _State) ->
-    {keep_state, State1, [{reply, From, ok}]};
+write_reply(From, StreamId, {ok, State1}, _State) ->
+    {keep_state, watch_answered(StreamId, From, State1), [{reply, From, ok}]};
 write_reply(From, StreamId, {error, Reason}, State) ->
     {keep_state, note_refusal(StreamId, Reason, From, State), [{reply, From, {error, Reason}}]};
 write_reply(From, StreamId, {error, Reason, State1}, _State) ->
@@ -4728,13 +4745,15 @@ report_consumed(StreamId, #h3_stream{consumed_sent = Sent} = Stream, State) ->
 
 %% After a parse pass: when everything delivered has been consumed, the
 %% framing just parsed is credited here, since no consume/3 will follow it.
-report_overhead(StreamId, #h3_stream{flow = manual, unconsumed = 0} = Stream, State) ->
+report_overhead(StreamId, #h3_stream{flow = Flow, unconsumed = 0} = Stream, State) when
+    Flow =/= auto
+->
     report_consumed(StreamId, Stream, State);
 report_overhead(_StreamId, Stream, _State) ->
     Stream.
 
-%% Payload handed to the reader of a manual stream is owed until consumed.
-owe(#h3_stream{flow = manual, unconsumed = Owed} = Stream, Payload) ->
+%% Payload handed to a manual or held stream is owed until consumed.
+owe(#h3_stream{flow = Flow, unconsumed = Owed} = Stream, Payload) when Flow =/= auto ->
     Stream#h3_stream{unconsumed = Owed + byte_size(Payload)};
 owe(Stream, _Payload) ->
     Stream.
@@ -4747,7 +4766,7 @@ make_manual(StreamId, Stream, Pending, State) ->
     quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, {manual, Offset}),
     Stream1#h3_stream{consumed_sent = Offset}.
 
-make_auto(StreamId, #h3_stream{flow = manual} = Stream, State) ->
+make_auto(StreamId, #h3_stream{flow = Flow} = Stream, State) when Flow =/= auto ->
     quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
     Stream#h3_stream{flow = auto, unconsumed = 0};
 make_auto(_StreamId, Stream, _State) ->
@@ -4787,16 +4806,27 @@ register_stream_handler(
             drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State2)
     end.
 
-%% Apply a `flow_control' option; without one the stream keeps its mode.
+%% Apply `flow_control'; without it a held stream goes auto, others keep their mode.
 set_flow(StreamId, Opts, Pending, #state{streams = Streams} = State) ->
-    #{StreamId := Stream} = Streams,
+    #{StreamId := #h3_stream{flow = Flow} = Stream} = Streams,
     Stream1 =
-        case {maps:get(flow_control, Opts, Stream#h3_stream.flow), Stream#h3_stream.flow} of
-            {manual, auto} -> make_manual(StreamId, Stream, Pending, State);
-            {auto, manual} -> make_auto(StreamId, Stream, State);
-            _ -> Stream
+        case {maps:get(flow_control, Opts, chosen_flow(Flow)), Flow} of
+            {manual, manual} ->
+                Stream;
+            {manual, _} ->
+                make_manual(StreamId, Stream, Pending, State);
+            {auto, _} ->
+                make_auto(StreamId, Stream, State);
+            {_, Unread} when Unread =:= held; Unread =:= abandoned ->
+                make_auto(StreamId, Stream, State);
+            _ ->
+                Stream
         end,
     State#state{streams = Streams#{StreamId => Stream1}}.
+
+chosen_flow(held) -> auto;
+chosen_flow(abandoned) -> auto;
+chosen_flow(Flow) -> Flow.
 
 drain_buffered_data(StreamId, HandlerPid, Chunks, Opts, State) ->
     OrderedChunks = lists:reverse(Chunks),
@@ -4818,9 +4848,77 @@ handler_down(Ref, #state{stream_handlers = Handlers} = State) ->
         {ok, StreamId} ->
             {keep_state, do_unset_stream_handler(StreamId, State)};
         error ->
-            %% Unknown monitor, ignore
+            answerer_down(Ref, State)
+    end.
+
+%% An answered held stream stays readable while its answerer may still register.
+watch_answered(StreamId, {Pid, _Tag}, #state{role = server} = State) ->
+    case answered_unread(StreamId, State) of
+        true ->
+            Ref = erlang:monitor(process, Pid),
+            Live = prune_answered(State),
+            State#state{answered_unread = Live#{Ref => StreamId}};
+        false ->
+            State
+    end;
+watch_answered(_StreamId, _From, State) ->
+    State.
+
+answered_unread(StreamId, #state{streams = Streams}) ->
+    case Streams of
+        #{StreamId := #h3_stream{flow = held, state = half_closed_local, reset = false}} -> true;
+        _ -> false
+    end.
+
+%% Entries for streams that registered, ended or were reset meanwhile.
+prune_answered(#state{answered_unread = Answered} = State) ->
+    maps:filter(
+        fun(Ref, StreamId) ->
+            case answered_unread(StreamId, State) of
+                true ->
+                    true;
+                false ->
+                    erlang:demonitor(Ref, [flush]),
+                    false
+            end
+        end,
+        Answered
+    ).
+
+answerer_down(Ref, #state{answered_unread = Answered} = State) ->
+    case maps:take(Ref, Answered) of
+        {StreamId, Rest} ->
+            {keep_state, settle_unread(StreamId, State#state{answered_unread = Rest})};
+        error ->
             keep_state_and_data
     end.
+
+%% Nobody will read the body: stopped now if it has started, else once it
+%% does, so a stream that only carries datagrams is left alone.
+settle_unread(StreamId, #state{streams = Streams} = State) ->
+    case answered_unread(StreamId, State) of
+        true ->
+            #{StreamId := Stream} = Streams,
+            {Stream1, State1} =
+                case body_started(Stream) of
+                    true -> abandon_reading(StreamId, Stream, State);
+                    false -> {Stream#h3_stream{flow = abandoned}, State}
+                end,
+            State1#state{streams = (State1#state.streams)#{StreamId => Stream1}};
+        false ->
+            State
+    end.
+
+%% RFC 9114 Section 4.1: the response is complete, so the client is asked
+%% to stop sending with H3_NO_ERROR, and what it sent is dropped.
+abandon_reading(StreamId, Stream, State) ->
+    State1 = release_buffered(StreamId, State),
+    _ = stop_reading(StreamId, ?H3_NO_ERROR, Stream, State1),
+    Closed = Stream#h3_stream{state = closed, reset = true, data_remaining = 0},
+    {Closed, State1#state{stream_buffers = maps:remove(StreamId, State1#state.stream_buffers)}}.
+
+body_started(#h3_stream{body_received = Received, data_remaining = Remaining}) ->
+    (Received > 0) orelse (Remaining > 0).
 
 %% Unregister a stream handler
 do_unset_stream_handler(StreamId, #state{stream_handlers = Handlers} = State) ->
@@ -4862,14 +4960,28 @@ find_handler_by_ref_iter(Ref, Iter) ->
 %% not what a stream carries: with a handler registered a body of any size
 %% streams through. A piece that would take the connection past its budget
 %% resets that stream with H3_EXCESSIVE_LOAD; the connection carries on.
+deliver_body(StreamId, Payload, false, #h3_stream{flow = abandoned}, _State) when
+    Payload =/= <<>>
+->
+    {error, {stop_reading, StreamId}};
 deliver_body(StreamId, Payload, Fin, Stream, State) ->
     case body_fits(StreamId, Payload, State) of
         true ->
+            Stream1 = release_for_owner(StreamId, Stream, State),
             State1 = notify_stream_data(StreamId, Payload, Fin, State),
-            {ok, finish_on_fin(owe(Stream, Payload), Fin), State1};
+            {ok, finish_on_fin(owe(Stream1, Payload), Fin), State1};
         false ->
             {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}}
     end.
+
+%% A client hands a held stream's body to its owner, who does not consume.
+release_for_owner(StreamId, #h3_stream{flow = held} = Stream, #state{role = client} = State) ->
+    case maps:is_key(StreamId, State#state.stream_handlers) of
+        true -> Stream;
+        false -> make_auto(StreamId, Stream, State)
+    end;
+release_for_owner(_StreamId, Stream, _State) ->
+    Stream.
 
 finish_on_fin(Stream, true) ->
     close_half(remote, Stream#h3_stream{frame_state = complete});
@@ -5448,17 +5560,28 @@ apply_peer_settings(Settings, #state{qpack_encoder = Encoder} = State) ->
 %% RFC 9297 §2.1: peer SETTINGS_H3_DATAGRAM = 1 requires non-zero
 %% max_datagram_frame_size on the QUIC connection. Return `true' when
 %% the precondition holds, otherwise raise H3_SETTINGS_ERROR. Takes
-%% the QUIC-level max datagram size directly so the check can be
-%% unit-tested without a live connection.
-validate_peer_h3_datagram_with(0) ->
-    throw(
-        {connection_error, ?H3_SETTINGS_ERROR, <<"h3_datagram without max_datagram_frame_size">>}
-    );
-validate_peer_h3_datagram_with(_) ->
-    true.
+%% the peer's QUIC transport parameters, as quic:get_peer_transport_params/1
+%% returns them, so the check can be unit-tested without a live
+%% connection. Without them, datagrams stay off.
+validate_peer_h3_datagram_with({error, _}) ->
+    false;
+validate_peer_h3_datagram_with(PeerParams) ->
+    case peer_supports_datagrams(PeerParams) of
+        true ->
+            true;
+        false ->
+            throw(
+                {connection_error, ?H3_SETTINGS_ERROR,
+                    <<"h3_datagram without max_datagram_frame_size">>}
+            )
+    end.
 
 validate_peer_h3_datagram(#state{quic_conn = QuicConn}) ->
-    validate_peer_h3_datagram_with(quic:datagram_max_size(QuicConn)).
+    validate_peer_h3_datagram_with(quic:get_peer_transport_params(QuicConn)).
+
+%% RFC 9221 Section 3: the peer advertised a non-zero max_datagram_frame_size.
+peer_supports_datagrams({ok, #{max_datagram_frame_size := Max}}) -> Max > 0;
+peer_supports_datagrams(_) -> false.
 
 %% RFC 9297 §2.1 inbound datagram. Peel the quarter-stream-id varint
 %% and deliver the payload tagged with the full stream id to the owner.

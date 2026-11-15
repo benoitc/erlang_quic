@@ -63,8 +63,92 @@ All notable changes to this project will be documented in this file.
 - Breaking: `quic_cc:can_send_control/2` is removed, and
   `quic_cc:send_check` and `quic_cc:send_check_run` no longer take an
   urgency argument.
+- Breaking: `quic_cc:detect_persistent_congestion/3` and the matching
+  congestion control callback are removed. Persistent congestion is now
+  decided by the loss tracker, so a congestion control module no longer
+  implements it.
+- Breaking: `quic:datagram_max_size/1` now returns the largest payload
+  `quic:send_datagram/2` accepts right now, not the limit the peer
+  advertised. That is the peer's limit less the frame overhead, or what
+  fits in one packet at the confirmed path MTU, whichever is smaller,
+  so it grows as path MTU discovery confirms larger packets. It is
+  still 0 when the peer does not support datagrams, and a connection
+  that is gone now returns `{error, closed}`. The peer's own value is
+  in `quic:get_peer_transport_params/1`. `quic_h3:max_datagram_size/2`
+  follows it.
+- `quic:get_peer_transport_params/1` and `quic:datagram_max_size/1` also
+  answer before the handshake completes, from what is known of the peer
+  so far: for a client sending 0-RTT, the parameters remembered with the
+  session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
 
 ### Fixed
+- A client that used zero-length connection IDs and moved to the
+  server's preferred address got no answer there: the server looked for
+  a new connection ID for that address, and such a client has none to
+  give. It is now answered under its empty connection ID, which is used
+  on every path (RFC 9000 Sections 5.1.1 and 8.2.2).
+- Datagrams were checked against the largest packet size path MTU
+  discovery may try, not the size it has confirmed. A datagram between
+  the two was accepted and sent, and lost on a path that does not carry
+  it; those losses could also make the connection fall back to the
+  smallest packet size. A peer that limits UDP payloads to 1200 bytes
+  could also be sent datagrams larger than it accepts (RFC 9000 Section
+  18.2). A datagram now has to fit the confirmed path MTU, as RFC 8899
+  Section 3 requires, and is refused with `datagram_too_large_for_path`
+  until a larger one is confirmed.
+- The peer's `max_datagram_frame_size` was applied to the datagram
+  payload alone, so a datagram up to a few bytes over the peer's limit
+  was sent. The limit covers the whole frame (RFC 9221 Section 3), and
+  datagrams are now checked that way.
+- A received datagram up to a few bytes larger than our
+  `max_datagram_frame_size` was accepted. The connection now closes
+  with PROTOCOL_VIOLATION, as RFC 9221 Section 3 requires.
+- A datagram of more than 16383 bytes, on a path whose MTU allows it,
+  could be sent in a packet 2 bytes larger than the path MTU. A packet
+  that ended a flight could also be made 1 byte too large by the
+  immediate acknowledgment request added to it.
+- A stream reset could give a smaller final size than the stream's end
+  had already given, when that end went out ahead of data still waiting
+  to be sent. The peer then closed the whole connection, as RFC 9000
+  Section 4.5 requires. This happened when a server stopped reading an
+  upload early. A reset now keeps the final size already sent.
+- When the network reordered packets, a packet could be acknowledged
+  after it had been declared lost, and what it carried was still sent
+  again: stream data, control frames and handshake data waiting to be
+  resent, or already resent and lost again. A stream whose last data
+  was in such a packet also waited for the copy to be acknowledged
+  before it finished. A late acknowledgment now stops those copies, and
+  the stream no longer waits for them (RFC 9000 Section 13.3).
+- Packets that carry padding but nothing that needs an acknowledgment,
+  such as a client's Initial packets that only acknowledge, were not
+  counted as data in flight. They now count until they are acknowledged,
+  declared lost or discarded (RFC 9002 Section 2), and like other data
+  in flight they wait for room in the congestion window (Section 7).
+- The loss tracker and the congestion controller could disagree about
+  the data in flight: discarding the Initial or Handshake keys removed
+  bytes that had never been counted, which could take the count of
+  other packets with it, and a lost packet that only acknowledged was
+  taken off the congestion controller's count. Both now count the same
+  packets (RFC 9002 Section 2 and Appendix B.9).
+- A lost packet that only carried acknowledgments cut the congestion
+  window when the loss timer declared it lost. Only packets in flight
+  now cause a congestion response (RFC 9002 Appendix B.8).
+- Switching congestion control algorithm on a live connection started
+  the new controller with nothing in flight, so it could send past its
+  window until the earlier packets were acknowledged. It now starts
+  with the data already in flight.
+- Persistent congestion, which drops the congestion window to its
+  minimum, was declared from any two lost packets far enough apart: even
+  when a packet sent between them had been acknowledged, when one of
+  them only carried acknowledgments, or when they were exactly the
+  threshold apart. It now follows RFC 9002 Section 7.6.2: two lost
+  packets that needed an acknowledgment, sent after the first RTT
+  sample and more than the persistent congestion duration apart, with
+  no packet sent between them acknowledged in any packet number space.
+  The two packets no longer have to be declared lost at the same time,
+  and once persistent congestion is declared the minimum RTT restarts
+  from the newest sample, so a path whose RTT rose is not declared
+  congested again and again (Section 5.2).
 - A client that had sent 0-RTT data could not complete a connection
   when the server answered with a Retry: processing the Retry failed
   each time and the connection timed out. The 0-RTT data now goes out
@@ -164,6 +248,19 @@ All notable changes to this project will be documented in this file.
   timer cut the window. Probes now count as in flight and wait for the
   congestion window like other packets, and losing one never lowers the
   sending rate (RFC 9000 Section 14.4, RFC 9002 Section 2).
+- An HTTP/3 request stream received receive credit with its first
+  packet, before its handler could register. A handler that then chose
+  `flow_control => manual` was not holding the client to one window:
+  the client could send several windows ahead of what the handler had
+  consumed, up to `max_receive_window`. A stream the peer opens now
+  keeps its initial window until its handler registers, so a manual
+  handler gets exactly one window past what it consumed, and a handler
+  in the default mode gets credit as before once it registers
+  (RFC 9000 Section 4.1). When a handler answers in full and ends
+  without registering, as the default 404 handler does, the client is
+  asked to stop sending the rest of the body with `H3_NO_ERROR` and what
+  was buffered for it is dropped (RFC 9114 Section 4.1). Such a body
+  used to be buffered up to `max_buffered_body` and its stream reset.
 
 ## [2.7.0] - 2026-11-13
 

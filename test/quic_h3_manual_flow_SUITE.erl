@@ -25,6 +25,12 @@
     a_response_stops_while_the_client_does_not_consume/1,
     data_buffered_before_the_claim_is_consumed_like_any_other/1,
     auto_streams_are_unchanged/1,
+    an_unread_body_takes_one_window_of_a_large_connection/1,
+    claimed_streams_carry_more_than_a_window/1,
+    an_unread_body_is_stopped_once_answered/1,
+    a_body_sent_after_the_answer_is_stopped/1,
+    a_handler_reading_after_its_response_is_not_stopped/1,
+    complete_requests_are_not_stopped/1,
     consume_on_a_finished_stream_is_an_error/1,
     consume_on_a_reset_stream_is_an_error/1,
     consume_on_an_auto_stream_is_a_no_op/1,
@@ -39,10 +45,12 @@
 -define(PIECE, (16 * ?KIB)).
 -define(PROBE, quic_h3_manual_flow_probe).
 -define(WAIT_MS, 10000).
-%% What a stalled transfer may still deliver: the manual window, plus what
-%% the stream was granted before the handler claimed it. The transfer is
-%% many times larger, so a receiver that keeps granting blows through it.
--define(STALL_BOUND, (?WINDOW + 2 * ?MAX_WINDOW)).
+-define(WT_STREAM, 16#41).
+-define(H3_NO_ERROR, 16#100).
+%% What a stalled transfer may still deliver: one manual window. The
+%% framing credited inside it moves the limit by less than half a window,
+%% so no more is granted. The transfer is many times larger.
+-define(STALL_BOUND, ?WINDOW).
 
 suite() ->
     [{timetrap, {seconds, 120}}].
@@ -54,6 +62,12 @@ all() ->
         a_response_stops_while_the_client_does_not_consume,
         data_buffered_before_the_claim_is_consumed_like_any_other,
         auto_streams_are_unchanged,
+        an_unread_body_takes_one_window_of_a_large_connection,
+        claimed_streams_carry_more_than_a_window,
+        an_unread_body_is_stopped_once_answered,
+        a_body_sent_after_the_answer_is_stopped,
+        a_handler_reading_after_its_response_is_not_stopped,
+        complete_requests_are_not_stopped,
         consume_on_a_finished_stream_is_an_error,
         consume_on_a_reset_stream_is_an_error,
         consume_on_an_auto_stream_is_a_no_op,
@@ -170,6 +184,124 @@ auto_streams_are_unchanged(Config) ->
         ok = quic_h3:close(Conn)
     end).
 
+%% A 64 KiB stream window next to a 16 MiB connection window (#554): a
+%% handler in manual mode that has consumed nothing holds one stream
+%% window of body, not what the connection would allow.
+an_unread_body_takes_one_window_of_a_large_connection(Config) ->
+    with_server(Config, large_connection(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, StreamId} = upload(Conn, <<"/upload/unread">>, body(?UPLOAD)),
+        Handler = claimed(),
+        Stalled = stalled_at(),
+        ?assert(Stalled > 0),
+        ?assert(Stalled =< ?STALL_BOUND),
+        Handler ! consume_from_now_on,
+        ?assertEqual(
+            {200, integer_to_binary(erlang:phash2(body(?UPLOAD)))}, response(Conn, StreamId)
+        ),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% A stream claimed for an extension, as WebTransport claims its data
+%% streams, is read without consume/3: it carries many windows, whichever
+%% side opened it.
+claimed_streams_carry_more_than_a_window(Config) ->
+    Test = self(),
+    Owner = spawn_link(fun() -> count_claimed(Test, #{}) end),
+    Extra = #{
+        stream_type_handler => fun claim_wt/3,
+        connection_handler => fun(_Conn) -> #{owner => Owner} end
+    },
+    with_server(Config, small_window(), Extra, fun(Port) ->
+        Conn = connect(Port, small_window(), #{stream_type_handler => fun claim_wt/3}),
+        {ok, Up} = quic_h3:open_bidi_stream(Conn, ?WT_STREAM),
+        ok = raw_send(quic_h3:get_quic_conn(Conn), Up, wt_stream(body(?UPLOAD))),
+        ?assertEqual(
+            {claimed, Up, ?UPLOAD},
+            receive
+                {claimed, Up, _} = Got -> Got
+            after ?WAIT_MS -> timeout
+            end
+        ),
+        {ok, Req} = quic_h3:request(Conn, headers(<<"GET">>, <<"/open-wt">>)),
+        {200, _} = response(Conn, Req),
+        ?assertEqual(?UPLOAD, claimed_from_server(Conn, 0)),
+        ok = quic_h3:close(Conn)
+    end),
+    unlink(Owner),
+    exit(Owner, kill).
+
+%% A handler that answers in full without reading the body, as the default
+%% 404 handler does: once it is done the client is asked to stop sending
+%% (RFC 9114 Section 4.1), still gets the whole response, and the
+%% connection serves the next request.
+an_unread_body_is_stopped_once_answered(Config) ->
+    with_server(Config, small_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, StreamId} = quic_h3:request(
+            Conn, headers(<<"POST">>, <<"/not-found/late">>), #{end_stream => false}
+        ),
+        _ = spawn_link(fun() -> send_until_refused(Conn, StreamId, body(?UPLOAD)) end),
+        ?assertEqual({404, <<"Not Found">>}, response(Conn, StreamId)),
+        ?assertEqual({stop_sending, ?H3_NO_ERROR}, stop_sending(Conn, StreamId, ?WAIT_MS)),
+        {ok, Next} = quic_h3:request(Conn, headers(<<"GET">>, <<"/bytes/100">>)),
+        ?assertEqual({200, body(100)}, response(Conn, Next)),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% The same when the body only starts once the answer is in.
+a_body_sent_after_the_answer_is_stopped(Config) ->
+    with_server(Config, small_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, StreamId} = quic_h3:request(
+            Conn, headers(<<"POST">>, <<"/not-found">>), #{end_stream => false}
+        ),
+        ?assertEqual({404, <<"Not Found">>}, response(Conn, StreamId)),
+        ?assertEqual(none, stop_sending(Conn, StreamId, 300)),
+        _ = spawn_link(fun() -> send_until_refused(Conn, StreamId, body(?UPLOAD)) end),
+        ?assertEqual({stop_sending, ?H3_NO_ERROR}, stop_sending(Conn, StreamId, ?WAIT_MS)),
+        {ok, Next} = quic_h3:request(Conn, headers(<<"GET">>, <<"/bytes/100">>)),
+        ?assertEqual({200, body(100)}, response(Conn, Next)),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% A handler that answers first and then registers, in either mode, still
+%% reads the whole body: it is not stopped.
+a_handler_reading_after_its_response_is_not_stopped(Config) ->
+    with_server(Config, small_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        lists:foreach(
+            fun(Mode) ->
+                Path = <<"/answer-then-read/", (atom_to_binary(Mode))/binary>>,
+                {ok, StreamId} = upload(Conn, Path, body(?UPLOAD)),
+                ?assertEqual({200, <<"ok">>}, response(Conn, StreamId)),
+                ?assertEqual(
+                    {read, erlang:phash2(body(?UPLOAD))},
+                    receive
+                        {read, _} = Read -> Read
+                    after ?WAIT_MS * 3 -> timeout
+                    end
+                ),
+                ?assertEqual(none, stop_sending(Conn, StreamId, 0))
+            end,
+            [auto, manual]
+        ),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% A request whose body is already complete is never stopped.
+complete_requests_are_not_stopped(Config) ->
+    with_server(Config, small_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, Get} = quic_h3:request(Conn, headers(<<"GET">>, <<"/not-found">>)),
+        ?assertEqual({404, <<"Not Found">>}, response(Conn, Get)),
+        {ok, Post} = upload(Conn, <<"/not-found/late">>, body(?PIECE)),
+        ?assertEqual({404, <<"Not Found">>}, response(Conn, Post)),
+        ?assertEqual(none, stop_sending(Conn, Get, 500)),
+        ?assertEqual(none, stop_sending(Conn, Post, 0)),
+        ok = quic_h3:close(Conn)
+    end).
+
 consume_on_a_finished_stream_is_an_error(Config) ->
     with_server(Config, #{}, fun(Port) ->
         Conn = connect(Port, #{}),
@@ -256,9 +388,20 @@ small_window() ->
         max_receive_window => ?MAX_WINDOW
     }.
 
+%% A small stream window next to a large connection window.
+large_connection() ->
+    #{
+        max_stream_data_bidi_remote => ?WINDOW,
+        max_data => 16 * ?MIB,
+        max_receive_window => 16 * ?MIB
+    }.
+
 with_server(Config, QuicOpts, F) ->
+    with_server(Config, QuicOpts, #{}, F).
+
+with_server(Config, QuicOpts, Extra, F) ->
     Name = list_to_atom("h3_manual_" ++ integer_to_list(erlang:unique_integer([positive]))),
-    {ok, _} = quic_h3:start_server(Name, 0, #{
+    {ok, _} = quic_h3:start_server(Name, 0, Extra#{
         cert => ?config(cert, Config),
         key => ?config(key, Config),
         handler => fun handle/5,
@@ -289,6 +432,29 @@ handle(Conn, StreamId, <<"POST">>, <<"/upload/held">>, _Headers) ->
     ?PROBE ! {claimed, self()},
     ok = consume(Conn, StreamId, Buffered),
     upload_loop(Conn, StreamId, held, Buffered);
+handle(Conn, StreamId, _Method, <<"/not-found">>, _Headers) ->
+    not_found(Conn, StreamId);
+handle(Conn, StreamId, _Method, <<"/not-found/late">>, _Headers) ->
+    %% The body, one piece with its FIN, is in before the answer.
+    timer:sleep(300),
+    not_found(Conn, StreamId);
+handle(Conn, StreamId, <<"POST">>, <<"/answer-then-read/", Mode/binary>>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    ok = quic_h3:send_data(Conn, StreamId, <<"ok">>, true),
+    Flow = binary_to_existing_atom(Mode),
+    Buffered = claim(Conn, StreamId, #{flow_control => Flow}),
+    ok = consume(Conn, StreamId, Buffered),
+    ?PROBE ! {read, erlang:phash2(read_all(Conn, StreamId, Flow, Buffered))};
+handle(Conn, StreamId, <<"GET">>, <<"/open-wt">>, _Headers) ->
+    {ok, Down} = quic_h3:open_bidi_stream(Conn, ?WT_STREAM),
+    ok = quic_h3:send_response(Conn, StreamId, 200, []),
+    ok = quic_h3:send_data(Conn, StreamId, <<>>, true),
+    ok = raw_send(quic_h3:get_quic_conn(Conn), Down, wt_stream(body(?UPLOAD)));
+handle(Conn, StreamId, <<"POST">>, <<"/upload/unread">>, _Headers) ->
+    Buffered = claim(Conn, StreamId, #{flow_control => manual}),
+    ?PROBE ! {claimed, self()},
+    ?PROBE ! {got, iolist_size([D || {D, _} <- Buffered])},
+    upload_loop(Conn, StreamId, held, Buffered);
 handle(Conn, StreamId, <<"POST">>, <<"/upload/late">>, _Headers) ->
     %% Let part of the body arrive and be buffered before claiming.
     timer:sleep(300),
@@ -297,6 +463,29 @@ handle(Conn, StreamId, <<"POST">>, <<"/upload/late">>, _Headers) ->
     ?PROBE ! {buffered, iolist_size([D || {D, _} <- Buffered])},
     ?PROBE ! {got, iolist_size([D || {D, _} <- Buffered])},
     upload_loop(Conn, StreamId, held, Buffered).
+
+%% What quic_h3's default handler answers.
+not_found(Conn, StreamId) ->
+    ok = quic_h3:send_response(Conn, StreamId, 404, [{<<"content-type">>, <<"text/plain">>}]),
+    quic_h3:send_data(Conn, StreamId, <<"Not Found">>, true).
+
+%% The whole body, consuming each piece on a manual stream.
+read_all(Conn, StreamId, Flow, Acc) ->
+    case lists:any(fun({_, Fin}) -> Fin end, Acc) of
+        true ->
+            iolist_to_binary([D || {D, _} <- Acc]);
+        false ->
+            receive
+                {quic_h3, Conn, {data, StreamId, Data, Fin}} ->
+                    %% The response is out, so the last piece ends the stream.
+                    _ = maybe_consume(Conn, StreamId, consume_mode(Flow), Data),
+                    read_all(Conn, StreamId, Flow, Acc ++ [{Data, Fin}])
+            after ?WAIT_MS * 3 -> exit(read_timed_out)
+            end
+    end.
+
+consume_mode(manual) -> consume;
+consume_mode(auto) -> auto.
 
 claim(Conn, StreamId, Opts) ->
     case quic_h3:set_stream_handler(Conn, StreamId, self(), Opts#{drain_buffer => true}) of
@@ -339,6 +528,51 @@ finish_upload(Conn, StreamId, Acc) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),
     quic_h3:send_data(Conn, StreamId, integer_to_binary(erlang:phash2(Body)), true).
 
+claim_wt(bidi, _StreamId, ?WT_STREAM) -> claim;
+claim_wt(_Dir, _StreamId, _Type) -> ignore.
+
+%% The server's owner: bytes per claimed stream, reported at its end.
+count_claimed(Test, Counts) ->
+    receive
+        {quic_h3, _Conn, {stream_type_data, bidi, Id, Data, Fin}} ->
+            N = maps:get(Id, Counts, 0) + byte_size(Data),
+            Fin andalso (Test ! {claimed, Id, N}),
+            count_claimed(Test, Counts#{Id => N});
+        _ ->
+            count_claimed(Test, Counts)
+    end.
+
+%% What a claimed stream the server opened carried to the client.
+claimed_from_server(Conn, Got) ->
+    receive
+        {quic_h3, Conn, {stream_type_data, bidi, _Id, Data, true}} ->
+            Got + byte_size(Data);
+        {quic_h3, Conn, {stream_type_data, bidi, _Id, Data, false}} ->
+            claimed_from_server(Conn, Got + byte_size(Data))
+    after ?WAIT_MS -> {stalled, Got}
+    end.
+
+%% The WebTransport stream signal, then the payload.
+wt_stream(Payload) ->
+    <<(quic_varint:encode(?WT_STREAM))/binary, Payload/binary>>.
+
+%% Straight onto the QUIC stream, in pieces, retrying a refused one.
+raw_send(QC, StreamId, Data) when byte_size(Data) =< ?PIECE ->
+    raw_piece(QC, StreamId, Data, true);
+raw_send(QC, StreamId, Data) ->
+    <<Piece:?PIECE/binary, Rest/binary>> = Data,
+    ok = raw_piece(QC, StreamId, Piece, false),
+    raw_send(QC, StreamId, Rest).
+
+raw_piece(QC, StreamId, Data, Fin) ->
+    case quic:send_data(QC, StreamId, Data, Fin) of
+        {error, send_queue_full} ->
+            timer:sleep(10),
+            raw_piece(QC, StreamId, Data, Fin);
+        Result ->
+            Result
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -377,6 +611,24 @@ upload_after_go(Conn, Path, Body, Head) ->
     end),
     {ok, StreamId, Sender}.
 
+%% Send until the stream is stopped; what happens to the writes then is
+%% not what the test checks.
+send_until_refused(Conn, StreamId, Body) when byte_size(Body) =< ?PIECE ->
+    _ = send(Conn, StreamId, Body, true);
+send_until_refused(Conn, StreamId, Body) ->
+    <<Piece:?PIECE/binary, Rest/binary>> = Body,
+    case send(Conn, StreamId, Piece, false) of
+        ok -> send_until_refused(Conn, StreamId, Rest);
+        _ -> ok
+    end.
+
+%% The peer's STOP_SENDING on StreamId, if one arrives within Ms.
+stop_sending(Conn, StreamId, Ms) ->
+    receive
+        {quic_h3, Conn, {stop_sending, StreamId, Code}} -> {stop_sending, Code}
+    after Ms -> none
+    end.
+
 %% In pieces, retrying a refused piece as the HTTP/3 guide shows.
 send_body(Conn, StreamId, Body) when byte_size(Body) =< ?PIECE ->
     send(Conn, StreamId, Body, true);
@@ -414,7 +666,10 @@ send(Conn, StreamId, Data, Fin) ->
     end.
 
 connect(Port, QuicOpts) ->
-    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, #{
+    connect(Port, QuicOpts, #{}).
+
+connect(Port, QuicOpts, Extra) ->
+    {ok, Conn} = quic_h3:connect("127.0.0.1", Port, Extra#{
         verify => false, sync => true, quic_opts => QuicOpts
     }),
     Conn.

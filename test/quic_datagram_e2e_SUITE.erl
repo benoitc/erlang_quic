@@ -14,6 +14,11 @@
 -include_lib("stdlib/include/assert.hrl").
 -include("quic.hrl").
 
+%% Payload of a DATAGRAM in a 1200-byte packet: flags, the server's
+%% 8-byte connection ID, a 4-byte packet number, the AEAD tag, the frame
+%% type and a 2-byte length.
+-define(PATH_BUDGET_1200, (1200 - (1 + 8 + 4 + 16) - (1 + 2))).
+
 %% CT callbacks
 -export([
     suite/0,
@@ -48,6 +53,7 @@
 %% Test cases - API
 -export([
     datagram_max_size_api/1,
+    datagram_max_size_fits_the_path/1,
     datagram_max_size_when_disabled/1
 ]).
 
@@ -83,6 +89,7 @@ groups() ->
         ]},
         {api, [sequence], [
             datagram_max_size_api,
+            datagram_max_size_fits_the_path,
             datagram_max_size_when_disabled
         ]}
     ].
@@ -131,6 +138,10 @@ end_per_testcase(_TestCase, Config) ->
 %%====================================================================
 %% Helper Functions
 %%====================================================================
+
+peer_max_datagram_frame_size(ConnRef) ->
+    {ok, Params} = quic:get_peer_transport_params(ConnRef),
+    maps:get(max_datagram_frame_size, Params, 0).
 
 generate_certs() ->
     TmpDir = filename:join([
@@ -247,11 +258,12 @@ both_support_datagrams(Config) ->
     {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => 65535}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
-    %% Check that datagrams are enabled
+    %% The peer's limit is negotiated; the path bounds what fits.
+    ?assertEqual(65535, peer_max_datagram_frame_size(ConnRef)),
     MaxSize = quic:datagram_max_size(ConnRef),
-    ct:log("Negotiated max datagram size: ~p", [MaxSize]),
+    ct:log("Largest datagram payload: ~p", [MaxSize]),
     ?assert(MaxSize > 0),
-    ?assertEqual(65535, MaxSize),
+    ?assert(MaxSize < 1500),
 
     quic:close(ConnRef, normal),
     ok.
@@ -264,9 +276,8 @@ client_disabled_datagrams(Config) ->
     {ok, ConnRef} = connect_client(Port, #{}),
 
     %% Client sees server's advertised value (server CAN receive)
-    MaxSize = quic:datagram_max_size(ConnRef),
-    ct:log("Max datagram size (peer's limit): ~p", [MaxSize]),
-    ?assertEqual(65535, MaxSize),
+    ?assertEqual(65535, peer_max_datagram_frame_size(ConnRef)),
+    ?assert(quic:datagram_max_size(ConnRef) > 0),
 
     %% Client CAN send to server (server advertised support)
     Result = quic:send_datagram(ConnRef, <<"test">>),
@@ -331,9 +342,8 @@ send_max_size_datagram(Config) ->
     {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => MaxSize}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
-    %% Client's max size should be the server's advertised limit
-    NegotiatedSize = quic:datagram_max_size(ConnRef),
-    ?assertEqual(MaxSize, NegotiatedSize),
+    %% Client sees the server's advertised limit
+    ?assertEqual(MaxSize, peer_max_datagram_frame_size(ConnRef)),
 
     %% Send a payload that fits under both the peer's advertised cap and
     %% the current PMTU budget.
@@ -361,19 +371,19 @@ send_oversized_for_path_fails(Config) ->
     quic:close(ConnRef, normal),
     ok.
 
-%% Sending an oversized datagram should fail
+%% The peer's limit covers the whole frame, so a 100-byte limit leaves
+%% 97 bytes after the frame type and a 2-byte length (RFC 9221 Section 3).
 send_oversized_datagram_fails(Config) ->
     MaxSize = 100,
     {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => MaxSize}),
     {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => 65535}),
 
-    %% Verify the negotiated size
-    ?assertEqual(MaxSize, quic:datagram_max_size(ConnRef)),
-
-    %% Try to send oversized datagram
-    OversizedData = crypto:strong_rand_bytes(MaxSize + 1),
-    Result = quic:send_datagram(ConnRef, OversizedData),
-    ?assertEqual({error, datagram_too_large}, Result),
+    ?assertEqual(MaxSize, peer_max_datagram_frame_size(ConnRef)),
+    ?assertEqual(97, quic:datagram_max_size(ConnRef)),
+    ?assertEqual(ok, quic:send_datagram(ConnRef, crypto:strong_rand_bytes(97))),
+    ?assertEqual(
+        {error, datagram_too_large}, quic:send_datagram(ConnRef, crypto:strong_rand_bytes(98))
+    ),
 
     quic:close(ConnRef, normal),
     ok.
@@ -440,16 +450,47 @@ bidirectional_datagrams(Config) ->
 %% API Tests
 %%====================================================================
 
-%% Test datagram_max_size API returns peer's value
+%% A peer limit of 1200 leaves 1197 bytes of frame payload, but a packet
+%% at the 1200-byte path MTU carries less: the path decides.
 datagram_max_size_api(Config) ->
     ServerMaxSize = 1200,
     ClientMaxSize = 65535,
     {ok, _ServerName, Port} = start_server(Config, #{max_datagram_frame_size => ServerMaxSize}),
-    {ok, ConnRef} = connect_client(Port, #{max_datagram_frame_size => ClientMaxSize}),
+    {ok, ConnRef} = connect_client(Port, #{
+        max_datagram_frame_size => ClientMaxSize, pmtu_enabled => false
+    }),
 
-    %% Client should see server's advertised value
+    ?assertEqual(ServerMaxSize, peer_max_datagram_frame_size(ConnRef)),
+    ?assertEqual(?PATH_BUDGET_1200, quic:datagram_max_size(ConnRef)),
+
+    quic:close(ConnRef, normal),
+    ok.
+
+%% Right after connecting, the size reported is what send_datagram
+%% accepts at the confirmed MTU: exactly that size goes through, one
+%% byte more is refused for the path (RFC 8899 Section 3).
+datagram_max_size_fits_the_path(Config) ->
+    {ok, ServerName, Port} = start_server(Config, #{max_datagram_frame_size => 65535}),
+    {ok, ConnRef} = connect_client(Port, #{
+        max_datagram_frame_size => 65535, pmtu_enabled => false
+    }),
+    {ok, ServerConn} = wait_for_server_connection(ServerName, 5000),
+    ok = quic:set_owner_sync(ServerConn, self()),
+
+    ?assertEqual({ok, 1200}, quic:get_mtu(ConnRef)),
     MaxSize = quic:datagram_max_size(ConnRef),
-    ?assertEqual(ServerMaxSize, MaxSize),
+    ?assertEqual(?PATH_BUDGET_1200, MaxSize),
+    Data = crypto:strong_rand_bytes(MaxSize),
+    ?assertEqual(ok, quic:send_datagram(ConnRef, Data)),
+    ?assertEqual(
+        {error, datagram_too_large_for_path},
+        quic:send_datagram(ConnRef, crypto:strong_rand_bytes(MaxSize + 1))
+    ),
+    receive
+        {quic, ServerConn, {datagram, Data}} -> ok
+    after 5000 ->
+        ct:fail("Timeout waiting for the full-size datagram")
+    end,
 
     quic:close(ConnRef, normal),
     ok.

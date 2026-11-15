@@ -38,7 +38,7 @@
 - [x] Packet number reconstruction per RFC 9000 Appendix A
 - [x] Coalesced packets
 - [x] Frame coalescing (ACK + small stream data in single packet)
-- [x] ACK frequency extension (draft-ietf-quic-ack-frequency-14): every connection advertises `min_ack_delay` (1 ms) and follows the peer's ACK_FREQUENCY and IMMEDIATE_ACK; with BBR it also asks a peer that advertised `min_ack_delay` for fewer ACKs in steady state. PTO probes, PMTU probes and the first packet after a client migration carry IMMEDIATE_ACK to such a peer
+- [x] ACK frequency extension (draft-ietf-quic-ack-frequency-14, the latest revision, expired 2026-08-09 while the working group prepares its write-up): every connection advertises `min_ack_delay` (1 ms) and follows the peer's ACK_FREQUENCY and IMMEDIATE_ACK; with BBR it also asks a peer that advertised `min_ack_delay` for fewer ACKs in steady state. PTO probes, PMTU probes and the first packet after a client migration carry IMMEDIATE_ACK to such a peer
 - [x] HTTP/3 response HEADERS coalesced with the first DATA frame so the
   response headers and first body bytes ride in one 1-RTT packet (a large
   body still fragments; only the standalone HEADERS packet is removed)
@@ -70,6 +70,10 @@ path's congestion controller.
 
 ### Loss Detection
 - [x] Packet loss detection
+- [x] Bytes in flight count the packets that are ack-eliciting or carry PADDING
+  (Section 2), a client's padded ACK-only Initial included; the loss tracker
+  and the congestion controller count the same packets. Packets that are not
+  ack-eliciting are never held back by the congestion window (Section 7)
 - [x] Per-packet-number-space recovery (RFC 9002 Appendix A): each space keeps
   its own sent packets and loss state, while the RTT estimate, the probe
   backoff and bytes in flight stay connection-wide
@@ -101,9 +105,12 @@ than from its own timer.
 - [x] Slow start with improved exit detection
 - [x] Congestion avoidance
 - [x] Recovery on packet loss
-- [x] Persistent congestion detection, over the RFC 9002 Section 7.6.1 duration:
-  the PTO without its exponential backoff, times 3. Section 7.6.2's rule about
-  packets sent before the first RTT sample is not applied
+- [x] Persistent congestion detection (RFC 9002 Section 7.6.2): two lost
+  ack-eliciting packets sent after the first RTT sample, more than the Section
+  7.6.1 duration apart (the PTO without its exponential backoff, times 3), with
+  no packet sent between them acknowledged. Another packet number space is
+  known only by the newest packet it acknowledged, so its acknowledgments end
+  the period conservatively
 - [x] ECN support (ECN-CE triggers congestion response)
 - [x] Packet pacing (RFC 9002 Section 7.7) to prevent bursts
 - [x] RTT-based flow control auto-tuning
@@ -240,13 +247,13 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram
-- `quic:datagram_max_size/1` - Get max datagram size (0 if unsupported)
+- `quic:datagram_max_size/1` - Largest payload `send_datagram/2` accepts now, at the confirmed path MTU (0 if unsupported)
 - `quic:datagram_stats/1` - Delivered / dropped / sent counters (backpressure); DATAGRAMs that arrive while the owner is behind are dropped
 
 ### HTTP Datagrams (RFC 9297)
 - `quic_h3:send_datagram/3` - Send an HTTP datagram bound to a request stream
 - `quic_h3:h3_datagrams_enabled/1` - Whether both sides negotiated support
-- `quic_h3:max_datagram_size/2` - Max payload per datagram for a given stream
+- `quic_h3:max_datagram_size/2` - Largest payload per datagram for a given stream that can be sent now
 - Owner event: `{quic_h3, Conn, {datagram, StreamId, Payload}}`
 - Set `h3_datagram_enabled => true` on `connect/3` / `start_server/3` to enable.
   CONNECT-UDP (RFC 9298) builds on this in a separate library.

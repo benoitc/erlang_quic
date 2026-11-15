@@ -452,27 +452,6 @@ configured_cwnd_minimum_test() ->
 %% Persistent Congestion Tests
 %%====================================================================
 
-detect_persistent_congestion_empty_test() ->
-    State = quic_cc:new(cubic, #{}),
-    ?assertNot(quic_cc:detect_persistent_congestion([], 100, State)).
-
-detect_persistent_congestion_single_packet_test() ->
-    State = quic_cc:new(cubic, #{}),
-    LostPackets = [{1, 1000}],
-    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, 100, State)).
-
-detect_persistent_congestion_below_threshold_test() ->
-    State = quic_cc:new(cubic, #{}),
-    PTO = 100,
-    LostPackets = [{1, 1000}, {2, 1200}],
-    ?assertNot(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
-detect_persistent_congestion_at_threshold_test() ->
-    State = quic_cc:new(cubic, #{}),
-    PTO = 100,
-    LostPackets = [{1, 1000}, {2, 1300}],
-    ?assert(quic_cc:detect_persistent_congestion(LostPackets, PTO, State)).
-
 on_persistent_congestion_resets_cwnd_test() ->
     State = quic_cc:new(cubic, #{}),
     InitialCwnd = quic_cc:cwnd(State),

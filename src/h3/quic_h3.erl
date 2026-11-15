@@ -426,6 +426,7 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
     ),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
+            ok = quic_connection:hold_peer_bidi_streams(QuicConn),
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
             %% With Happy Eyeballs the connection can already be `connected'
@@ -966,8 +967,9 @@ send_datagram(Conn, StreamId, Data) ->
 h3_datagrams_enabled(Conn) ->
     quic_h3_connection:h3_datagrams_enabled(Conn).
 
-%% @doc Max payload we can fit in one H3 DATAGRAM for the given stream.
-%% Returns 0 if RFC 9297 isn't live or the peer advertised 0 for
+%% @doc Largest payload one H3 DATAGRAM for the given stream can carry
+%% now: `quic:datagram_max_size/1' less the quarter stream ID. Returns 0
+%% if RFC 9297 isn't live or the peer advertised 0 for
 %% `max_datagram_frame_size'.
 -spec max_datagram_size(conn(), stream_id()) -> non_neg_integer().
 max_datagram_size(Conn, StreamId) ->
@@ -1121,8 +1123,15 @@ start_h3_connection(QuicConnPid, H3Opts, Owner) ->
             {error, Reason}
     end.
 
+%% A request stream gets credit once its reader is known (RFC 9000 Section 4.1).
 start_h3_process(QuicConnPid, H3Opts, Owner) ->
-    gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []).
+    case gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []) of
+        {ok, _} = Started ->
+            ok = quic_connection:hold_peer_bidi_streams(QuicConnPid),
+            Started;
+        Error ->
+            Error
+    end.
 
 %% The per-connection map, validated, with the keys the connection reads.
 build_h3_opts(Opts) ->

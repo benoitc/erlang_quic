@@ -3,7 +3,7 @@
 %%% Every ack-eliciting packet waits for the congestion window (RFC 9002
 %%% Section 7). The exceptions are a PTO probe (Section 7.5) and the one
 %%% packet a sender may send on entering recovery (Section 7.3.2).
-%%% Packets that are not in flight, ACK-only and CONNECTION_CLOSE, are
+%%% Packets that are not ack-eliciting, ACK-only and CONNECTION_CLOSE, are
 %%% never held back.
 %%%
 %%% Copyright (c) 2024-2026 Benoit Chesneau

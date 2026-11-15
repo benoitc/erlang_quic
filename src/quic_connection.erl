@@ -97,6 +97,7 @@
     send_data/5,
     send_data_async/4,
     set_stream_flow_control/3,
+    hold_peer_bidi_streams/1,
     stream_consumed/3,
     stream_flow_control/3,
     consume/3,
@@ -377,6 +378,14 @@ send_data_async(Conn, StreamId, Data, Fin) ->
 set_stream_flow_control(Conn, StreamId, Mode) ->
     gen_statem:cast(Conn, {set_stream_flow_control, StreamId, Mode}).
 
+%% @private From now on a bidirectional stream the peer opens starts as
+%% `{manual, 0}': it keeps its initial window until its reader picks a
+%% mode with set_stream_flow_control/3. Its bytes still earn connection
+%% credit as delivered until then. Used by quic_h3.
+-spec hold_peer_bidi_streams(pid()) -> ok.
+hold_peer_bidi_streams(Conn) ->
+    gen_statem:cast(Conn, hold_peer_bidi_streams).
+
 %% @private After a send_queue_full refusal: send the owner
 %% `{quic, Conn, send_ready}' once, when the send queue is below half its
 %% ceiling (at once if it already is). Used by quic_h3.
@@ -518,11 +527,11 @@ set_owner_sync(_Conn, _NewOwner) ->
 send_datagram(Conn, Data) ->
     call(Conn, {send_datagram, Data}).
 
-%% @doc Get maximum datagram payload size.
+%% @doc Largest datagram payload send_datagram/2 accepts now.
 %% Returns 0 if peer doesn't support datagrams.
--spec datagram_max_size(pid()) -> non_neg_integer().
+-spec datagram_max_size(pid()) -> non_neg_integer() | {error, term()}.
 datagram_max_size(Conn) ->
-    gen_statem:call(Conn, datagram_max_size).
+    call(Conn, datagram_max_size).
 
 -spec datagram_stats(pid()) ->
     #{
@@ -1600,6 +1609,12 @@ idle(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 idle({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+idle({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+idle({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 idle({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 idle(info, {path_validation_timeout, _}, _State) ->
@@ -1722,6 +1737,12 @@ handshaking(cast, {close, Reason}, State) ->
     {next_state, draining, NewState};
 handshaking({call, From}, has_early_keys, #state{hs = #hs{early_keys = EK}} = State) ->
     {keep_state, State, [{reply, From, EK =/= undefined}]};
+%% What is known of the peer so far: for 0-RTT, the parameters remembered
+%% with the ticket (RFC 9000 Section 7.4.1, RFC 9221 Section 3).
+handshaking({call, From}, get_peer_transport_params, #state{transport_params = TP} = State) ->
+    {keep_state, State, [{reply, From, {ok, TP}}]};
+handshaking({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 handshaking({call, From}, early_data_accepted, State) ->
     {keep_state, State, [{reply, From, unknown}]};
 handshaking(info, {path_validation_timeout, _}, _State) ->
@@ -1818,8 +1839,8 @@ connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = Stat
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
-connected({call, From}, datagram_max_size, #state{max_datagram_frame_size_remote = Size} = State) ->
-    {keep_state, State, [{reply, From, Size}]};
+connected({call, From}, datagram_max_size, State) ->
+    {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 connected({call, From}, datagram_stats, State) ->
     {keep_state, State, [{reply, From, datagram_stats_snapshot(State)}]};
 connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
@@ -2384,6 +2405,8 @@ closed(_EventType, _EventContent, State) ->
 
 handle_common_event(cast, notify_send_ready, _StateName, State) ->
     {keep_state, maybe_send_ready(State#state{send_ready_wanted = true})};
+handle_common_event(cast, hold_peer_bidi_streams, _StateName, State) ->
+    {keep_state, State#state{hold_peer_bidi = true}};
 handle_common_event(cast, {set_stream_flow_control, StreamId, Mode}, StateName, State) ->
     {keep_state, flush_after_grant(StateName, set_recv_flow(StreamId, Mode, StateName, State))};
 handle_common_event(cast, {stream_consumed, StreamId, Offset}, StateName, State) ->
@@ -3570,17 +3593,15 @@ send_new_session_ticket(
 %%====================================================================
 
 %% RFC 9002 Section 2: a packet is in flight when it is ack-eliciting or
-%% carries PADDING. ACK and CONNECTION_CLOSE are neither, so an ACK-only
-%% Initial is not in flight and must not arm a probe. The PADDING that
-%% brings an Initial to 1200 bytes does not count: an ACK-only packet
-%% is not acknowledged on its own, so its bytes would stay in flight.
+%% carries PADDING, the PADDING that brings an Initial to 1200 bytes
+%% included.
 -spec packet_flags([term()], boolean()) -> {boolean(), boolean()}.
 packet_flags(Frames, Padded) ->
     AckEliciting = quic_ack:contains_ack_eliciting_frames(Frames),
     {AckEliciting, AckEliciting orelse Padded orelse lists:member(padding, Frames)}.
 
-%% RFC 9002 Section 7: a handshake packet counts against the congestion
-%% window like any other. A refusal holds the frames rather than the
+%% RFC 9002 Section 7: a handshake packet in flight, ack-eliciting or
+%% padded (Section 2), counts against the congestion window like any other. A refusal holds the frames rather than the
 %% encoded packet, so the packet number is not spent and the packet is
 %% rebuilt when the window reopens.
 %%
@@ -3591,10 +3612,9 @@ packet_flags(Frames, Padded) ->
     quic_loss:space(), boolean(), non_neg_integer(), iodata(), [term()], #state{}
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
-%% A packet that is not in flight is not congestion controlled
-%% (RFC 9002 Section 2), and holding one back is worse than pointless:
-%% an acknowledgement is what frees the window, so deferring it can stall
-%% the very handshake that would unblock the sender.
+%% Only a packet holding nothing but ACK frames is not congestion
+%% controlled. A padded ACK-only Initial waits like the rest: the window
+%% reopens on the peer's acknowledgements, which do not depend on ours.
 admit(_Space, false, _Size, _Payload, _Frames, State) ->
     {ok, State};
 admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = true}} = State) ->
@@ -3602,7 +3622,13 @@ admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{hs = #hs{hs_probe = tr
 admit(_Space, _InFlight, _Size, _Payload, _Frames, #state{cc_state = undefined} = State) ->
     {ok, State};
 admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
-    case quic_cc:send_check(CCState, Size) of
+    case closes(Frames) of
+        true -> {ok, State};
+        false -> admit_cwnd(Space, quic_cc:send_check(CCState, Size), Payload, Frames, State)
+    end.
+
+admit_cwnd(Space, Check, Payload, Frames, State) ->
+    case Check of
         {ok, NewCC} ->
             {ok, State#state{cc_state = NewCC}};
         {blocked_cwnd, _Avail} ->
@@ -3616,6 +3642,12 @@ admit(Space, true, Size, Payload, Frames, #state{cc_state = CCState} = State) ->
             %% schedule its own retry.
             {deferred, maybe_set_pacing_timer(Delay, enqueue_hs(Space, Payload, Frames, State))}
     end.
+
+%% A closing endpoint may drop all but what it needs to send
+%% CONNECTION_CLOSE (RFC 9000 Section 10.2) and stops reading ACKs, so a
+%% full window would never reopen for the close.
+closes(Frames) ->
+    lists:keymember(connection_close, 1, Frames).
 
 %% A queue, so both ends are cheap: a sustained refusal appends and the
 %% drain takes from the head.
@@ -3792,7 +3824,7 @@ send_initial_packet(Payload, Frames, State) ->
         Cipher, Key, IV, HP, PN, HeaderPrefix, PaddedPayload
     ),
 
-    Padded = iolist_size(HPPayload) > iolist_size(Payload),
+    Padded = iolist_size(PaddedPayload) > iolist_size(Payload),
     {AckEliciting, InFlight} = packet_flags(Frames, Padded),
     Datagram = initial_datagram(Role, AckEliciting, Packet, State),
     Meta = {initial, PN, byte_size(Packet), Frames, AckEliciting, InFlight},
@@ -4065,7 +4097,8 @@ send_app_packet_internal(Payload, Frames, State) ->
 
 %% RFC 9002 Section 7: an ack-eliciting packet goes out only if the window
 %% and the pacer have room for it, unless it is a PTO probe (Section 7.5).
-%% Packets that are not in flight are never held back.
+%% The only padded 1-RTT packet that is not ack-eliciting is a short
+%% CONNECTION_CLOSE, which is exempt like the handshake ones (closes/1).
 app_admit(Size, Frames, State) ->
     case quic_ack:contains_ack_eliciting_frames(Frames) of
         true -> admit_in_flight(Size, State);
@@ -4289,7 +4322,8 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
         case
             AckEliciting andalso (not lists:member(immediate_ack, Frames0)) andalso
                 (probe_immediate_ack(State) orelse
-                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State))
+                    flight_end_immediate_ack(erlang:iolist_size(Payload0), false, CCState, State)) andalso
+                immediate_ack_fits(Payload0, State)
         of
             true -> {[Payload0, quic_frame:encode(immediate_ack)], Frames0 ++ [immediate_ack]};
             false -> {Payload0, Frames0}
@@ -4324,6 +4358,10 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
 
     %% Pad payload if needed for header protection sampling
     PaddedPayload = pad_for_header_protection(Payload),
+    %% RFC 9002 Section 2; a PMTU probe's PADDING shows in its frames.
+    InFlight =
+        AckEliciting orelse (iolist_size(PaddedPayload) > iolist_size(Payload)) orelse
+            lists:member(padding, Frames),
 
     %% Protect packet (encrypt + header protection in single call)
     #crypto_keys{key = Key, iv = IV, hp = HP, cipher = Cipher} = EncryptKeys,
@@ -4354,10 +4392,10 @@ send_app_packet_now(Payload0, Frames0, State0, Pend, CCState) ->
 
     %% Track sent packet for loss detection and congestion control.
     NewLossState = quic_loss:on_packet_sent(
-        app, LossState, PN, PacketSize, AckEliciting, Frames, Now
+        app, LossState, PN, PacketSize, AckEliciting, InFlight, Frames, Now
     ),
     NewCCState =
-        case AckEliciting of
+        case InFlight of
             true -> quic_cc:on_packet_sent(CCState, PacketSize);
             false -> CCState
         end,
@@ -4686,9 +4724,10 @@ amp_account_recv(_Data, State) ->
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
 %%
-%% A refused probe is not queued: what it carries is still outstanding,
-%% so the next probe carries it again, and a queued copy per expiry is
-%% what filled the queue.
+%% A refused probe that replays sent data is not queued: what it carries
+%% is still outstanding, so the next probe carries it again, and a queued
+%% copy per expiry is what filled the queue. One taken from the queue goes
+%% back there (send_pending_hs_probe/2).
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
@@ -4766,7 +4805,7 @@ register_now({_Space, _PN, _Size, _Frames, _AckEliciting, false}, _Now, State) -
     State;
 register_now({Space, PN, Size, Frames, AckEliciting, true}, Now, State) ->
     LossState = quic_loss:on_packet_sent(
-        Space, State#state.loss_state, PN, Size, AckEliciting, Frames, Now
+        Space, State#state.loss_state, PN, Size, AckEliciting, true, Frames, Now
     ),
     State#state{
         loss_state = LossState,
@@ -6402,7 +6441,11 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
             NewState = process_frame_track_probing(Level, padding, State),
             decode_and_process_streaming(Level, skip_padding(Rest), NewState, [padding | Acc]);
         {Frame, Rest} ->
-            NewState = process_frame_track_probing(Level, Frame, State),
+            NewState =
+                case datagram_too_large(Level, Frame, byte_size(Data) - byte_size(Rest), State) of
+                    true -> send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+                    false -> process_frame_track_probing(Level, Frame, State)
+                end,
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
 
@@ -6410,6 +6453,18 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
 %% each; a run is handled as one.
 skip_padding(<<0, Rest/binary>>) -> skip_padding(Rest);
 skip_padding(Rest) -> Rest.
+
+%% RFC 9221 Section 3: a DATAGRAM frame of Size bytes, type and length
+%% included, larger than the max_datagram_frame_size we sent.
+datagram_too_large(
+    Level, {Type, _}, Size, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}}
+) when
+    (Level =:= app orelse Level =:= zero_rtt) andalso
+        (Type =:= datagram orelse Type =:= datagram_with_length) andalso Max > 0
+->
+    Size > Max;
+datagram_too_large(_Level, _Frame, _Size, _State) ->
+    false.
 
 %% quic_frame:decode/1 raises on a frame cut short by the end of the
 %% packet.
@@ -6605,8 +6660,8 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             ),
             %% Use pre-computed metadata from quic_loss (avoids redundant scanning)
             AckedBytes = maps:get(acked_bytes, AckMeta, 0),
-            LargestAckedSentTime = maps:get(largest_ae_time, AckMeta, Now),
-            HasAckEliciting = maps:get(has_ack_eliciting, AckMeta, false),
+            LargestAckedSentTime = maps:get(largest_acked_sent_time, AckMeta, Now),
+            HasInFlight = maps:get(has_in_flight, AckMeta, false),
             LostBytes = maps:get(lost_bytes, AckMeta, 0),
             LargestLostSentTime = maps:get(largest_lost_sent_time, AckMeta, undefined),
 
@@ -6624,16 +6679,16 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             {CCState3, NewLossState1, State0a} = process_ecn(
                 Level, ECN, LargestAcked, AckedPackets, CCState2, NewLossState, State
             ),
-            CCState4 = cc_after_loss(
+            {CCState4, Persistent} = cc_after_loss(
                 Level, CCState3, LostBytes, LargestLostSentTime, LostPackets, NewLossState
             ),
-            %% Only ack-eliciting packets move the window: an ACK of
-            %% ACK-only packets has no send time to end recovery with.
+            NewLossState2 = after_persistent_congestion(Persistent, NewLossState1),
+            %% Only in-flight packets move the window (RFC 9002 Appendix B.5).
             CCState5 = cc_after_ack(
                 CCState4,
                 AckedBytes,
                 LargestAckedSentTime,
-                HasAckEliciting,
+                HasInFlight,
                 AckedPackets,
                 Level,
                 NewLossState
@@ -6652,7 +6707,7 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 end,
 
             State1 = State0a#state{
-                loss_state = NewLossState1,
+                loss_state = NewLossState2,
                 cc_state = CCState6,
                 pto_dirty = true
             },
@@ -6680,11 +6735,12 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
                 LostPackets
             ),
 
+            LateAcked = maps:get(late_acked, AckMeta, []),
             case Level of
                 app ->
-                    app_ack_tail(AckedPackets, LostPackets, State1);
+                    app_ack_tail(AckedPackets, LostPackets, LateAcked, State1);
                 _ ->
-                    handshake_ack_tail(Level, LostPackets, State1)
+                    handshake_ack_tail(Level, LostPackets, LateAcked, State1)
             end
         %% close outer case (Ranges)
     end;
@@ -7162,19 +7218,7 @@ process_frame(
     #state{cfg = #conn_cfg{max_datagram_frame_size_local = 0}} = State
 ) ->
     send_protocol_violation(<<"unexpected DATAGRAM frame">>, State);
-%% RFC 9221: MUST terminate with PROTOCOL_VIOLATION if receiving oversized DATAGRAM
-process_frame(
-    app, {datagram, Data}, #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when
-    byte_size(Data) > Max
-->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
-process_frame(
-    app,
-    {datagram_with_length, Data},
-    #state{cfg = #conn_cfg{max_datagram_frame_size_local = Max}} = State
-) when byte_size(Data) > Max ->
-    send_protocol_violation(<<"DATAGRAM frame too large">>, State);
+%% A DATAGRAM larger than we advertised is refused as it is decoded.
 process_frame(app, {datagram, Data}, State) ->
     deliver_datagram(Data, State);
 process_frame(app, {datagram_with_length, Data}, State) ->
@@ -7207,8 +7251,20 @@ process_frame(_Level, _Frame, State) ->
     %% Ignore unknown frames
     State.
 
-%% draft-ietf-quic-ack-frequency-14 Section 4: a Requested Max Ack Delay
-%% below our min_ack_delay or at 2^14 ms or more is a PROTOCOL_VIOLATION.
+%% draft-ietf-quic-ack-frequency-14 Section 4: a frame whose Sequence
+%% Number is not above the largest processed is ignored, fields and all.
+apply_ack_frequency(
+    Seq,
+    _Threshold,
+    _Delay,
+    _Reordering,
+    #state{
+        peer_ack_freq = #peer_ack_freq{seq = Last}
+    } = State
+) when Seq =< Last ->
+    State;
+%% Section 4: a Requested Max Ack Delay below our min_ack_delay or at
+%% 2^14 ms or more is a PROTOCOL_VIOLATION.
 apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
     Delay < ?MIN_ACK_DELAY_US orelse Delay >= ?MAX_REQUESTED_ACK_DELAY_US
 ->
@@ -7220,17 +7276,6 @@ apply_ack_frequency(_Seq, _Threshold, Delay, _Reordering, State) when
         <<"invalid Requested Max Ack Delay">>,
         State
     );
-%% Section 4: only a Sequence Number above the largest processed counts.
-apply_ack_frequency(
-    Seq,
-    _Threshold,
-    _Delay,
-    _Reordering,
-    #state{
-        peer_ack_freq = #peer_ack_freq{seq = Last}
-    } = State
-) when Seq =< Last ->
-    State;
 apply_ack_frequency(Seq, Threshold, DelayUs, Reordering, #state{ack_timer = Timer} = State) ->
     DelayMs = DelayUs div 1000,
     %% A timer armed for a longer delay is dropped; this ack-eliciting packet arms a new one.
@@ -7341,6 +7386,7 @@ send_ack_frequency({Threshold, Delay, Reordering} = Request, Now, State0) ->
 %% Section 7: a lower max_ack_delay counts once its request is acknowledged.
 ack_frequency_acked(
     Acked,
+    LateAcked,
     #state{
         ack_freq_req = #ack_freq_req{seq = Seq, pending_pto_delay = DelayMs} = Req,
         loss_state = LossState
@@ -7348,7 +7394,7 @@ ack_frequency_acked(
 ) when DelayMs =/= undefined ->
     case
         lists:any(
-            fun(#sent_packet{frames = Frames}) ->
+            fun(Frames) ->
                 lists:any(
                     fun
                         ({ack_frequency, S, _, _, _}) -> S =:= Seq;
@@ -7357,7 +7403,7 @@ ack_frequency_acked(
                     Frames
                 )
             end,
-            Acked
+            LateAcked ++ [Frames || #sent_packet{frames = Frames} <- Acked]
         )
     of
         true ->
@@ -7368,7 +7414,7 @@ ack_frequency_acked(
         false ->
             State
     end;
-ack_frequency_acked(_Acked, State) ->
+ack_frequency_acked(_Acked, _LateAcked, State) ->
     State.
 
 %% draft-ietf-quic-ack-frequency-14 Section 5: the controller may want the
@@ -7378,6 +7424,11 @@ flight_end_immediate_ack(Bytes, More, CC, State) ->
     quic_cc:immediate_ack(CC) andalso peer_takes_ack_frequency(State) andalso
         ((quic_cc:available_cwnd(CC) < Bytes + quic_cc:max_datagram_size(CC)) orelse
             (not More andalso (State#state.send_queue_count =:= 0))).
+
+%% The packet with IMMEDIATE_ACK added still fits the current MTU.
+immediate_ack_fits(Payload, #state{dcid = Dcid, pn_app = #pn_space{next_pn = PN}} = State) ->
+    Size = 1 + byte_size(Dcid) + quic_packet:pn_length(PN) + erlang:iolist_size(Payload) + 1 + 16,
+    Size =< get_current_mtu(State).
 
 %% Section 7: a PTO probe can carry IMMEDIATE_ACK, so its ACK is not
 %% held back by the peer's ACK delay.
@@ -7394,7 +7445,8 @@ peer_takes_ack_frequency(#state{transport_params = TP}) ->
 %% application space has streams, PMTU probes and a send queue, so the
 %% handshake spaces take the short path: replay what was lost, at their
 %% own encryption level.
-app_ack_tail(AckedPackets, LostPackets, State1) ->
+app_ack_tail(AckedPackets, LostPackets0, LateAcked, State0) ->
+    {LostPackets, State1} = drop_late_acked(app, LateAcked, LostPackets0, State0),
     %% Handle PMTU probe ACKs. Only walk the acked list when a
     %% probe is actually outstanding - the common bulk-ACK case
     %% has none and skips the per-packet fold.
@@ -7433,21 +7485,24 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
     %% acked (RFC 9000 §3.1 "Data Recvd"). Reclaiming here, and
     %% not at send time, paces MAX_STREAMS credit to what the
     %% peer has actually consumed; granting at send time let a
-    %% peer run far ahead of its own completions.
+    %% peer run far ahead of its own completions. Late ACKs count too
+    %% (RFC 9000 Section 13.3).
     State4a =
         case
-            lists:usort([
-                Sid
-             || #sent_packet{frames = Fs} <- AckedPackets,
-                {stream, Sid, _O, _D, true} <- Fs
-            ])
+            lists:usort(
+                [
+                    Sid
+                 || #sent_packet{frames = Fs} <- AckedPackets,
+                    {stream, Sid, _O, _D, true} <- Fs
+                ] ++ [Sid || Fs <- LateAcked, {stream, Sid, _, _, true} <- Fs]
+            )
         of
             [] -> State4;
             FinSids -> lists:foldl(fun settle_fin_ack/2, State4, FinSids)
         end,
 
     %% Ask the peer for the ACK frequency the controller wants now.
-    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, State4a)),
+    State4b = maybe_request_ack_frequency(ack_frequency_acked(AckedPackets, LateAcked, State4a)),
 
     %% cwnd may have reopened: held handshake packets, then held control
     %% frames, then the send queue, retransmit_stream entries included.
@@ -7462,7 +7517,8 @@ app_ack_tail(AckedPackets, LostPackets, State1) ->
         _ -> flush_event(State8, rearm)
     end.
 
-handshake_ack_tail(Level, LostPackets, State1) ->
+handshake_ack_tail(Level, LostPackets0, LateAcked, State0) ->
+    {LostPackets, State1} = drop_late_acked(Level, LateAcked, LostPackets0, State0),
     State2 = retransmit_lost_handshake(Level, LostPackets, State1),
     State3 = send_held(drain_pending_hs(note_handshake_ack(Level, State2))),
     flush_event(State3#state{pto_dirty = true}, event).
@@ -8912,7 +8968,7 @@ run_alpn_handler(undefined, State) ->
 run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
     try call_alpn_handler(Fn, ALPN, State) of
         {ok, Owner} when is_pid(Owner) ->
-            {ok, reown(State, Owner)};
+            {ok, held_by_handler(reown(State, Owner))};
         Other ->
             ?LOG_WARNING(
                 #{what => alpn_handler_rejected, alpn => ALPN, result => Other},
@@ -8932,6 +8988,15 @@ run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
                 ?QUIC_LOG_META
             ),
             {error, <<"alpn handler failed">>}
+    end.
+
+%% A hold the handler asked for (quic_h3:accept/2) is a cast to this very
+%% process, already in its mailbox: apply it before the 0-RTT packets of
+%% the same datagram open streams.
+held_by_handler(State) ->
+    receive
+        {'$gen_cast', hold_peer_bidi_streams} -> State#state{hold_peer_bidi = true}
+    after 0 -> State
     end.
 
 %% The 3-argument form also gets the current owner: the one a
@@ -10321,19 +10386,19 @@ loss_space(_) -> app.
 cc_after_loss(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
     case lists:partition(fun is_pmtu_probe/1, Lost) of
         {[], _} ->
-            cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState);
+            loss_response(app, CCState, LostBytes, LargestLostSentTime, Lost, LossState);
         {Probes, Rest} ->
             ProbeBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Probes]),
             Largest =
-                case [TS || #sent_packet{ack_eliciting = true, time_sent = TS} <- Rest] of
+                case [TS || #sent_packet{in_flight = true, time_sent = TS} <- Rest] of
                     [] -> undefined;
                     Times -> lists:max(Times)
                 end,
             CC = quic_cc:on_packets_discarded(CCState, ProbeBytes),
-            cc_after_loss(CC, max(0, LostBytes - ProbeBytes), Largest, Rest, LossState)
+            loss_response(app, CC, max(0, LostBytes - ProbeBytes), Largest, Rest, LossState)
     end;
-cc_after_loss(_Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
-    cc_after_loss(CCState, LostBytes, LargestLostSentTime, Lost, LossState).
+cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState) ->
+    loss_response(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState).
 
 %% In the application space only a PMTU probe carries PADDING.
 is_pmtu_probe(#sent_packet{frames = Frames}) ->
@@ -10341,15 +10406,17 @@ is_pmtu_probe(#sent_packet{frames = Frames}) ->
 
 %% @doc The congestion-control consequences of declaring packets lost,
 %% for both the ACK path and the loss-detection timer: the bytes, the
-%% congestion event, then persistent congestion (RFC 9002 Appendix B.8).
--spec cc_after_loss(
+%% congestion event, then persistent congestion (RFC 9002 Appendix B.8),
+%% and whether it was declared.
+-spec loss_response(
+    quic_loss:space(),
     quic_cc:cc_state(),
     non_neg_integer(),
     non_neg_integer() | undefined,
     [#sent_packet{}],
     quic_loss:loss_state()
-) -> quic_cc:cc_state().
-cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
+) -> {quic_cc:cc_state(), boolean()}.
+loss_response(Space, CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) ->
     %% Losses on an earlier path say nothing about this one (RFC 9000
     %% Section 9.4); they only stop counting as in flight.
     LostPackets = [P || P <- LostPackets0, not quic_loss:on_earlier_path(LossState, P)],
@@ -10360,25 +10427,17 @@ cc_after_loss(CCState, LostBytes, LargestLostSentTime, LostPackets0, LossState) 
             {_, []} -> CC1;
             _ -> quic_cc:on_congestion_event(CC1, LargestLostSentTime)
         end,
-    check_persistent_congestion(LostPackets, LossState, CC2).
+    check_persistent_congestion(Space, LostPackets0, LossState, CC2).
 
-%% Check for persistent congestion (RFC 9002 Section 7.6)
-%% If lost packets span more than PTO * 3, reset to minimum window
-check_persistent_congestion([], _LossState, CCState) ->
-    CCState;
-check_persistent_congestion(LostPackets, LossState, CCState) ->
-    %% Extract packet number and time sent from lost packets
-    LostInfo = [
-        {P#sent_packet.pn, P#sent_packet.time_sent}
-     || P <- LostPackets, quic_loss:after_first_rtt_sample(LossState, P)
-    ],
-    PTO = quic_loss:persistent_congestion_pto(LossState),
-    case quic_cc:detect_persistent_congestion(LostInfo, PTO, CCState) of
-        true ->
-            quic_cc:on_persistent_congestion(CCState);
-        false ->
-            CCState
+%% RFC 9002 Section 7.6.2: the window drops to its minimum.
+check_persistent_congestion(Space, LostPackets, LossState, CCState) ->
+    case quic_loss:persistent_congestion(Space, LostPackets, LossState) of
+        true -> {quic_cc:on_persistent_congestion(CCState), true};
+        false -> {CCState, false}
     end.
+
+after_persistent_congestion(true, LossState) -> quic_loss:on_persistent_congestion(LossState);
+after_persistent_congestion(false, LossState) -> LossState.
 
 %% Generate a connection ID
 %% Uses LB config if available, otherwise random 8 bytes
@@ -10860,8 +10919,13 @@ new_peer_stream(StreamId, State) ->
         recv_max_data = get_local_recv_limit(Kind, State),
         recv_fin = false,
         recv_buffer = gb_trees:empty(),
+        recv_flow = peer_recv_flow(Kind, State),
         final_size = undefined
     }.
+
+%% RFC 9000 Section 4.1: a held stream earns credit only as its reader consumes.
+peer_recv_flow(bidi_peer_initiated, #state{hold_peer_bidi = true}) -> manual;
+peer_recv_flow(_Kind, _State) -> auto.
 
 peer_send_limit(uni_peer_initiated, _State) -> 0;
 peer_send_limit(Kind, State) -> get_peer_stream_limit(Kind, State).
@@ -11869,17 +11933,34 @@ record_app_recv(FirstByte, PN, #state{pn_app = PNSpace} = State, Now) ->
         ack_eliciting_since_recv = false
     }.
 
-%% Short-header packet overhead for a DATAGRAM frame on the 1-RTT level:
-%%   1 byte flags
-%%   + DCID length (no length byte on short header)
-%%   + up to 4 bytes packet number
-%%   + 16 bytes AEAD tag
-%%   + 1 byte frame type (0x31 DATAGRAM_WITH_LEN)
-%%   + up to 2 bytes length varint (covers lengths up to 16383).
-%% That leaves `pmtu - datagram_overhead(State)` as the upper bound on
-%% the payload we can fit in a single UDP datagram without fragmenting.
-datagram_overhead(#state{dcid = Dcid}) ->
-    1 + byte_size(Dcid) + 4 + 16 + 1 + 2.
+%% A 1-RTT packet around its frames: flags, DCID, the longest packet
+%% number and the AEAD tag.
+short_header_overhead(#state{dcid = Dcid}) ->
+    1 + byte_size(Dcid) + 4 + 16.
+
+%% Largest DATAGRAM payload whose packet fits the confirmed path MTU
+%% (RFC 8899 Section 3).
+datagram_path_budget(State) ->
+    datagram_frame_payload(get_current_mtu(State) - short_header_overhead(State)).
+
+%% Largest DATAGRAM payload sendable now, for both send_datagram and
+%% datagram_max_size; -1 when none fits.
+datagram_budget(#state{max_datagram_frame_size_remote = PeerMax} = State) ->
+    min(datagram_frame_payload(PeerMax), datagram_path_budget(State)).
+
+%% Largest payload whose DATAGRAM frame, type and length included, fits
+%% in Max bytes (RFC 9221 Section 3); -1 when not even an empty one does.
+datagram_frame_payload(Max) when Max < 2 ->
+    -1;
+datagram_frame_payload(Max) ->
+    datagram_frame_payload(Max, 1).
+
+datagram_frame_payload(Max, LenSize) ->
+    Payload = Max - 1 - LenSize,
+    case quic_varint:encode_len(Payload) =< LenSize of
+        true -> Payload;
+        false -> datagram_frame_payload(Max, LenSize * 2)
+    end.
 
 %% Deliver an inbound DATAGRAM to the owner, or drop it while the owner's
 %% mailbox holds more than max_owner_queue messages: DATAGRAMs are
@@ -11939,23 +12020,19 @@ datagram_stats_snapshot(State) ->
     }.
 
 %% Send a datagram (RFC 9221)
-%% RFC 9221: MUST NOT send DATAGRAM frames until receiving peer's max_datagram_frame_size
-%% and MUST NOT send frames larger than peer's advertised value.
-%% Additionally clamp to the current PMTU budget so we don't emit a UDP
-%% payload the network will black-hole.
+%% RFC 9221 Section 3: MUST NOT send DATAGRAM frames until the peer advertised
+%% max_datagram_frame_size, nor frames (type, length and data) larger than it.
+%% RFC 8899 Section 3: the packet must also fit the confirmed path MTU.
 do_send_datagram(_Data, #state{max_datagram_frame_size_remote = 0}) ->
     %% Peer didn't advertise datagram support
     {error, datagrams_not_supported};
 do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State) ->
     DataBin = iolist_to_binary(Data),
     DataSize = byte_size(DataBin),
-    PmtuBudget = max(0, get_local_max_udp_payload_size(State) - datagram_overhead(State)),
+    Budget = datagram_budget(State),
+    PeerLimit = datagram_frame_payload(PeerMax),
     if
-        DataSize > PeerMax ->
-            {error, datagram_too_large};
-        DataSize > PmtuBudget ->
-            {error, datagram_too_large_for_path};
-        true ->
+        DataSize =< Budget ->
             Frame = {datagram_with_length, DataBin},
             Payload = quic_frame:encode(Frame),
             case app_admit(byte_size(Payload), [Frame], State) of
@@ -11966,7 +12043,11 @@ do_send_datagram(Data, #state{max_datagram_frame_size_remote = PeerMax} = State)
                     %% Unreliable, so dropped rather than held (RFC 9221 Section 5).
                     bump(?C_DATAGRAM_SEND_DROPPED, 1, State1),
                     {error, congestion_limited, State1}
-            end
+            end;
+        DataSize > PeerLimit ->
+            {error, datagram_too_large};
+        true ->
+            {error, datagram_too_large_for_path}
     end.
 
 %% Send stream data in fragments, tracking how many bytes were actually sent
@@ -13122,16 +13203,20 @@ trim_entry(_Entry, _StreamId, _ReliableSize) ->
     keep.
 
 %% RFC 9000 Section 4.5: the final size of a stream we reset covers what
-%% we sent. New data still queued is dropped with the reset; retransmits
-%% in the queue were sent already. A stream's new data goes out in
-%% offset order, so what is queued is a tail.
-reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queue = PQ} = State) ->
+%% we sent, and a FIN already sent fixed it. New data still queued is
+%% dropped with the reset, but a later write, its FIN included, can go out
+%% ahead of it: send_highest is the highest offset sent.
+reset_final_size(
+    StreamId,
+    #stream_state{send_offset = Offset, send_highest = Highest},
+    #state{send_queue = PQ} = State
+) ->
     Sent =
         case State#state.send_parked of
             #{StreamId := Q} -> min(Offset, element(3, queue:get(Q)));
             _ -> Offset
         end,
-    lists:foldl(
+    Unsent = lists:foldl(
         fun(I, Acc) ->
             queue:fold(
                 fun
@@ -13146,7 +13231,8 @@ reset_final_size(StreamId, #stream_state{send_offset = Offset}, #state{send_queu
         end,
         Sent,
         lists:seq(1, 8)
-    ).
+    ),
+    max(Unsent, Highest).
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).
@@ -13228,9 +13314,18 @@ do_set_congestion_control(Algorithm, #state{cc_state = OldCC} = State) when
 ->
     #state{cfg = #conn_cfg{cc_opts = Opts}} = State,
     NewCC = quic_cc:new(Algorithm, Opts#{max_datagram_size => quic_cc:max_datagram_size(OldCC)}),
-    {ok, State#state{cc_state = NewCC}};
+    {ok, State#state{cc_state = with_flight(NewCC, State#state.loss_state)}};
 do_set_congestion_control(_Algorithm, _State) ->
     {error, invalid_algorithm}.
+
+%% A new controller takes over the packets already in flight (RFC 9002 Appendix B.4).
+with_flight(CC, undefined) ->
+    CC;
+with_flight(CC, LossState) ->
+    case quic_loss:bytes_in_flight(LossState) of
+        0 -> CC;
+        Outstanding -> quic_cc:on_packet_sent(CC, Outstanding)
+    end.
 
 %% Set stream deadline
 do_set_stream_deadline(StreamId, TimeoutMs, Opts, State) when
@@ -13857,6 +13952,200 @@ enqueue_retransmit_stream(StreamId, Offset, Data, Fin, State) ->
         send_queue_version = Version + 1
     }.
 
+%% RFC 9000 Section 13.3: what a late ACK acknowledged is not sent again.
+drop_late_acked(_Space, [], Lost, State) ->
+    {Lost, State};
+drop_late_acked(Space, LateAcked, Lost, #state{loss_state = LossState} = State) ->
+    Index = acked_index(LateAcked),
+    Strip = fun(Frames) -> drop_acked(Frames, Index) end,
+    Stripped = State#state{loss_state = quic_loss:map_frames(Space, Strip, LossState)},
+    {
+        [P#sent_packet{frames = Strip(Frames)} || #sent_packet{frames = Frames} = P <- Lost],
+        drop_queued(Space, Index, Stripped)
+    }.
+
+drop_queued(app, Index, State) ->
+    drop_acked_from_ctrl_queue(Index, drop_acked_from_send_queue(Index, State));
+drop_queued(Space, Index, State) ->
+    drop_acked_from_pending_hs(Space, Index, State).
+
+%% Acknowledged STREAM and CRYPTO ranges, merged, FINs and control frames.
+acked_index(FrameLists) ->
+    Index = lists:foldl(fun index_acked/2, #{}, lists:append(FrameLists)),
+    maps:map(
+        fun
+            ({fin, _}, End) -> End;
+            (ctrl, Frames) -> Frames;
+            (_Key, Ranges) -> merge_ranges(lists:sort(Ranges))
+        end,
+        Index
+    ).
+
+index_acked({stream, StreamId, Offset, Data, Fin}, Acc) ->
+    End = Offset + iolist_size(Data),
+    Acc1 = add_range({stream, StreamId}, Offset, End, Acc),
+    case Fin of
+        true -> Acc1#{{fin, StreamId} => End};
+        false -> Acc1
+    end;
+index_acked({crypto, Offset, Data}, Acc) ->
+    add_range(crypto, Offset, Offset + iolist_size(Data), Acc);
+index_acked(Frame, Acc) ->
+    maps:update_with(ctrl, fun(Frames) -> [Frame | Frames] end, [Frame], Acc).
+
+add_range(_Key, Offset, Offset, Acc) ->
+    Acc;
+add_range(Key, Offset, End, Acc) ->
+    maps:update_with(Key, fun(Ranges) -> [{Offset, End} | Ranges] end, [{Offset, End}], Acc).
+
+merge_ranges([{S1, E1}, {S2, E2} | Rest]) when S2 =< E1 ->
+    merge_ranges([{S1, max(E1, E2)} | Rest]);
+merge_ranges([Range | Rest]) ->
+    [Range | merge_ranges(Rest)];
+merge_ranges([]) ->
+    [].
+
+%% Frames less what Index covers; an owed FIN stays on the piece ending at it.
+drop_acked(Frames, Index) ->
+    case lists:any(fun(Frame) -> touches(Frame, Index) end, Frames) of
+        true -> lists:flatmap(fun(Frame) -> drop_acked_frame(Frame, Index) end, Frames);
+        false -> Frames
+    end.
+
+%% Whether Index may cover part of Frame; the rest are left as they are.
+touches({stream, StreamId, _, _, _}, Index) ->
+    maps:is_key({stream, StreamId}, Index) orelse maps:is_key({fin, StreamId}, Index);
+touches({crypto, _, _}, Index) ->
+    maps:is_key(crypto, Index);
+touches(Frame, #{ctrl := Acked}) ->
+    lists:member(Frame, Acked);
+touches(_Frame, _Index) ->
+    false.
+
+drop_acked_frame({stream, StreamId, Offset, Data, Fin} = Frame, Index) ->
+    End = Offset + iolist_size(Data),
+    FinOwed = Fin andalso not maps:is_key({fin, StreamId}, Index),
+    case uncovered(Offset, End, maps:get({stream, StreamId}, Index, [])) of
+        [{Offset, End}] when FinOwed =:= Fin ->
+            [Frame];
+        Pieces ->
+            Parts = [
+                {stream, StreamId, S, slice(Data, S - Offset, E - S), FinOwed andalso E =:= End}
+             || {S, E} <- Pieces
+            ],
+            case FinOwed andalso not lists:keymember(End, 2, Pieces) of
+                true -> Parts ++ [{stream, StreamId, End, <<>>, true}];
+                false -> Parts
+            end
+    end;
+drop_acked_frame({crypto, Offset, Data} = Frame, Index) ->
+    End = Offset + iolist_size(Data),
+    case uncovered(Offset, End, maps:get(crypto, Index, [])) of
+        [{Offset, End}] -> [Frame];
+        Pieces -> [{crypto, S, slice(Data, S - Offset, E - S)} || {S, E} <- Pieces]
+    end;
+drop_acked_frame(Frame, #{ctrl := Acked}) ->
+    case lists:member(Frame, Acked) of
+        true -> [];
+        false -> [Frame]
+    end;
+drop_acked_frame(Frame, _Index) ->
+    [Frame].
+
+%% The parts of [Start, End) outside the sorted, merged Ranges.
+uncovered(Start, End, _Ranges) when Start >= End ->
+    [];
+uncovered(Start, End, []) ->
+    [{Start, End}];
+uncovered(Start, End, [{_, E} | Rest]) when E =< Start ->
+    uncovered(Start, End, Rest);
+uncovered(Start, End, [{S, _} | _]) when S >= End ->
+    [{Start, End}];
+uncovered(Start, End, [{S, E} | Rest]) when S > Start ->
+    [{Start, S} | uncovered(E, End, Rest)];
+uncovered(_Start, End, [{_, E} | Rest]) ->
+    uncovered(E, End, Rest).
+
+slice(Data, Pos, Len) ->
+    binary:part(iolist_to_binary(Data), Pos, Len).
+
+%% Only retransmissions: parked and stream_data entries were never sent.
+drop_acked_from_send_queue(Index, #state{send_queue = PQ} = State) ->
+    {Buckets, Bytes, Count} = lists:foldl(
+        fun(I, {Acc, B, C}) ->
+            {Q, DB, DC} = drop_acked_bucket(element(I, PQ), Index),
+            {[Q | Acc], B + DB, C + DC}
+        end,
+        {[], 0, 0},
+        lists:seq(1, 8)
+    ),
+    State#state{
+        send_queue = list_to_tuple(lists:reverse(Buckets)),
+        send_queue_bytes = max(0, State#state.send_queue_bytes - Bytes),
+        send_queue_count = max(0, State#state.send_queue_count - Count),
+        send_queue_version = State#state.send_queue_version + 1
+    }.
+
+drop_acked_bucket(Q, Index) ->
+    case queue:any(fun(Entry) -> acked_retransmit(Entry, Index) end, Q) of
+        false ->
+            {Q, 0, 0};
+        true ->
+            lists:foldl(
+                fun(Entry, {QAcc, DB, DC}) ->
+                    case acked_retransmit(Entry, Index) of
+                        false ->
+                            {queue:in(Entry, QAcc), DB, DC};
+                        true ->
+                            {retransmit_stream, StreamId, Offset, Data, Fin, Size} = Entry,
+                            Kept = [
+                                {retransmit_stream, StreamId, O, D, F, iolist_size(D)}
+                             || {stream, _, O, D, F} <- drop_acked_frame(
+                                    {stream, StreamId, Offset, Data, Fin}, Index
+                                )
+                            ],
+                            {
+                                lists:foldl(fun queue:in/2, QAcc, Kept),
+                                DB + Size - lists:sum([element(6, K) || K <- Kept]),
+                                DC + 1 - length(Kept)
+                            }
+                    end
+                end,
+                {queue:new(), 0, 0},
+                queue:to_list(Q)
+            )
+    end.
+
+acked_retransmit({retransmit_stream, StreamId, _, _, _, _}, Index) ->
+    maps:is_key({stream, StreamId}, Index) orelse maps:is_key({fin, StreamId}, Index);
+acked_retransmit(_Entry, _Index) ->
+    false.
+
+drop_acked_from_ctrl_queue(_Index, #state{ctrl_queue = {0, _}} = State) ->
+    State;
+drop_acked_from_ctrl_queue(Index, #state{ctrl_queue = {_, Q}} = State) ->
+    Kept = drop_acked(queue:to_list(Q), Index),
+    State#state{ctrl_queue = {length(Kept), queue:from_list(Kept)}}.
+
+%% A held packet is already encoded: it goes once all it repairs is acked.
+drop_acked_from_pending_hs(Space, Index, #state{hs = HS} = State) ->
+    #hs{pending_hs = Pending, pending_hs_bytes = Bytes} = HS,
+    Queued = queue:to_list(maps:get(Space, Pending, queue:new())),
+    {Dropped, Kept} = lists:partition(
+        fun({_Payload, Frames}) -> fully_acked(Frames, Index) end, Queued
+    ),
+    Held = maps:get(Space, Bytes, 0) - lists:sum([iolist_size(P) || {P, _} <- Dropped]),
+    State#state{
+        hs = HS#hs{
+            pending_hs = Pending#{Space => queue:from_list(Kept)},
+            pending_hs_bytes = Bytes#{Space => max(0, Held)}
+        }
+    }.
+
+fully_acked(Frames, Index) ->
+    Repair = quic_loss:retransmittable_frames(Frames),
+    (Repair =/= []) andalso (drop_acked(Repair, Index) =:= []).
+
 %% Drain pending local reset-at streams whose data below ReliableSize is now
 %% fully acked (no longer queued or in flight), completing the reclaim.
 complete_send_reset_at(#state{pending_send_reset_at = P} = State) when map_size(P) =:= 0 ->
@@ -13971,9 +14260,17 @@ handle_loss_timeout(#state{loss_state = LossState, pto_space = Space} = State) -
 apply_lost_packets(_Space, [], State) ->
     State;
 apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossState} = State) ->
-    LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- Lost]),
-    LargestLostSentTime = lists:max([TS || #sent_packet{time_sent = TS} <- Lost]),
-    NewCC = cc_after_loss(Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState),
+    %% Only in-flight losses count and set the congestion event (RFC 9002 Appendix B.8).
+    InFlight = [P || #sent_packet{in_flight = true} = P <- Lost],
+    LostBytes = lists:sum([Sz || #sent_packet{size = Sz} <- InFlight]),
+    LargestLostSentTime =
+        case InFlight of
+            [] -> undefined;
+            _ -> lists:max([TS || #sent_packet{time_sent = TS} <- InFlight])
+        end,
+    {NewCC, Persistent} = cc_after_loss(
+        Space, CCState, LostBytes, LargestLostSentTime, Lost, LossState
+    ),
     lists:foreach(
         fun(#sent_packet{pn = LostPN}) ->
             ?QLOG_EMIT_PACKET_LOST((State#state.cfg)#conn_cfg.qlog_ctx, #{
@@ -13982,7 +14279,9 @@ apply_lost_packets(Space, Lost, #state{cc_state = CCState, loss_state = LossStat
         end,
         Lost
     ),
-    retransmit_for_space(Space, Lost, State#state{cc_state = NewCC}).
+    retransmit_for_space(Space, Lost, State#state{
+        cc_state = NewCC, loss_state = after_persistent_congestion(Persistent, LossState)
+    }).
 
 retransmit_for_space(app, Lost, State) -> retransmit_lost_packets(Lost, State);
 retransmit_for_space(Space, Lost, State) -> retransmit_lost_handshake(Space, Lost, State).
@@ -14118,8 +14417,28 @@ send_pending_hs_probe(
                     pending_hs_bytes = Bytes#{Space => Held}
                 }
             },
-            {sent, send_at_level(Space, Payload, Frames, State1)}
+            State2 = send_at_level(Space, Payload, Frames, State1),
+            {sent, keep_unsent_probe(Space, next_hs_pn(Space, State), State, State2)}
     end.
+
+%% A refused probe from the queue was never sent, so nothing else would
+%% resend it: it goes back to the head of the queue (RFC 9000 Section 13.3).
+keep_unsent_probe(Space, PN, #state{hs = #hs{pending_hs = Pending, pending_hs_bytes = Bytes}}, S) ->
+    case next_hs_pn(Space, S) of
+        PN ->
+            #state{hs = #hs{pending_hs = Pending1, pending_hs_bytes = Bytes1} = HS} = S,
+            S#state{
+                hs = HS#hs{
+                    pending_hs = Pending1#{Space => maps:get(Space, Pending)},
+                    pending_hs_bytes = Bytes1#{Space => maps:get(Space, Bytes, 0)}
+                }
+            };
+        _ ->
+            S
+    end.
+
+next_hs_pn(initial, #state{hs = #hs{pn_initial = #pn_space{next_pn = PN}}}) -> PN;
+next_hs_pn(handshake, #state{hs = #hs{pn_handshake = #pn_space{next_pn = PN}}}) -> PN.
 
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
@@ -15241,6 +15560,9 @@ probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
         true ->
             path_cid_for(Addr, false, State);
+        false when State#state.dcid =:= <<>> ->
+            %% A zero-length CID goes on every path (RFC 9000 Section 5.1.1).
+            {State, <<>>, undefined};
         false ->
             case bind_path_cid(Addr, State) of
                 {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
@@ -15640,11 +15962,12 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
 %% the peer kept its CID: the network moved it, and the current CID may
 %% stay (RFC 9000 Section 9.5). A client moving to the preferred address
 %% may keep its own address, so a change of the local socket alone is a
-%% new path too.
+%% new path too. A peer with a zero-length CID needs none: that CID goes
+%% on every path (Section 5.1.1).
 maybe_handle_path_change(Via, NewAddr, DataSize, State) ->
     Probed = lists:any(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State)),
     KeptCID = Via =:= current_via(State) andalso kept_its_cid(State),
-    case Probed orelse has_unused_cid(State) orelse KeptCID of
+    case Probed orelse has_unused_cid(State) orelse KeptCID orelse State#state.dcid =:= <<>> of
         true -> initiate_peer_path_validation(NewAddr, Via, false, DataSize, State);
         false -> State
     end.
@@ -16448,12 +16771,7 @@ reset_path_estimates(
     NewLossState = quic_loss:reset_for_new_path(State#state.loss_state),
     %% Same algorithm and configured options, starting over.
     #state{cc_state = OldCC, cfg = #conn_cfg{cc_opts = CCOpts}} = State,
-    NewCCState0 = quic_cc:new(quic_cc:algorithm(OldCC), CCOpts),
-    NewCCState =
-        case quic_loss:bytes_in_flight(NewLossState) of
-            0 -> NewCCState0;
-            Outstanding -> quic_cc:on_packet_sent(NewCCState0, Outstanding)
-        end,
+    NewCCState = with_flight(quic_cc:new(quic_cc:algorithm(OldCC), CCOpts), NewLossState),
 
     State#state{
         pmtu_state = NewPMTUState,
@@ -17232,14 +17550,6 @@ get_current_mtu(#state{pmtu_state = undefined}) ->
     ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
 get_current_mtu(#state{pmtu_state = PMTUState}) ->
     quic_pmtu:current_mtu(PMTUState).
-
-%% @doc Get the local max UDP payload size for transport parameters.
-%% Returns the configured max MTU from PMTU state, or the default if not configured.
--spec get_local_max_udp_payload_size(#state{}) -> pos_integer().
-get_local_max_udp_payload_size(#state{pmtu_state = undefined}) ->
-    ?DEFAULT_MAX_UDP_PAYLOAD_SIZE;
-get_local_max_udp_payload_size(#state{pmtu_state = PMTUState}) ->
-    PMTUState#pmtu_state.max_mtu.
 
 %% The `max_udp_payload_size' transport parameter (RFC 9000 §18.2): the
 %% largest UDP payload we are willing to receive. Distinct from the PMTU

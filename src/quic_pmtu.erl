@@ -159,8 +159,11 @@ on_connection_established(PeerMax, #pmtu_state{max_mtu = ConfigMax, base_mtu = B
                 lost = [EffectiveMax, undefined, undefined]
             };
         false ->
-            %% No room to probe - stay disabled
-            State
+            %% No room to probe - stay disabled, at the peer's limit
+            State#pmtu_state{
+                max_mtu = EffectiveMax,
+                lost = [EffectiveMax, undefined, undefined]
+            }
     end.
 
 %% @doc Reset PMTU state on path change (connection migration).

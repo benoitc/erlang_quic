@@ -57,7 +57,6 @@
     on_packets_lost/2,
     on_congestion_event/2,
     on_persistent_congestion/1,
-    detect_persistent_congestion/3,
     update_pacing_rate/2,
     update_mtu/2,
     cwnd/1,
@@ -142,7 +141,6 @@
 -define(DEFAULT_ACK_DELAY_US, 25000).
 -define(ACK_REORDERING_THRESHOLD, 3).
 -define(MAX_ACK_FREQ_SHIFT, 4).
--define(PERSISTENT_CONGESTION_THRESHOLD, 3).
 
 %%====================================================================
 %% State
@@ -1274,20 +1272,6 @@ on_persistent_congestion(State) ->
 on_persistent_congestion_at(#bbr_state{minimum_window = MinimumWindow} = S, Now) ->
     S1 = save_state_upon_loss(S),
     S1#bbr_state{cwnd = MinimumWindow, in_recovery = true, recovery_start = Now}.
-
-%% @doc Detect persistent congestion from lost packets.
--spec detect_persistent_congestion(
-    [{non_neg_integer(), non_neg_integer()}],
-    non_neg_integer(),
-    cc_state()
-) -> boolean().
-detect_persistent_congestion([], _PTO, _State) ->
-    false;
-detect_persistent_congestion([_], _PTO, _State) ->
-    false;
-detect_persistent_congestion(LostPackets, PTO, _State) ->
-    Times = [T || {_PN, T} <- LostPackets],
-    (lists:max(Times) - lists:min(Times)) >= PTO * ?PERSISTENT_CONGESTION_THRESHOLD.
 
 %%====================================================================
 %% Congestion window (Section 5.6.4)

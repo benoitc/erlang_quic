@@ -27,6 +27,7 @@ calls() ->
         {peercert, fun quic:peercert/1},
         {set_owner_sync, fun(C) -> quic:set_owner_sync(C, self()) end},
         {send_datagram, fun(C) -> quic:send_datagram(C, <<"x">>) end},
+        {datagram_max_size, fun quic:datagram_max_size/1},
         {setopts, fun(C) -> quic:setopts(C, []) end},
         {migrate, fun quic:migrate/1},
         {migrate_timeout, fun(C) -> quic_connection:migrate(C, 1000) end},

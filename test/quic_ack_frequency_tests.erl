@@ -200,9 +200,9 @@ pto_takes_a_smaller_delay_once_acknowledged_test() ->
     ?assertEqual(50, quic_loss:max_ack_delay(S2#state.loss_state)),
     [_, Second] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
     [First, _] = [P || P <- sent(S2), lists:keymember(ack_frequency, 1, P#sent_packet.frames)],
-    S3 = quic_connection:ack_frequency_acked([First], S2),
+    S3 = quic_connection:ack_frequency_acked([First], [], S2),
     ?assertEqual(50, quic_loss:max_ack_delay(S3#state.loss_state)),
-    S4 = quic_connection:ack_frequency_acked([Second], S3),
+    S4 = quic_connection:ack_frequency_acked([Second], [], S3),
     ?assertEqual(5, quic_loss:max_ack_delay(S4#state.loss_state)).
 
 only_the_latest_request_is_resent_test() ->
@@ -441,6 +441,19 @@ stale_sequence_numbers_ignored_test() ->
     S4 = process(app, {ack_frequency, 6, 0, 2000, 1}, S3),
     ?assertEqual(1, quic_connection:ack_tolerance(S4)),
     ?assertEqual(2, quic_connection:ack_delay_ms(S4)).
+
+%% Section 4: a stale frame is ignored before its fields are checked.
+stale_frame_with_an_invalid_delay_is_ignored_test_() ->
+    S1 = process(app, {ack_frequency, 5, 9, 4000, 1}, receiver()),
+    [
+        {lists:flatten(io_lib:format("seq ~p delay ~p", [Seq, Delay])), fun() ->
+            S = process(app, {ack_frequency, Seq, 1, Delay, 1}, S1),
+            ?assertEqual(undefined, S#state.close_reason),
+            ?assertEqual(10, quic_connection:ack_tolerance(S)),
+            ?assertEqual(4, quic_connection:ack_delay_ms(S))
+        end}
+     || Seq <- [5, 3], Delay <- [999, 16384000]
+    ].
 
 threshold_is_capped_test() ->
     S = process(app, {ack_frequency, 0, 1 bsl 40, 25000, 1}, receiver()),

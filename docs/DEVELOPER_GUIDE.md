@@ -253,12 +253,15 @@ Opts = #{
 },
 {ok, Conn} = quic:connect(Host, Port, Opts, self()),
 
-%% Check if peer supports datagrams
+%% Largest payload that can be sent now, 0 if the peer has no support
+Update = <<"game state update">>,
 case quic:datagram_max_size(Conn) of
     0 -> {error, not_supported};
-    MaxSize ->
+    MaxSize when byte_size(Update) =< MaxSize ->
         %% Send datagram (not retransmitted on loss)
-        ok = quic:send_datagram(Conn, <<"game state update">>)
+        ok = quic:send_datagram(Conn, Update);
+    _MaxSize ->
+        {error, too_large}
 end.
 
 %% Receive datagrams
