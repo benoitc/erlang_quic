@@ -579,7 +579,9 @@
     %% When the flight last drained with the timer armed. A flight that
     %% drains again within ?PTO_LAZY_WINDOW_MS leaves the timer armed for
     %% the next send; otherwise it is cancelled, so a connection going
-    %% quiet is not woken by a timer with nothing to probe.
+    %% quiet is not woken by a timer with nothing to probe. The deadline
+    %% is checked when the timer fires (RFC 9002 Section 6.2.1 and
+    %% Appendix A.8).
     pto_drained_at = undefined :: integer() | undefined,
     %% The packet number space the armed timer belongs to. A probe has to
     %% go out at that level, and a change of space forces a re-arm: the

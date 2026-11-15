@@ -3439,7 +3439,7 @@ confirm_handshake(#state{loss_state = LossState} = State) ->
         hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}
     }).
 
-%% RFC 8446 Section 7.1: a secret is erased once everything derived from
+%% RFC 9846 Section 7.1: a secret is erased once everything derived from
 %% it has been. Nothing reads the transcript, the handshake secrets, the
 %% key-exchange private key or the signing key after confirmation; a
 %% client first derives the one secret its session tickets need.
@@ -14889,7 +14889,7 @@ set_keep_alive_timer(
 
 %% Time to the next PING after one was sent. With both ends on the same
 %% interval the client goes first, so each interval carries one PING, not
-%% one from each end.
+%% one from each end (RFC 9000 Section 10.1.2).
 keep_alive_period(#state{cfg = #conn_cfg{role = client, keep_alive_interval = Interval}}) ->
     Interval - Interval div 16;
 keep_alive_period(#state{cfg = #conn_cfg{keep_alive_interval = Interval}}) ->

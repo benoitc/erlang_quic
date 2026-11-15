@@ -11,7 +11,7 @@
 
 -define(IV, <<1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12>>).
 
-%% RFC 8446 Section 7.1: a secret is erased once what is derived from it
+%% RFC 9846 Section 7.1: a secret is erased once what is derived from it
 %% has been, and RFC 9001 Section 4.9.2 discards the Handshake keys. The
 %% client still gets a session ticket it can resume with: its secret is
 %% derived before the transcript goes.
