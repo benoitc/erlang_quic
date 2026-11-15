@@ -4652,9 +4652,10 @@ amp_account_recv(_Data, State) ->
 ) ->
     {ok, #state{}} | {deferred, #state{}}.
 %%
-%% A refused probe is not queued: what it carries is still outstanding,
-%% so the next probe carries it again, and a queued copy per expiry is
-%% what filled the queue.
+%% A refused probe that replays sent data is not queued: what it carries
+%% is still outstanding, so the next probe carries it again, and a queued
+%% copy per expiry is what filled the queue. One taken from the queue goes
+%% back there (send_pending_hs_probe/2).
 gate(Space, InFlight, Size, Datagram, Payload, Frames, State) ->
     case amp_allows(Datagram, State) of
         false when (State#state.hs)#hs.hs_probe ->
@@ -14287,8 +14288,28 @@ send_pending_hs_probe(
                     pending_hs_bytes = Bytes#{Space => Held}
                 }
             },
-            {sent, send_at_level(Space, Payload, Frames, State1)}
+            State2 = send_at_level(Space, Payload, Frames, State1),
+            {sent, keep_unsent_probe(Space, next_hs_pn(Space, State), State, State2)}
     end.
+
+%% A refused probe from the queue was never sent, so nothing else would
+%% resend it: it goes back to the head of the queue (RFC 9000 Section 13.3).
+keep_unsent_probe(Space, PN, #state{hs = #hs{pending_hs = Pending, pending_hs_bytes = Bytes}}, S) ->
+    case next_hs_pn(Space, S) of
+        PN ->
+            #state{hs = #hs{pending_hs = Pending1, pending_hs_bytes = Bytes1} = HS} = S,
+            S#state{
+                hs = HS#hs{
+                    pending_hs = Pending1#{Space => maps:get(Space, Pending)},
+                    pending_hs_bytes = Bytes1#{Space => maps:get(Space, Bytes, 0)}
+                }
+            };
+        _ ->
+            S
+    end.
+
+next_hs_pn(initial, #state{hs = #hs{pn_initial = #pn_space{next_pn = PN}}}) -> PN;
+next_hs_pn(handshake, #state{hs = #hs{pn_handshake = #pn_space{next_pn = PN}}}) -> PN.
 
 %% Get frames from the oldest unacked packet for probe retransmission
 %% Uses cached oldest_unacked from loss_state for O(1) lookup
@@ -15386,6 +15407,9 @@ probe_cid_for(Addr, Via, State) ->
     case Via =:= current_via(State) of
         true ->
             path_cid_for(Addr, false, State);
+        false when State#state.dcid =:= <<>> ->
+            %% A zero-length CID goes on every path (RFC 9000 Section 5.1.1).
+            {State, <<>>, undefined};
         false ->
             case bind_path_cid(Addr, State) of
                 {ok, State1, DCID, Seq} -> {State1, DCID, Seq};
@@ -15785,11 +15809,12 @@ maybe_handle_address_change(NewAddr, DataSize, State) ->
 %% the peer kept its CID: the network moved it, and the current CID may
 %% stay (RFC 9000 Section 9.5). A client moving to the preferred address
 %% may keep its own address, so a change of the local socket alone is a
-%% new path too.
+%% new path too. A peer with a zero-length CID needs none: that CID goes
+%% on every path (Section 5.1.1).
 maybe_handle_path_change(Via, NewAddr, DataSize, State) ->
     Probed = lists:any(fun(P) -> is_path(NewAddr, Via, P) end, alt_paths(State)),
     KeptCID = Via =:= current_via(State) andalso kept_its_cid(State),
-    case Probed orelse has_unused_cid(State) orelse KeptCID of
+    case Probed orelse has_unused_cid(State) orelse KeptCID orelse State#state.dcid =:= <<>> of
         true -> initiate_peer_path_validation(NewAddr, Via, false, DataSize, State);
         false -> State
     end.

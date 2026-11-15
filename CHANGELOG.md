@@ -82,6 +82,11 @@ All notable changes to this project will be documented in this file.
   session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
 
 ### Fixed
+- A client that used zero-length connection IDs and moved to the
+  server's preferred address got no answer there: the server looked for
+  a new connection ID for that address, and such a client has none to
+  give. It is now answered under its empty connection ID, which is used
+  on every path (RFC 9000 Sections 5.1.1 and 8.2.2).
 - Datagrams were checked against the largest packet size path MTU
   discovery may try, not the size it has confirmed. A datagram between
   the two was accepted and sent, and lost on a path that does not carry
