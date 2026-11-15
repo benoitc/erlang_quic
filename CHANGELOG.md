@@ -2,7 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.0.0] - 2026-11-15
+
+Upgrading from 2.x:
+- A peer's certificate is now checked for what it may be used for: a
+  server's for TLS server authentication and a client's for TLS client
+  authentication, when it has an Extended Key Usage, and for signing,
+  when it has a Key Usage. A certificate issued for something else is
+  refused. A certificate used to both accept and open connections, as
+  an Erlang distribution node uses its own, needs both purposes or no
+  Extended Key Usage. A certificate you list yourself in `cacerts` is
+  taken as configured.
+- `quic:datagram_max_size/1` returns the largest payload you can send
+  now, not the limit the peer advertised. Code that used it as the
+  peer's limit gets a smaller number, which grows as path MTU discovery
+  confirms larger packets.
+- A congestion control module no longer implements persistent
+  congestion detection, and `quic_cc:can_send_control/2` and the urgency
+  argument of `quic_cc:send_check` and `quic_cc:send_check_run` are
+  gone. Only custom congestion control modules are affected.
+- A server configured with the `stream_cipher` or `block_cipher` QUIC-LB
+  algorithm no longer starts. Use `encrypted` with the same key.
+- A server with an invalid `lb_config` no longer starts and returns
+  `{error, {invalid_lb_config, Reason}}`.
 
 ### Security
 - A peer's certificate was accepted whatever it was issued for. A
