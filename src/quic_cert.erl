@@ -2,12 +2,13 @@
 %%%
 %%% Server certificate validation for QUIC clients.
 %%%
-%%% Performs the two checks RFC 9846 requires of a client after it
-%%% receives the server's Certificate message: chain validation against
-%%% a set of trust anchors (§4.5.1.3) and identity (hostname) matching
-%%% (RFC 9525). Signature verification of CertificateVerify is handled
-%%% in `quic_tls:verify_certificate_verify/4'; this module covers the
-%%% chain and the name.
+%%% Performs the checks RFC 9846 requires of a client after it receives
+%%% the server's Certificate message: chain validation against a set of
+%%% trust anchors (§4.5.1.3), what the certificate may be used for
+%%% (§4.5.1.2, RFC 5280 §4.2.1.12) and identity (hostname) matching
+%%% (RFC 9525). A server checks a client certificate the same way, less
+%%% the name. Signature verification of CertificateVerify is handled in
+%%% `quic_tls:verify_certificate_verify/4'.
 
 -module(quic_cert).
 
@@ -35,9 +36,15 @@
 validate_server(undefined, _Intermediates, _CaCerts, _ServerName) ->
     {error, no_certificate};
 validate_server(Leaf, Intermediates, CaCerts, ServerName) when is_binary(Leaf) ->
-    case verify_chain(Leaf, Intermediates, trust_anchors(CaCerts)) of
-        ok -> verify_hostname(Leaf, ServerName);
-        {error, _} = Error -> Error
+    Anchors = trust_anchors(CaCerts),
+    case verify_chain(Leaf, Intermediates, Anchors) of
+        ok ->
+            case verify_usage(Leaf, server, Anchors) of
+                ok -> verify_hostname(Leaf, ServerName);
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
     end.
 
 %% @doc Validate a client's certificate chain (mutual TLS, RFC 9846 §4.5.1.3).
@@ -54,7 +61,11 @@ validate_server(Leaf, Intermediates, CaCerts, ServerName) when is_binary(Leaf) -
 validate_client(undefined, _Intermediates, _CaCerts) ->
     {error, no_certificate};
 validate_client(Leaf, Intermediates, CaCerts) when is_binary(Leaf) ->
-    verify_chain(Leaf, Intermediates, trust_anchors(CaCerts)).
+    Anchors = trust_anchors(CaCerts),
+    case verify_chain(Leaf, Intermediates, Anchors) of
+        ok -> verify_usage(Leaf, client, Anchors);
+        {error, _} = Error -> Error
+    end.
 
 %% @doc Whether a server with these options asks the client for a
 %% certificate: `verify' (`true' or `verify_peer') asks and accepts a
@@ -234,6 +245,67 @@ is_issuer(Cert, Anchor) ->
         public_key:pkix_is_issuer(Cert, Anchor)
     catch
         _:_ -> false
+    end.
+
+%%====================================================================
+%% Key usage
+%%====================================================================
+
+%% What the leaf may be used for. Its Key Usage, when present, must allow
+%% signatures (RFC 9846 Section 4.5.1.2), and its Extended Key Usage, when
+%% present, the role it authenticates (RFC 5280 Section 4.2.1.12). A leaf
+%% listed among the trust anchors was trusted as it is, so is taken as
+%% configured.
+verify_usage(Leaf, Role, Anchors) ->
+    case lists:member(Leaf, Anchors) of
+        true -> ok;
+        false -> verify_usage(Role, leaf_extensions(Leaf))
+    end.
+
+verify_usage(Role, Extensions) ->
+    case allows_signing(Extensions) of
+        false -> {error, {bad_cert, key_usage}};
+        true -> allows_role(Role, Extensions)
+    end.
+
+allows_signing(Extensions) ->
+    case extension(?'id-ce-keyUsage', Extensions) of
+        none -> true;
+        Usage -> lists:member(digitalSignature, Usage)
+    end.
+
+allows_role(Role, Extensions) ->
+    case extension(?'id-ce-extKeyUsage', Extensions) of
+        none ->
+            ok;
+        Purposes ->
+            case
+                lists:member(role_purpose(Role), Purposes) orelse
+                    lists:member(?'anyExtendedKeyUsage', Purposes)
+            of
+                true -> ok;
+                false -> {error, {bad_cert, {extended_key_usage, role_name(Role)}}}
+            end
+    end.
+
+role_purpose(server) -> ?'id-kp-serverAuth';
+role_purpose(client) -> ?'id-kp-clientAuth'.
+
+role_name(server) -> server_auth;
+role_name(client) -> client_auth.
+
+leaf_extensions(Leaf) ->
+    #'OTPCertificate'{tbsCertificate = #'OTPTBSCertificate'{extensions = Extensions}} =
+        public_key:pkix_decode_cert(Leaf, otp),
+    case Extensions of
+        asn1_NOVALUE -> [];
+        _ -> Extensions
+    end.
+
+extension(Id, Extensions) ->
+    case lists:keyfind(Id, #'Extension'.extnID, Extensions) of
+        #'Extension'{extnValue = Value} -> Value;
+        false -> none
     end.
 
 %%====================================================================

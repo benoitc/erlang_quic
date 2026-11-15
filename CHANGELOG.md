@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security
+- A peer's certificate was accepted whatever it was issued for. A
+  certificate from a trusted CA meant for another purpose, such as code
+  signing, could authenticate a QUIC server or client, and so could one
+  whose Key Usage does not allow signatures. A server's certificate now
+  has to allow TLS server authentication and a client's TLS client
+  authentication when it carries an Extended Key Usage (RFC 5280
+  Section 4.2.1.12), and its Key Usage, when present, has to allow
+  signatures (RFC 9846 Section 4.5.1.2). A certificate you list yourself
+  in `cacerts` is still taken as configured. A certificate used both to
+  accept and to open connections, as an Erlang distribution node uses
+  its own, needs both purposes or no Extended Key Usage.
+
 ### Added
 - `alpn_handler` can take a third argument, the connection's current
   owner: the one `connection_handler` returned, or the listener without

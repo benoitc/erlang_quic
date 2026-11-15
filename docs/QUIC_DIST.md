@@ -28,6 +28,20 @@ openssl req -x509 -newkey rsa:2048 \
     -days 365 -nodes -subj '/CN=localhost'
 ```
 
+A node uses its certificate both to accept connections and to open
+them, so with `verify_peer` the certificate must work for a TLS server
+and a TLS client. Give it no Extended Key Usage, or list both purposes,
+and keep `digitalSignature` if it has a Key Usage:
+
+```bash
+openssl x509 -req -in node.csr -CA ca.pem -CAkey ca.key \
+    -out cert.pem -days 365 \
+    -extfile <(printf 'extendedKeyUsage=serverAuth,clientAuth\nkeyUsage=digitalSignature')
+```
+
+A certificate listing only `serverAuth` lets a node accept connections
+but not open them: its peers refuse it as a client.
+
 ### Configuration
 
 Create `sys.config`:
