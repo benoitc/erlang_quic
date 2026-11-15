@@ -25,6 +25,11 @@ All notable changes to this project will be documented in this file.
   immediate ACK, so loss recovery, path MTU discovery and migration are
   not slowed by the peer's ACK delay. Until a peer sends a request,
   acknowledgments go out as before.
+- `fullsweep_after` connection option, passed to the connection process
+  as its spawn option of the same name. Unset, the VM default applies as
+  before. `0` keeps the heap of a mostly idle connection close to its
+  live data between hibernations, and costs collector time on a busy
+  one.
 
 ### Changed
 - Breaking: the `stream_cipher` and `block_cipher` QUIC-LB algorithms
@@ -80,6 +85,29 @@ All notable changes to this project will be documented in this file.
   answer before the handshake completes, from what is known of the peer
   so far: for a client sending 0-RTT, the parameters remembered with the
   session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
+- A connection uses less CPU and memory, idle ones most of all.
+- Keep-alive sends its PING once the connection has been idle for seven
+  eighths of `keep_alive_interval`, instead of waking at the interval
+  and again a round trip later. When both ends use the same interval, as
+  with `auto`, only the client sends PINGs; the server takes over if the
+  client stops (RFC 9000 Section 10.1.2).
+- In a request-response exchange the PTO timer is no longer cancelled
+  and started again on every round trip: when everything in flight is
+  acknowledged twice within 100 ms the timer stays armed for the next
+  send. Probes go out at the same times as before (RFC 9002 Section
+  6.2.1 and Appendix A.8).
+- The `disconnect_timeout` check no longer wakes an established
+  connection every `disconnect_timeout` when nothing is waiting for an
+  acknowledgement. It runs during the handshake as before, and from the
+  first probe timeout of data in flight, so an unresponsive peer is
+  still given up on at the same time.
+- A connection lets go of its handshake state once the handshake is
+  confirmed: the TLS transcript, the handshake and master secrets, the
+  key-exchange private key, its copy of the signing key and the cipher
+  contexts of the discarded Initial and Handshake keys (RFC 9846 Section
+  7.1, RFC 9001 Section 4.9). A client keeps only the resumption secret
+  its session tickets need.
+- qlog reports a run of PADDING frames as a single `padding` frame.
 
 ### Fixed
 - A client that used zero-length connection IDs and moved to the
@@ -261,6 +289,10 @@ All notable changes to this project will be documented in this file.
   asked to stop sending the rest of the body with `H3_NO_ERROR` and what
   was buffered for it is dropped (RFC 9114 Section 4.1). Such a body
   used to be buffered up to `max_buffered_body` and its stream reset.
+- No timer of a connection was ever cancelled: the PTO, idle,
+  keep-alive, pacing, disconnect and PMTU timers were "cancelled"
+  through a reference that was not the timer, so each ran to its end and
+  woke the connection for nothing. They are now stopped when cancelled.
 
 ## [2.7.0] - 2026-11-13
 
@@ -389,63 +421,6 @@ All notable changes to this project will be documented in this file.
 - TLS now follows RFC 9846, which obsoletes RFC 8446.
 - Reliable stream reset now follows draft-ietf-quic-reliable-stream-reset-11;
   both transport parameter ids are sent and accepted.
-- `fullsweep_after` connection option, passed to the connection process
-  as its spawn option of the same name. Unset, the VM default applies as
-  before. `0` keeps the heap of a mostly idle connection close to its
-  live data between hibernations, and costs collector time on a busy
-  one.
-
-### Changed
-- The receiver process of a client on the `socket` backend waits for a
-  datagram instead of waking ten times a second, and reads the
-  connection's mailbox length once per 16 forwarded messages rather than
-  on each. Together with the timer fix below, an idle client connection
-  uses 10 to 39 microseconds of CPU per second where it used 190 to 490
-  (loopback).
-- In a request-response exchange the PTO timer is no longer cancelled
-  and started again on every round trip: when everything in flight is
-  acknowledged twice within 100 ms the timer stays armed for the next
-  send. Probes go out at the same times as before (RFC 9002 Section
-  6.2.1).
-- The `disconnect_timeout` check no longer wakes an established
-  connection every `disconnect_timeout` when nothing is waiting for an
-  acknowledgement. It runs during the handshake as before, and from the
-  first probe timeout of data in flight, so an unresponsive peer is
-  still given up on at the same time.
-- With keep-alive on, the idle timer no longer fires just to find that
-  the connection was kept alive: each keep-alive expiry moves it to the
-  idle deadline (RFC 9000 Section 10.1).
-- Keep-alive sends its PING once the connection has been idle for seven
-  eighths of `keep_alive_interval`, instead of waking at the interval
-  and again a round trip later. When both ends use the same interval, as
-  with `auto`, only the client sends PINGs; the server takes over if the
-  client stops. With the timer changes above, an idle connection with
-  keep-alive handles about 16 messages per 100 seconds on the server and
-  11 on the client, where it handled 29 (loopback).
-- A listener routes a train of 1-RTT packets for one connection with a
-  single routing table lookup instead of one per packet.
-- Processing an ACK no longer builds the list of acknowledged packet
-  numbers unless qlog is on, nor the list of their sizes unless PMTU
-  black hole detection has a strike to clear.
-- A connection lets go of its handshake state once the handshake is
-  confirmed: the TLS transcript, the handshake and master secrets, the
-  key-exchange private key, its copy of the signing key and the cipher
-  contexts of the discarded Initial and Handshake keys (RFC 8446 Section
-  7.1, RFC 9001 Section 4.9). A client keeps only the resumption secret
-  its session tickets need. An established connection holds 8224 bytes
-  of process memory where it held 9960, and 1744 bytes less in binaries
-  (loopback).
-- A run of PADDING frames is processed as one frame instead of one per
-  byte, about a thousand in a padded Initial. A server connection runs
-  27 garbage collections during its handshake where it ran 41
-  (loopback). qlog reports such a run as a single `padding` frame.
-- A run of stream packets is handed to the send batch in one step
-  instead of copying the socket state once per packet.
-- A server connection receiving on an unchanged path no longer rewrites
-  its state three times per receive pass with the values already there.
-  With the listener and send batch changes above, a 50 MB transfer
-  leaves 55 MB of garbage on the receiving server where it left 81, and
-  54 on the sending server where it left 63 (loopback).
 
 ### Fixed
 - A client connecting to an internationalized host name sent it in
@@ -912,10 +887,6 @@ All notable changes to this project will be documented in this file.
   now closes the connection with STREAM_STATE_ERROR, the owner hears of
   the reset once, and no stream data is delivered after the peer's
   RESET_STREAM (draft-ietf-quic-reliable-stream-reset-11 Section 5.2).
-- No timer of a connection was ever cancelled: the PTO, idle,
-  keep-alive, pacing, disconnect and PMTU timers were "cancelled"
-  through a reference that was not the timer, so each ran to its end and
-  woke the connection for nothing. They are now stopped when cancelled.
 
 ## [2.6.1] - 2026-11-08
 
