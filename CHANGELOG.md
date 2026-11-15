@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- A `stream_type_handler` can claim a stream with manual receive credit
+  by returning `{claim, #{flow_control => manual}}`, and
+  `quic_h3:open_bidi_stream/3` opens a claimed stream the same way. The
+  peer can then send only one stream window past what the owner has
+  handled and returned with `quic_h3:consume/3`, which now works on
+  claimed streams. Until now a claimed stream always earned credit as its
+  data arrived, and an owner could only switch it to manual after it
+  heard of the stream, by which time a fast peer had sent far more than
+  a window. WebTransport sessions need this to keep a slow application
+  from buffering without bound.
+
 ## [3.0.0] - 2026-11-15
 
 Upgrading from 2.x:
