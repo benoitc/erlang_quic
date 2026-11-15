@@ -5015,10 +5015,32 @@ close_half(local, Stream) ->
 %% GOAWAY-ed connection from ever draining. A body no handler came for
 %% goes with it, since none can register for the stream any more.
 store_stream(StreamId, #h3_stream{state = closed, reset = false}, State) ->
-    State1 = release_buffered(StreamId, State),
+    State1 = forget_watchers(StreamId, release_buffered(StreamId, State)),
     State1#state{streams = maps:remove(StreamId, State1#state.streams)};
 store_stream(StreamId, Stream, #state{streams = Streams} = State) ->
     State#state{streams = Streams#{StreamId => Stream}}.
+
+%% A finished stream needs no handler and no answerer watch any more.
+forget_watchers(StreamId, #state{stream_handlers = Handlers, answered_unread = Answered} = State) ->
+    Handlers1 =
+        case maps:take(StreamId, Handlers) of
+            {{_Pid, MonRef}, Rest} ->
+                erlang:demonitor(MonRef, [flush]),
+                Rest;
+            error ->
+                Handlers
+        end,
+    Answered1 = maps:filter(
+        fun
+            (Ref, StreamId1) when StreamId1 =:= StreamId ->
+                erlang:demonitor(Ref, [flush]),
+                false;
+            (_Ref, _StreamId1) ->
+                true
+        end,
+        Answered
+    ),
+    State#state{stream_handlers = Handlers1, answered_unread = Answered1}.
 
 %% Only what gets buffered is charged: a client hands each piece to its
 %% owner, and so does a server once the stream has a handler.

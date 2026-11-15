@@ -2350,6 +2350,49 @@ tail_behind_a_blocked_section_is_not_credited_test() ->
         stop_conn(Conn)
     end.
 
+%% A finished stream takes its handler entry and monitor with it, so a
+%% handler that stays registered does not grow the connection per request.
+finished_streams_drop_their_handler_test() ->
+    Conn = cast_capture_conn(self()),
+    Handler = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    try
+        Ids = [4 * N || N <- lists:seq(0, 99)],
+        State0 = make_test_state(#{
+            role => server,
+            quic_conn => Conn,
+            streams => maps:from_list([
+                {Id, #h3_stream{
+                    id = Id, type = request, state = half_closed_local, frame_state = expecting_data
+                }}
+             || Id <- Ids
+            ]),
+            stream_handlers => maps:from_list([
+                {Id, {Handler, erlang:monitor(process, Handler)}}
+             || Id <- Ids
+            ])
+        }),
+        Fin = quic_h3_frame:encode_data(<<"done">>),
+        State = lists:foldl(
+            fun(Id, S) ->
+                {ok, S1} = quic_h3_connection:handle_stream_data(Id, Fin, true, S),
+                S1
+            end,
+            State0,
+            Ids
+        ),
+        ?assertEqual(#{}, quic_h3_connection:test_stream_handlers(State)),
+        ?assertEqual(#{}, quic_h3_connection:test_streams(State)),
+        {monitors, Monitors} = process_info(self(), monitors),
+        ?assertNot(lists:member({process, Handler}, Monitors))
+    after
+        Handler ! stop,
+        stop_conn(Conn)
+    end.
+
 %% Every state answers the per-stream calls; none leaves the caller
 %% waiting on a call it has no clause for.
 stream_calls_are_answered_in_every_state_test_() ->

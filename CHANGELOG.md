@@ -82,6 +82,10 @@ All notable changes to this project will be documented in this file.
   session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
 
 ### Fixed
+- An HTTP/3 connection kept an entry and a monitor for every finished
+  request whose handler stayed registered, so a long-lived handler
+  grew the connection's memory with each request. A finished request
+  now lets go of its handler.
 - A client that used zero-length connection IDs and moved to the
   server's preferred address got no answer there: the server looked for
   a new connection ID for that address, and such a client has none to
