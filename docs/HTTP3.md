@@ -651,6 +651,31 @@ unaffected.
 The same claimed-stream reset/stop_sending events fire on uni
 streams too.
 
+#### Receive credit on a claimed stream
+
+A claimed stream earns receive credit as its bytes reach the owner's
+mailbox, so a peer can send as fast as the connection carries it, however
+far behind the owner is. To hold the peer to one stream window past what
+you have handled, claim the stream with manual credit and return credit
+with `quic_h3:consume/3` as you handle each `stream_type_data` event:
+
+```erlang
+Claim = fun
+    (uni,  _StreamId, 16#54) -> {claim, #{flow_control => manual}};
+    (bidi, _StreamId, 16#41) -> {claim, #{flow_control => manual}};
+    (_, _, _)                -> ignore
+end,
+
+%% in the owner:
+{quic_h3, Conn, {stream_type_data, _Dir, StreamId, Data, _Fin}} ->
+    handle(Data),
+    ok = quic_h3:consume(Conn, StreamId, byte_size(Data))
+```
+
+Count the payload only: the stream type is credited for you. `claim` and
+`{claim, #{flow_control => auto}}` keep credit following delivery, and
+`consume/3` is then a no-op. Any other result ignores the stream.
+
 ### Client-initiated claimed bidi streams
 
 The peer-initiated path above covers streams the remote opens. A
@@ -671,6 +696,15 @@ claims use, emits `{stream_type_open, bidi, StreamId, SignalType}`
 to the owner at open time, and routes inbound bytes on the stream
 as `{stream_type_data, bidi, ...}` events instead of HTTP/3 request
 frames.
+
+Open it with `quic_h3:open_bidi_stream/3` and
+`#{flow_control => manual}` to give it manual receive credit before the
+peer can send on it. Everything the peer sends on it is payload, so
+consume the full `Data` of each `stream_type_data` event:
+
+```erlang
+{ok, StreamId} = quic_h3:open_bidi_stream(H3Conn, 16#41, #{flow_control => manual}).
+```
 
 `open_bidi_stream/1` and `open_bidi_stream(Conn, undefined)` skip
 the claim and return a plain bidi stream that the H3 layer will

@@ -3456,6 +3456,59 @@ open_bidi_stream_undefined_passthrough_test() ->
     after 50 -> ok
     end.
 
+%% A claim sets the stream's credit before its data is forwarded; with
+%% `manual' the stream type is credited, counted as the bytes read, here
+%% a non-minimal 4-byte varint.
+manual_uni_claim_credits_the_type_it_read_test() ->
+    Claim = fun(uni, _StreamId, 16#54) -> {claim, #{flow_control => manual}} end,
+    State0 = make_test_state(#{
+        role => server, stream_type_handler => Claim, quic_conn => self()
+    }),
+    StreamId = 2,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#80, 0, 0, 16#54, 0, "hello">>, false, State1
+    ),
+    ?assertEqual(
+        [
+            {'$gen_cast', {set_stream_flow_control, StreamId, {manual, 4}}},
+            {quic_h3, self(), {stream_type_open, uni, StreamId, 16#54}},
+            {quic_h3, self(), {stream_type_data, uni, StreamId, <<0, "hello">>, false}}
+        ],
+        drain_mailbox()
+    ).
+
+manual_bidi_claim_credits_the_type_it_read_test() ->
+    ?assertEqual({manual, 2}, bidi_claim_flow({claim, #{flow_control => manual}})).
+
+%% `claim' and an auto claim keep credit following delivery.
+auto_bidi_claim_is_released_test() ->
+    ?assertEqual(auto, bidi_claim_flow(claim)),
+    ?assertEqual(auto, bidi_claim_flow({claim, #{flow_control => auto}})),
+    ?assertEqual(auto, bidi_claim_flow({claim, #{}})).
+
+%% A claim with a flow it does not know ignores the stream: it is read as
+%% a request stream.
+unknown_claim_flow_ignores_the_stream_test() ->
+    Handler = fun(_, _, _) -> {claim, #{flow_control => x}} end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Handler}),
+    {ok, State1} = quic_h3_connection:handle_new_stream(0, bidirectional, State0),
+    flush_mailbox(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<16#40, 16#41>>, false, State1),
+    ?assertEqual([], drain_mailbox()),
+    ?assert(maps:is_key(0, quic_h3_connection:test_streams(State2))).
+
+bidi_claim_flow(Result) ->
+    State0 = make_test_state(#{
+        role => server, stream_type_handler => fun(_, _, _) -> Result end, quic_conn => self()
+    }),
+    {ok, State1} = quic_h3_connection:handle_new_stream(0, bidirectional, State0),
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, "x">>, false, State1),
+    [Flow] = [F || {'$gen_cast', {set_stream_flow_control, 0, F}} <- drain_mailbox()],
+    Flow.
+
 %% QUIC holds a peer's uni stream until its type is read: every stream
 %% that is not claimed is then released, known or not.
 uni_streams_are_released_once_their_type_is_read_test() ->

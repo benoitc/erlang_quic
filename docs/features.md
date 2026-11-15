@@ -271,8 +271,15 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
   with a non-negative `SignalType` varint the stream is pre-claimed and
   inbound bytes route as `{stream_type_data, bidi, ...}` owner messages
   instead of HTTP/3 request frames (e.g. WebTransport's `0x41`)
+- `quic_h3:open_bidi_stream/3` - The same with
+  `#{flow_control => manual}`: the peer may send one stream window past
+  what the owner has consumed
 - `stream_type_handler` option on `start_server/3` claims peer-initiated
-  uni / bidi streams whose first varint matches a caller-supplied filter
+  uni / bidi streams whose first varint matches a caller-supplied filter;
+  returning `{claim, #{flow_control => manual}}` gives the stream manual
+  receive credit from the moment it is claimed
+- `quic_h3:consume/3` - Return credit on a manually claimed stream, counting
+  the payload of its `stream_type_data` events
 - Owner events: `{stream_type_open, Direction, StreamId, VarintType}`,
   `{stream_type_data, Direction, StreamId, Data, Fin}`,
   `{stream_type_closed, Direction, StreamId}`,

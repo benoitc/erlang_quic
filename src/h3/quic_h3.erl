@@ -190,6 +190,7 @@
     request/3,
     open_bidi_stream/1,
     open_bidi_stream/2,
+    open_bidi_stream/3,
     open_uni_stream/2,
     wait_connected/2
 ]).
@@ -260,7 +261,8 @@
     connect_opts/0,
     server_opts/0,
     accept_opts/0,
-    push_id/0
+    push_id/0,
+    stream_claim/0
 ]).
 
 -include("quic.hrl").
@@ -277,8 +279,12 @@
 -type status() :: 100..599.
 -type error_code() :: non_neg_integer().
 
+%% `claim' and `{claim, #{flow_control => auto}}' credit the stream as its
+%% data is delivered; `{claim, #{flow_control => manual}}' only as the
+%% owner consumes it with consume/3. Any other result ignores the stream.
+-type stream_claim() :: claim | {claim, #{flow_control => auto | manual}} | ignore.
 -type stream_type_handler() ::
-    fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore).
+    fun((uni | bidi, stream_id(), non_neg_integer()) -> stream_claim()).
 
 -ifdef(TEST).
 -export([test_client_quic_opts/1]).
@@ -541,6 +547,30 @@ open_bidi_stream(Conn) ->
 open_bidi_stream(Conn, SignalType) ->
     quic_h3_connection:open_bidi_stream(Conn, SignalType).
 
+%% @doc Open and pre-claim a bidirectional stream, as `open_bidi_stream/2',
+%% choosing its receive credit. With `#{flow_control => manual}' the peer
+%% may send one stream window past what the owner has consumed with
+%% `consume/3', counting payload bytes only. `#{}' or
+%% `#{flow_control => auto}' is the same as `open_bidi_stream/2'.
+%%
+%% ```
+%% {ok, StreamId} = quic_h3:open_bidi_stream(Conn, 16#41, #{flow_control => manual}),
+%% %% after handling the Data of a stream_type_data event:
+%% ok = quic_h3:consume(Conn, StreamId, byte_size(Data)).
+%% '''
+%% @end
+-spec open_bidi_stream(conn(), non_neg_integer(), #{flow_control => auto | manual}) ->
+    {ok, stream_id()} | {error, term()}.
+open_bidi_stream(Conn, SignalType, Opts) when
+    is_integer(SignalType), SignalType >= 0, is_map(Opts)
+->
+    case maps:get(flow_control, Opts, auto) of
+        Flow when Flow =:= auto; Flow =:= manual ->
+            quic_h3_connection:open_bidi_stream(Conn, SignalType, Flow);
+        _ ->
+            {error, badarg}
+    end.
+
 %% @doc Open a unidirectional stream of an extension type (e.g.
 %% WebTransport's `16#54'), write the stream-type varint and claim it.
 %%
@@ -692,6 +722,9 @@ unset_stream_handler(Conn, StreamId) ->
 %% Call it after processing `Bytes' of body received on `StreamId'; the
 %% peer may then send up to one stream window past what was consumed.
 %% HTTP/3 framing is credited without it, so count payload bytes only.
+%% On a stream claimed with `{claim, #{flow_control => manual}}' or
+%% opened with `open_bidi_stream/3', count the `Data' of its
+%% `stream_type_data' events; the stream type is credited without it.
 %% A no-op returning `ok' on an `auto' stream. Returns
 %% `{error, unknown_stream}' once the stream is finished or reset.
 %%
