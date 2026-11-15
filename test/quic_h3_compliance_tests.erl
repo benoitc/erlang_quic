@@ -3456,6 +3456,32 @@ open_bidi_stream_undefined_passthrough_test() ->
     after 50 -> ok
     end.
 
+%% QUIC holds a peer's uni stream until its type is read: every stream
+%% that is not claimed is then released, known or not.
+uni_streams_are_released_once_their_type_is_read_test() ->
+    lists:foreach(
+        fun({StreamId, Bytes}) ->
+            State0 = make_test_state(#{role => server, quic_conn => self()}),
+            State1 = mark_uni_stream_open(StreamId, State0),
+            flush_mailbox(),
+            {ok, _} = quic_h3_connection:handle_stream_data(StreamId, Bytes, false, State1),
+            Release = {'$gen_cast', {set_stream_flow_control, StreamId, auto}},
+            ?assert(lists:member(Release, drain_mailbox()))
+        end,
+        [
+            {2, <<?H3_STREAM_CONTROL>>},
+            {6, <<?H3_STREAM_QPACK_ENCODER>>},
+            {10, <<?H3_STREAM_QPACK_DECODER>>},
+            {14, <<16#21, "ignored">>}
+        ]
+    ).
+
+drain_mailbox() ->
+    receive
+        M -> [M | drain_mailbox()]
+    after 0 -> []
+    end.
+
 flush_mailbox() ->
     receive
         _ -> flush_mailbox()

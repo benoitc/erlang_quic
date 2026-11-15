@@ -1565,7 +1565,7 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
             end
     end.
 
-%% QUIC holds a peer's stream until its reader is known (hold_peer_bidi_streams/1).
+%% QUIC holds a peer's stream until its reader is known (hold_peer_streams/1).
 new_request_stream(StreamId, State) ->
     Flow =
         case ?IS_PEER_STREAM(StreamId, State) of
@@ -1800,6 +1800,8 @@ handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers}
 %% known types process their payload. Fin propagates so a single
 %% STREAM frame carrying type-varint + payload + FIN surfaces as one
 %% {stream_type_data, uni, _, _, true} event.
+%% QUIC holds the stream until its type is known (hold_peer_streams/1); a
+%% claim sets its credit, any other stream is released to `auto'.
 dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, Fin, State) ->
     case consult_stream_type_handler(uni, StreamId, Type, State) of
         claim ->
@@ -1807,17 +1809,23 @@ dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, Fin, State) ->
             forward_claimed_uni_data(StreamId, Rest, Fin, State1),
             {ok, State1};
         ignore ->
+            release_uni_stream(StreamId, State),
             {ok, State#state{
                 discarded_uni_streams = sets:add_element(
                     StreamId, State#state.discarded_uni_streams
                 )
             }}
     end;
-dispatch_remaining_uni_data(_StreamId, _Type, <<>>, Fin, State) ->
+dispatch_remaining_uni_data(StreamId, _Type, <<>>, Fin, State) ->
     _ = Fin,
+    release_uni_stream(StreamId, State),
     {ok, State};
 dispatch_remaining_uni_data(StreamId, _Type, Rest, Fin, State) ->
+    release_uni_stream(StreamId, State),
     handle_stream_data(StreamId, Rest, Fin, State).
+
+release_uni_stream(StreamId, #state{quic_conn = QuicConn}) ->
+    quic_connection:set_stream_flow_control(QuicConn, StreamId, auto).
 
 consult_stream_type_handler(_Direction, _StreamId, _Type, #state{
     stream_type_handler = undefined
@@ -1832,6 +1840,8 @@ consult_stream_type_handler(Direction, StreamId, Type, #state{
     end.
 
 claim_uni_stream(StreamId, Type, #state{owner = Owner} = State) ->
+    %% The owner reads it without consuming: credit follows delivery.
+    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
     Owner ! {quic_h3, self(), {stream_type_open, uni, StreamId, Type}},
     State#state{
         claimed_uni_streams = maps:put(StreamId, Type, State#state.claimed_uni_streams)

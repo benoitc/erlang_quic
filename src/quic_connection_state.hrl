@@ -618,8 +618,8 @@
     send_queue_bytes = 0 :: non_neg_integer(),
     %% Streams whose receive credit waits for the reader (recv_flow).
     manual_recv_streams = sets:new([{version, 2}]) :: sets:set(non_neg_integer()),
-    %% Peer bidi streams start manual (hold_peer_bidi_streams/1).
-    hold_peer_bidi = false :: boolean(),
+    %% Peer streams start manual (hold_peer_streams/1).
+    hold_peer_streams = false :: boolean(),
     %% The owner asked to hear `send_ready' once the send queue drains.
     send_ready_wanted = false :: boolean(),
     %% Send queue entry count. Used as an O(1) emptiness check because

@@ -426,7 +426,7 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
     ),
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
-            ok = quic_connection:hold_peer_bidi_streams(QuicConn),
+            ok = quic_connection:hold_peer_streams(QuicConn),
             %% Transfer ownership to H3 process so it receives QUIC events
             ok = quic:set_owner_sync(QuicConn, H3Conn),
             %% With Happy Eyeballs the connection can already be `connected'
@@ -1127,7 +1127,7 @@ start_h3_connection(QuicConnPid, H3Opts, Owner) ->
 start_h3_process(QuicConnPid, H3Opts, Owner) ->
     case gen_statem:start_link(quic_h3_connection, {server, QuicConnPid, H3Opts, Owner}, []) of
         {ok, _} = Started ->
-            ok = quic_connection:hold_peer_bidi_streams(QuicConnPid),
+            ok = quic_connection:hold_peer_streams(QuicConnPid),
             Started;
         Error ->
             Error
