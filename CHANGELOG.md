@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.1.0] - 2026-11-15
 
 ### Added
 - A `stream_type_handler` can claim a stream with manual receive credit
