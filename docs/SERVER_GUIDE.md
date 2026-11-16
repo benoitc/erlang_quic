@@ -175,6 +175,22 @@ openssl req -x509 -newkey rsa:2048 \
     -subj '/CN=localhost'
 ```
 
+### What a certificate may be used for
+
+A client that verifies your server checks what its certificate allows:
+an Extended Key Usage must list `serverAuth`, and a Key Usage must set
+`digitalSignature`. A certificate with neither extension is fine. When
+you issue one from your own CA, set both:
+
+```bash
+openssl x509 -req -in server.csr -CA ca.pem -CAkey ca.key \
+    -out cert.pem -days 365 \
+    -extfile <(printf 'extendedKeyUsage=serverAuth\nkeyUsage=digitalSignature\nsubjectAltName=DNS:localhost')
+```
+
+A server with `require_client_cert` (or `verify => true`) checks client
+certificates the same way, with `clientAuth` in place of `serverAuth`.
+
 ## Connection Handling
 
 ### Using connection_handler Callback

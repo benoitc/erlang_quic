@@ -2,7 +2,56 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.1.0] - 2026-11-15
+
+### Added
+- A `stream_type_handler` can claim a stream with manual receive credit
+  by returning `{claim, #{flow_control => manual}}`, and
+  `quic_h3:open_bidi_stream/3` opens a claimed stream the same way. The
+  peer can then send only one stream window past what the owner has
+  handled and returned with `quic_h3:consume/3`, which now works on
+  claimed streams. Until now a claimed stream always earned credit as its
+  data arrived, and an owner could only switch it to manual after it
+  heard of the stream, by which time a fast peer had sent far more than
+  a window. WebTransport sessions need this to keep a slow application
+  from buffering without bound.
+
+## [3.0.0] - 2026-11-15
+
+Upgrading from 2.x:
+- A peer's certificate is now checked for what it may be used for: a
+  server's for TLS server authentication and a client's for TLS client
+  authentication, when it has an Extended Key Usage, and for signing,
+  when it has a Key Usage. A certificate issued for something else is
+  refused. A certificate used to both accept and open connections, as
+  an Erlang distribution node uses its own, needs both purposes or no
+  Extended Key Usage. A certificate you list yourself in `cacerts` is
+  taken as configured.
+- `quic:datagram_max_size/1` returns the largest payload you can send
+  now, not the limit the peer advertised. Code that used it as the
+  peer's limit gets a smaller number, which grows as path MTU discovery
+  confirms larger packets.
+- A congestion control module no longer implements persistent
+  congestion detection, and `quic_cc:can_send_control/2` and the urgency
+  argument of `quic_cc:send_check` and `quic_cc:send_check_run` are
+  gone. Only custom congestion control modules are affected.
+- A server configured with the `stream_cipher` or `block_cipher` QUIC-LB
+  algorithm no longer starts. Use `encrypted` with the same key.
+- A server with an invalid `lb_config` no longer starts and returns
+  `{error, {invalid_lb_config, Reason}}`.
+
+### Security
+- A peer's certificate was accepted whatever it was issued for. A
+  certificate from a trusted CA meant for another purpose, such as code
+  signing, could authenticate a QUIC server or client, and so could one
+  whose Key Usage does not allow signatures. A server's certificate now
+  has to allow TLS server authentication and a client's TLS client
+  authentication when it carries an Extended Key Usage (RFC 5280
+  Section 4.2.1.12), and its Key Usage, when present, has to allow
+  signatures (RFC 9846 Section 4.5.1.2). A certificate you list yourself
+  in `cacerts` is still taken as configured. A certificate used both to
+  accept and to open connections, as an Erlang distribution node uses
+  its own, needs both purposes or no Extended Key Usage.
 
 ### Added
 - `alpn_handler` can take a third argument, the connection's current
@@ -110,6 +159,10 @@ All notable changes to this project will be documented in this file.
 - qlog reports a run of PADDING frames as a single `padding` frame.
 
 ### Fixed
+- An HTTP/3 connection kept an entry and a monitor for every finished
+  request whose handler stayed registered, so a long-lived handler
+  grew the connection's memory with each request. A finished request
+  now lets go of its handler.
 - A client that used zero-length connection IDs and moved to the
   server's preferred address got no answer there: the server looked for
   a new connection ID for that address, and such a client has none to

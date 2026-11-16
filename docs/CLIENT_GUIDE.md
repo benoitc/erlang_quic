@@ -559,6 +559,15 @@ bracketed or not, such as `"[::1]"`) and you set no `server_name`, the
 address must appear in the certificate's IP subjectAltName entries, and
 no SNI is sent. The same holds for an address given as `server_name`.
 
+The certificate must also be one for a TLS server. When it has an
+Extended Key Usage extension, that must list `serverAuth` (or
+`anyExtendedKeyUsage`), and when it has a Key Usage extension,
+`digitalSignature` must be set. A certificate for another purpose, such
+as code signing, is refused with `{bad_cert, {extended_key_usage, server_auth}}`
+or `{bad_cert, key_usage}`. A certificate you list yourself in `cacerts`,
+such as a pinned self-signed one, is taken as you configured it and not
+checked for usage.
+
 ### 2. Connection Pooling
 
 ```erlang

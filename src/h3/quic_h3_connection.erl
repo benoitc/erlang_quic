@@ -24,6 +24,7 @@
     request/2,
     request/3,
     open_bidi_stream/2,
+    open_bidi_stream/3,
     open_uni_stream/2,
     send_response/4,
     respond/5,
@@ -280,7 +281,8 @@
     %% subsequent bytes to the owner as `{stream_type_*, ...}` events
     %% instead of discarding them.
     stream_type_handler ::
-        fun((uni | bidi, stream_id(), non_neg_integer()) -> claim | ignore) | undefined,
+        fun((uni | bidi, stream_id(), non_neg_integer()) -> quic_h3:stream_claim())
+        | undefined,
 
     %% Uni streams that the stream_type_handler claimed; maps StreamId
     %% to the advertised varint stream type so owner messages can
@@ -402,7 +404,13 @@ request(Conn, Headers, Opts) ->
 -spec open_bidi_stream(pid(), non_neg_integer() | undefined) ->
     {ok, stream_id()} | {error, term()}.
 open_bidi_stream(Conn, SignalType) ->
-    gen_statem:call(Conn, {open_bidi_stream, SignalType}).
+    gen_statem:call(Conn, {open_bidi_stream, SignalType, auto}).
+
+%% @doc See quic_h3:open_bidi_stream/3.
+-spec open_bidi_stream(pid(), non_neg_integer(), auto | manual) ->
+    {ok, stream_id()} | {error, term()}.
+open_bidi_stream(Conn, SignalType, Flow) ->
+    gen_statem:call(Conn, {open_bidi_stream, SignalType, Flow}).
 
 %% @doc See quic_h3:open_uni_stream/2.
 -spec open_uni_stream(pid(), non_neg_integer()) -> {ok, stream_id()} | {error, term()}.
@@ -557,7 +565,7 @@ set_stream_handler(Conn, StreamId, HandlerPid, Opts) ->
 unset_stream_handler(Conn, StreamId) ->
     gen_statem:call(Conn, {unset_stream_handler, StreamId}).
 
-%% @doc Return Bytes of receive credit on a manual stream.
+%% @doc Return Bytes of receive credit on a manual request or claimed stream.
 -spec consume(pid(), stream_id(), non_neg_integer()) -> ok | {error, term()}.
 consume(Conn, StreamId, Bytes) when is_integer(Bytes), Bytes >= 0 ->
     gen_statem:call(Conn, {consume, StreamId, Bytes}).
@@ -1250,8 +1258,8 @@ live_event({call, From}, {open_uni_stream, StreamType}, State) ->
         {error, Reason} ->
             {keep_state_and_data, [{reply, From, {error, Reason}}]}
     end;
-live_event({call, From}, {open_bidi_stream, SignalType}, State) ->
-    case do_open_bidi_stream(SignalType, State) of
+live_event({call, From}, {open_bidi_stream, SignalType, Flow}, State) ->
+    case do_open_bidi_stream(SignalType, Flow, State) of
         {ok, StreamId, State1} ->
             {keep_state, State1, [{reply, From, {ok, StreamId}}]};
         {error, stream_limit} ->
@@ -1565,7 +1573,7 @@ handle_new_stream(StreamId, bidirectional, #state{role = Role} = State) ->
             end
     end.
 
-%% QUIC holds a peer's stream until its reader is known (hold_peer_bidi_streams/1).
+%% QUIC holds a peer's stream until its reader is known (hold_peer_streams/1).
 new_request_stream(StreamId, State) ->
     Flow =
         case ?IS_PEER_STREAM(StreamId, State) of
@@ -1786,7 +1794,8 @@ handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers}
             State1 = State#state{uni_stream_buffers = maps:remove(StreamId, Buffers)},
             case assign_uni_stream(StreamId, Type, State1) of
                 {ok, State2} ->
-                    dispatch_remaining_uni_data(StreamId, Type, Rest, Fin, State2);
+                    TypeLen = byte_size(Combined) - byte_size(Rest),
+                    dispatch_remaining_uni_data(StreamId, Type, TypeLen, Rest, Fin, State2);
                 {error, Reason} ->
                     {error, Reason, State1}
             end;
@@ -1800,24 +1809,32 @@ handle_uni_stream_type(StreamId, Data, Fin, #state{uni_stream_buffers = Buffers}
 %% known types process their payload. Fin propagates so a single
 %% STREAM frame carrying type-varint + payload + FIN surfaces as one
 %% {stream_type_data, uni, _, _, true} event.
-dispatch_remaining_uni_data(StreamId, {unknown, Type}, Rest, Fin, State) ->
+%% QUIC holds the stream until its type is known (hold_peer_streams/1); a
+%% claim sets its credit, any other stream is released to `auto'.
+dispatch_remaining_uni_data(StreamId, {unknown, Type}, TypeLen, Rest, Fin, State) ->
     case consult_stream_type_handler(uni, StreamId, Type, State) of
-        claim ->
-            State1 = claim_uni_stream(StreamId, Type, State),
+        {claim, Flow} ->
+            State1 = claim_uni_stream(StreamId, Type, {Flow, TypeLen}, State),
             forward_claimed_uni_data(StreamId, Rest, Fin, State1),
             {ok, State1};
         ignore ->
+            release_uni_stream(StreamId, State),
             {ok, State#state{
                 discarded_uni_streams = sets:add_element(
                     StreamId, State#state.discarded_uni_streams
                 )
             }}
     end;
-dispatch_remaining_uni_data(_StreamId, _Type, <<>>, Fin, State) ->
+dispatch_remaining_uni_data(StreamId, _Type, _TypeLen, <<>>, Fin, State) ->
     _ = Fin,
+    release_uni_stream(StreamId, State),
     {ok, State};
-dispatch_remaining_uni_data(StreamId, _Type, Rest, Fin, State) ->
+dispatch_remaining_uni_data(StreamId, _Type, _TypeLen, Rest, Fin, State) ->
+    release_uni_stream(StreamId, State),
     handle_stream_data(StreamId, Rest, Fin, State).
+
+release_uni_stream(StreamId, #state{quic_conn = QuicConn}) ->
+    quic_connection:set_stream_flow_control(QuicConn, StreamId, auto).
 
 consult_stream_type_handler(_Direction, _StreamId, _Type, #state{
     stream_type_handler = undefined
@@ -1827,11 +1844,24 @@ consult_stream_type_handler(Direction, StreamId, Type, #state{
     stream_type_handler = Fun
 }) ->
     case Fun(Direction, StreamId, Type) of
-        claim -> claim;
+        claim -> {claim, auto};
+        {claim, #{} = Opts} -> claim_flow(maps:get(flow_control, Opts, auto));
         _ -> ignore
     end.
 
-claim_uni_stream(StreamId, Type, #state{owner = Owner} = State) ->
+claim_flow(Flow) when Flow =:= auto; Flow =:= manual -> {claim, Flow};
+claim_flow(_Flow) -> ignore.
+
+%% The receive credit of a claimed stream, set before any of its data is
+%% forwarded. A manual one earns credit for the stream type here and for
+%% the payload as the owner consumes it.
+claimed_flow({auto, _TypeLen}) -> auto;
+claimed_flow({manual, TypeLen}) -> {manual, TypeLen}.
+
+claim_uni_stream(StreamId, Type, Credit, #state{owner = Owner} = State) ->
+    quic_connection:set_stream_flow_control(
+        State#state.quic_conn, StreamId, claimed_flow(Credit)
+    ),
     Owner ! {quic_h3, self(), {stream_type_open, uni, StreamId, Type}},
     State#state{
         claimed_uni_streams = maps:put(StreamId, Type, State#state.claimed_uni_streams)
@@ -1860,8 +1890,9 @@ handle_bidi_stream_type(StreamId, Data, Fin, State) ->
         {ok, Decoded, Rest} ->
             VarintType = stream_type_varint(Decoded),
             case consult_stream_type_handler(bidi, StreamId, VarintType, State) of
-                claim ->
-                    State1 = claim_bidi_stream(StreamId, VarintType, State),
+                {claim, Flow} ->
+                    TypeLen = byte_size(Combined) - byte_size(Rest),
+                    State1 = claim_bidi_stream(StreamId, VarintType, {Flow, TypeLen}, State),
                     forward_claimed_bidi_data(StreamId, Rest, Fin, State1),
                     {ok, State1};
                 ignore ->
@@ -1878,9 +1909,10 @@ stream_type_varint(qpack_encoder) -> ?H3_STREAM_QPACK_ENCODER;
 stream_type_varint(qpack_decoder) -> ?H3_STREAM_QPACK_DECODER;
 stream_type_varint({unknown, V}) -> V.
 
-claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
-    %% The owner reads it without consuming: credit follows delivery.
-    quic_connection:set_stream_flow_control(State#state.quic_conn, StreamId, auto),
+claim_bidi_stream(StreamId, Type, Credit, #state{owner = Owner} = State) ->
+    quic_connection:set_stream_flow_control(
+        State#state.quic_conn, StreamId, claimed_flow(Credit)
+    ),
     Owner ! {quic_h3, self(), {stream_type_open, bidi, StreamId, Type}},
     State#state{
         bidi_type_buffers = maps:remove(StreamId, State#state.bidi_type_buffers),
@@ -1889,13 +1921,22 @@ claim_bidi_stream(StreamId, Type, #state{owner = Owner} = State) ->
         )
     }.
 
-%% Local-open counterpart of claim_bidi_stream/3. Opens a client-initiated
+%% Local-open counterpart of claim_bidi_stream/4. Opens a client-initiated
 %% bidi stream on the underlying QUIC connection and, when SignalType is
 %% set, pre-claims it so inbound bytes bypass the H3 request parser and
 %% land as {stream_type_data, bidi, ...} owner messages.
-do_open_bidi_stream(SignalType, #state{quic_conn = QuicConn} = State) ->
+do_open_bidi_stream(SignalType, Flow, #state{quic_conn = QuicConn} = State) ->
     case quic:open_stream(QuicConn) of
         {ok, StreamId} ->
+            %% Before the peer can learn of the stream, so nothing it sends
+            %% is credited by delivery.
+            ok =
+                case Flow of
+                    manual ->
+                        quic_connection:set_stream_flow_control(QuicConn, StreamId, {manual, 0});
+                    auto ->
+                        ok
+                end,
             {ok, StreamId, pre_claim_bidi_stream(StreamId, SignalType, State)};
         {error, _} = Err ->
             Err
@@ -1950,7 +1991,7 @@ do_open_uni_stream(StreamType, #state{quic_conn = QuicConn, owner = Owner} = Sta
             Err
     end.
 
-%% Pure half of do_open_bidi_stream/2: given a freshly opened StreamId,
+%% Pure half of do_open_bidi_stream/3: given a freshly opened StreamId,
 %% record the claim (if any) and notify the owner.
 pre_claim_bidi_stream(_StreamId, undefined, State) ->
     State;
@@ -4725,14 +4766,28 @@ do_consume(StreamId, Bytes, #state{streams = Streams} = State) ->
         #{StreamId := #h3_stream{}} ->
             {ok, State};
         _ ->
-            {{error, unknown_stream}, State}
+            consume_claimed(StreamId, Bytes, State)
     end.
 
-%% The stream offset the reader has accounted for: everything parsed,
-%% less payload it has not consumed yet.
+%% A claimed stream's credit is kept by QUIC: a no-op on an `auto' claim.
+consume_claimed(StreamId, Bytes, #state{quic_conn = QuicConn} = State) ->
+    case claimed_stream_direction(StreamId, State) of
+        {ok, _Direction} -> {quic_connection:consume(QuicConn, StreamId, Bytes), State};
+        error -> {{error, unknown_stream}, State}
+    end.
+
+%% The stream offset the reader has accounted for: everything received,
+%% less payload it has not consumed yet. The unparsed tail is a frame
+%% still arriving, framing like the rest, except behind a field section
+%% waiting on the encoder stream, where it can hold body.
 consumed_offset(StreamId, #h3_stream{received = Received, unconsumed = Owed}, State) ->
-    Tail = byte_size(maps:get(StreamId, State#state.stream_buffers, <<>>)),
-    Received - Tail - Owed.
+    Received - blocked_tail(StreamId, State) - Owed.
+
+blocked_tail(StreamId, #state{blocked_streams = Blocked, stream_buffers = Buffers}) ->
+    case is_map_key(StreamId, Blocked) of
+        true -> byte_size(maps:get(StreamId, Buffers, <<>>));
+        false -> 0
+    end.
 
 report_consumed(StreamId, #h3_stream{consumed_sent = Sent} = Stream, State) ->
     case consumed_offset(StreamId, Stream, State) of
@@ -5008,10 +5063,32 @@ close_half(local, Stream) ->
 %% GOAWAY-ed connection from ever draining. A body no handler came for
 %% goes with it, since none can register for the stream any more.
 store_stream(StreamId, #h3_stream{state = closed, reset = false}, State) ->
-    State1 = release_buffered(StreamId, State),
+    State1 = forget_watchers(StreamId, release_buffered(StreamId, State)),
     State1#state{streams = maps:remove(StreamId, State1#state.streams)};
 store_stream(StreamId, Stream, #state{streams = Streams} = State) ->
     State#state{streams = Streams#{StreamId => Stream}}.
+
+%% A finished stream needs no handler and no answerer watch any more.
+forget_watchers(StreamId, #state{stream_handlers = Handlers, answered_unread = Answered} = State) ->
+    Handlers1 =
+        case maps:take(StreamId, Handlers) of
+            {{_Pid, MonRef}, Rest} ->
+                erlang:demonitor(MonRef, [flush]),
+                Rest;
+            error ->
+                Handlers
+        end,
+    Answered1 = maps:filter(
+        fun
+            (Ref, StreamId1) when StreamId1 =:= StreamId ->
+                erlang:demonitor(Ref, [flush]),
+                false;
+            (_Ref, _StreamId1) ->
+                true
+        end,
+        Answered
+    ),
+    State#state{stream_handlers = Handlers1, answered_unread = Answered1}.
 
 %% Only what gets buffered is charged: a client hands each piece to its
 %% owner, and so does a server once the stream has a handler.

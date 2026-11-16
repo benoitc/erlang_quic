@@ -34,7 +34,9 @@
     consume_on_a_finished_stream_is_an_error/1,
     consume_on_a_reset_stream_is_an_error/1,
     consume_on_an_auto_stream_is_a_no_op/1,
-    a_refused_writer_is_told_when_to_send_again/1
+    a_refused_writer_is_told_when_to_send_again/1,
+    headers_larger_than_the_window_complete/1,
+    trailers_larger_than_the_window_complete/1
 ]).
 
 -define(KIB, 1024).
@@ -71,7 +73,9 @@ all() ->
         consume_on_a_finished_stream_is_an_error,
         consume_on_a_reset_stream_is_an_error,
         consume_on_an_auto_stream_is_a_no_op,
-        a_refused_writer_is_told_when_to_send_again
+        a_refused_writer_is_told_when_to_send_again,
+        headers_larger_than_the_window_complete,
+        trailers_larger_than_the_window_complete
     ].
 
 init_per_suite(Config) ->
@@ -375,9 +379,46 @@ a_refused_writer_is_told_when_to_send_again(Config) ->
         ok = quic_h3:close(Conn)
     end).
 
+%% A held stream grants nothing until a handler registers, and none can
+%% before the HEADERS frame is whole: its bytes are framing, credited as
+%% they arrive, so a header section larger than the stream window still
+%% completes.
+headers_larger_than_the_window_complete(Config) ->
+    with_server(Config, tiny_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        Big = [{<<"x-big">>, big_value()} | headers(<<"GET">>, <<"/bytes/100">>)],
+        {ok, StreamId} = quic_h3:request(Conn, lists:reverse(Big)),
+        ?assertEqual({200, body(100)}, response(Conn, StreamId)),
+        ok = quic_h3:close(Conn)
+    end).
+
+%% The same for trailers larger than the window, after a body the handler
+%% has consumed.
+trailers_larger_than_the_window_complete(Config) ->
+    with_server(Config, tiny_window(), fun(Port) ->
+        Conn = connect(Port, #{}),
+        {ok, StreamId} = quic_h3:request(
+            Conn, headers(<<"POST">>, <<"/upload/consume">>), #{end_stream => false}
+        ),
+        ok = quic_h3:send_data(Conn, StreamId, <<"body">>, false),
+        ok = quic_h3:send_trailers(Conn, StreamId, [{<<"x-big">>, big_value()}]),
+        ?assertEqual(
+            {200, integer_to_binary(erlang:phash2(<<"body">>))}, response(Conn, StreamId)
+        ),
+        ok = quic_h3:close(Conn)
+    end).
+
 %%====================================================================
 %% Server
 %%====================================================================
+
+%% A stream window smaller than one header section.
+tiny_window() ->
+    #{max_stream_data_bidi_remote => ?KIB, max_data => 16 * ?MIB, max_receive_window => 16 * ?MIB}.
+
+%% A field value QPACK cannot compress below the tiny window.
+big_value() ->
+    base64:encode(crypto:strong_rand_bytes(3 * ?KIB)).
 
 %% Windows small next to the transfers, so a stall is unmistakable.
 small_window() ->

@@ -97,7 +97,7 @@
     send_data/5,
     send_data_async/4,
     set_stream_flow_control/3,
-    hold_peer_bidi_streams/1,
+    hold_peer_streams/1,
     stream_consumed/3,
     stream_flow_control/3,
     consume/3,
@@ -378,13 +378,13 @@ send_data_async(Conn, StreamId, Data, Fin) ->
 set_stream_flow_control(Conn, StreamId, Mode) ->
     gen_statem:cast(Conn, {set_stream_flow_control, StreamId, Mode}).
 
-%% @private From now on a bidirectional stream the peer opens starts as
-%% `{manual, 0}': it keeps its initial window until its reader picks a
-%% mode with set_stream_flow_control/3. Its bytes still earn connection
-%% credit as delivered until then. Used by quic_h3.
--spec hold_peer_bidi_streams(pid()) -> ok.
-hold_peer_bidi_streams(Conn) ->
-    gen_statem:cast(Conn, hold_peer_bidi_streams).
+%% @private From now on a stream the peer opens starts as `{manual, 0}':
+%% it keeps its initial window until its reader picks a mode with
+%% set_stream_flow_control/3. Its bytes still earn connection credit as
+%% delivered until then. Used by quic_h3.
+-spec hold_peer_streams(pid()) -> ok.
+hold_peer_streams(Conn) ->
+    gen_statem:cast(Conn, hold_peer_streams).
 
 %% @private After a send_queue_full refusal: send the owner
 %% `{quic, Conn, send_ready}' once, when the send queue is below half its
@@ -2405,8 +2405,8 @@ closed(_EventType, _EventContent, State) ->
 
 handle_common_event(cast, notify_send_ready, _StateName, State) ->
     {keep_state, maybe_send_ready(State#state{send_ready_wanted = true})};
-handle_common_event(cast, hold_peer_bidi_streams, _StateName, State) ->
-    {keep_state, State#state{hold_peer_bidi = true}};
+handle_common_event(cast, hold_peer_streams, _StateName, State) ->
+    {keep_state, State#state{hold_peer_streams = true}};
 handle_common_event(cast, {set_stream_flow_control, StreamId, Mode}, StateName, State) ->
     {keep_state, flush_after_grant(StateName, set_recv_flow(StreamId, Mode, StateName, State))};
 handle_common_event(cast, {stream_consumed, StreamId, Offset}, StateName, State) ->
@@ -8995,7 +8995,7 @@ run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
 %% the same datagram open streams.
 held_by_handler(State) ->
     receive
-        {'$gen_cast', hold_peer_bidi_streams} -> State#state{hold_peer_bidi = true}
+        {'$gen_cast', hold_peer_streams} -> State#state{hold_peer_streams = true}
     after 0 -> State
     end.
 
@@ -10919,13 +10919,13 @@ new_peer_stream(StreamId, State) ->
         recv_max_data = get_local_recv_limit(Kind, State),
         recv_fin = false,
         recv_buffer = gb_trees:empty(),
-        recv_flow = peer_recv_flow(Kind, State),
+        recv_flow = peer_recv_flow(State),
         final_size = undefined
     }.
 
 %% RFC 9000 Section 4.1: a held stream earns credit only as its reader consumes.
-peer_recv_flow(bidi_peer_initiated, #state{hold_peer_bidi = true}) -> manual;
-peer_recv_flow(_Kind, _State) -> auto.
+peer_recv_flow(#state{hold_peer_streams = true}) -> manual;
+peer_recv_flow(_State) -> auto.
 
 peer_send_limit(uni_peer_initiated, _State) -> 0;
 peer_send_limit(Kind, State) -> get_peer_stream_limit(Kind, State).

@@ -271,8 +271,15 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
   with a non-negative `SignalType` varint the stream is pre-claimed and
   inbound bytes route as `{stream_type_data, bidi, ...}` owner messages
   instead of HTTP/3 request frames (e.g. WebTransport's `0x41`)
+- `quic_h3:open_bidi_stream/3` - The same with
+  `#{flow_control => manual}`: the peer may send one stream window past
+  what the owner has consumed
 - `stream_type_handler` option on `start_server/3` claims peer-initiated
-  uni / bidi streams whose first varint matches a caller-supplied filter
+  uni / bidi streams whose first varint matches a caller-supplied filter;
+  returning `{claim, #{flow_control => manual}}` gives the stream manual
+  receive credit from the moment it is claimed
+- `quic_h3:consume/3` - Return credit on a manually claimed stream, counting
+  the payload of its `stream_type_data` events
 - Owner events: `{stream_type_open, Direction, StreamId, VarintType}`,
   `{stream_type_data, Direction, StreamId, Data, Fin}`,
   `{stream_type_closed, Direction, StreamId}`,
@@ -345,7 +352,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `alpn` - ALPN protocols list
 - `verify` - Server certificate verification on the client (default: `true`; verifies the CertificateVerify signature, the chain, and the hostname). The hostname check follows RFC 9525: it matches the subjectAltName only, never the subject CN, and a wildcard SAN such as `*.example.com` matches one leftmost label, so `host.example.com` but not `example.com` or `a.b.example.com`. Set `false` to accept any certificate, e.g. a self-signed test server.
 - `cacerts` - Trust anchors for chain validation, as a list of DER-encoded certificates. On a client, for the server's chain (default: the operating system trust store). On a server that asks for client certificates, for the client's chain: required there, with `cacertfile` as the alternative, and the start fails with `{error, client_auth_needs_cacerts}` without either
-- `require_client_cert` - On a server: ask the client for a certificate and refuse one that sends none (`certificate_required`), whatever `verify` says (default: `false`). A server with `verify => true` (or `verify_peer`) alone asks for a certificate, validates one if sent, and still accepts a client without one. `quic:peercert/1` returns the client's DER leaf once validated
+- `require_client_cert` - On a server: ask the client for a certificate and refuse one that sends none (`certificate_required`), whatever `verify` says (default: `false`). A server with `verify => true` (or `verify_peer`) alone asks for a certificate, validates one if sent, and still accepts a client without one. `quic:peercert/1` returns the client's DER leaf once validated. A client certificate with an Extended Key Usage must list `clientAuth`, and one with a Key Usage must set `digitalSignature`
 - `cacertfile` - Path to a PEM file holding those anchors, read once when the connection or server starts. Ignored when `cacerts` is given; an unreadable file, or one with no certificate in it, fails the call
 - `preferred_ipv4` - Server preferred IPv4 address
 - `preferred_ipv6` - Server preferred IPv6 address

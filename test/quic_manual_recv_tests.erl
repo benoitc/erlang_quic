@@ -62,7 +62,7 @@ back_to_auto_grants_at_once_test() ->
     ?assertEqual(2 * ?W, Max).
 
 %%====================================================================
-%% Held peer streams (quic_h3 calls hold_peer_bidi_streams/1)
+%% Held peer streams (quic_h3 calls hold_peer_streams/1)
 %%====================================================================
 
 %% Server-initiated, as seen by the client the test state plays.
@@ -117,12 +117,10 @@ held_stream_switched_to_auto_is_released_test() ->
     ?assertMatch(#{flow := auto, max := 1000 + ?W}, ?S:stream_recv(S2, ?PEER_BIDI)),
     ?assertNot(?S:manual_tracked(S2, ?PEER_BIDI)).
 
-%% Unidirectional streams (HTTP/3 control and QPACK) are not held.
-uni_stream_is_not_held_test() ->
-    S = deliver_on(held(), ?PEER_UNI, 0, 1000),
-    #{flow := Flow, max := Max} = ?S:stream_recv(S, ?PEER_UNI),
-    ?assertEqual(auto, Flow),
-    ?assert(Max > ?W).
+%% A unidirectional stream is held as well, until quic_h3 has read its type.
+uni_stream_is_held_test() ->
+    S = deliver_on(held(), ?PEER_UNI, 0, ?W),
+    ?assertMatch(#{flow := manual, max := ?W, consumed := 0}, ?S:stream_recv(S, ?PEER_UNI)).
 
 %% Streams this side opened are not held.
 local_stream_is_not_held_test() ->
@@ -159,7 +157,7 @@ hold_asked_by_the_alpn_handler_applies_at_once_test() ->
         end
     end),
     Accept = fun(Conn, <<"h3">>) ->
-        ok = quic_connection:hold_peer_bidi_streams(Conn),
+        ok = quic_connection:hold_peer_streams(Conn),
         {ok, Owner}
     end,
     try
@@ -169,7 +167,7 @@ hold_asked_by_the_alpn_handler_applies_at_once_test() ->
     after
         Owner ! stop,
         receive
-            {'$gen_cast', hold_peer_bidi_streams} -> ok
+            {'$gen_cast', hold_peer_streams} -> ok
         after 0 -> ok
         end
     end.
@@ -183,7 +181,7 @@ peer() ->
 
 held() ->
     {keep_state, S} = quic_connection:handle_common_event(
-        cast, hold_peer_bidi_streams, connected, peer()
+        cast, hold_peer_streams, connected, peer()
     ),
     S.
 

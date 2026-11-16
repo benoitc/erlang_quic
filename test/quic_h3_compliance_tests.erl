@@ -2310,6 +2310,89 @@ credit_follows_the_consumed_payload_test() ->
         stop_conn(Conn)
     end.
 
+%% A frame still arriving is framing: its bytes are credited as they come,
+%% so a HEADERS frame larger than the stream window can complete.
+partial_frame_is_credited_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        Frame = quic_h3_frame:encode_headers(binary:copy(<<"h">>, 3000)),
+        <<Part:1000/binary, _/binary>> = Frame,
+        {ok, _} = quic_h3_connection:handle_stream_data(0, Part, false, manual_stream_state(Conn)),
+        ?assertEqual([1000], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
+%% Bytes held behind a field section waiting on the encoder stream can be
+%% body, so they are not credited before they are parsed.
+tail_behind_a_blocked_section_is_not_credited_test() ->
+    Conn = cast_capture_conn(self()),
+    try
+        State = make_test_state(#{
+            role => server,
+            quic_conn => Conn,
+            streams => #{
+                0 => #h3_stream{
+                    id = 0,
+                    type = request,
+                    state = open,
+                    frame_state = expecting_data,
+                    flow = manual
+                }
+            },
+            stream_handlers => #{0 => {self(), make_ref()}},
+            blocked_streams => #{0 => {1, <<>>, false}}
+        }),
+        Data = quic_h3_frame:encode_data(<<"body">>),
+        {ok, _} = quic_h3_connection:handle_stream_data(0, Data, false, State),
+        ?assertEqual([], consumed_offsets())
+    after
+        stop_conn(Conn)
+    end.
+
+%% A finished stream takes its handler entry and monitor with it, so a
+%% handler that stays registered does not grow the connection per request.
+finished_streams_drop_their_handler_test() ->
+    Conn = cast_capture_conn(self()),
+    Handler = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    try
+        Ids = [4 * N || N <- lists:seq(0, 99)],
+        State0 = make_test_state(#{
+            role => server,
+            quic_conn => Conn,
+            streams => maps:from_list([
+                {Id, #h3_stream{
+                    id = Id, type = request, state = half_closed_local, frame_state = expecting_data
+                }}
+             || Id <- Ids
+            ]),
+            stream_handlers => maps:from_list([
+                {Id, {Handler, erlang:monitor(process, Handler)}}
+             || Id <- Ids
+            ])
+        }),
+        Fin = quic_h3_frame:encode_data(<<"done">>),
+        State = lists:foldl(
+            fun(Id, S) ->
+                {ok, S1} = quic_h3_connection:handle_stream_data(Id, Fin, true, S),
+                S1
+            end,
+            State0,
+            Ids
+        ),
+        ?assertEqual(#{}, quic_h3_connection:test_stream_handlers(State)),
+        ?assertEqual(#{}, quic_h3_connection:test_streams(State)),
+        {monitors, Monitors} = process_info(self(), monitors),
+        ?assertNot(lists:member({process, Handler}, Monitors))
+    after
+        Handler ! stop,
+        stop_conn(Conn)
+    end.
+
 %% Every state answers the per-stream calls; none leaves the caller
 %% waiting on a call it has no clause for.
 stream_calls_are_answered_in_every_state_test_() ->
@@ -3371,6 +3454,85 @@ open_bidi_stream_undefined_passthrough_test() ->
     receive
         {quic_h3, _, {stream_type_open, _, _, _}} -> ?assert(false)
     after 50 -> ok
+    end.
+
+%% A claim sets the stream's credit before its data is forwarded; with
+%% `manual' the stream type is credited, counted as the bytes read, here
+%% a non-minimal 4-byte varint.
+manual_uni_claim_credits_the_type_it_read_test() ->
+    Claim = fun(uni, _StreamId, 16#54) -> {claim, #{flow_control => manual}} end,
+    State0 = make_test_state(#{
+        role => server, stream_type_handler => Claim, quic_conn => self()
+    }),
+    StreamId = 2,
+    State1 = mark_uni_stream_open(StreamId, State0),
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(
+        StreamId, <<16#80, 0, 0, 16#54, 0, "hello">>, false, State1
+    ),
+    ?assertEqual(
+        [
+            {'$gen_cast', {set_stream_flow_control, StreamId, {manual, 4}}},
+            {quic_h3, self(), {stream_type_open, uni, StreamId, 16#54}},
+            {quic_h3, self(), {stream_type_data, uni, StreamId, <<0, "hello">>, false}}
+        ],
+        drain_mailbox()
+    ).
+
+manual_bidi_claim_credits_the_type_it_read_test() ->
+    ?assertEqual({manual, 2}, bidi_claim_flow({claim, #{flow_control => manual}})).
+
+%% `claim' and an auto claim keep credit following delivery.
+auto_bidi_claim_is_released_test() ->
+    ?assertEqual(auto, bidi_claim_flow(claim)),
+    ?assertEqual(auto, bidi_claim_flow({claim, #{flow_control => auto}})),
+    ?assertEqual(auto, bidi_claim_flow({claim, #{}})).
+
+%% A claim with a flow it does not know ignores the stream: it is read as
+%% a request stream.
+unknown_claim_flow_ignores_the_stream_test() ->
+    Handler = fun(_, _, _) -> {claim, #{flow_control => x}} end,
+    State0 = make_test_state(#{role => server, stream_type_handler => Handler}),
+    {ok, State1} = quic_h3_connection:handle_new_stream(0, bidirectional, State0),
+    flush_mailbox(),
+    {ok, State2} = quic_h3_connection:handle_stream_data(0, <<16#40, 16#41>>, false, State1),
+    ?assertEqual([], drain_mailbox()),
+    ?assert(maps:is_key(0, quic_h3_connection:test_streams(State2))).
+
+bidi_claim_flow(Result) ->
+    State0 = make_test_state(#{
+        role => server, stream_type_handler => fun(_, _, _) -> Result end, quic_conn => self()
+    }),
+    {ok, State1} = quic_h3_connection:handle_new_stream(0, bidirectional, State0),
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, <<16#40, 16#41, "x">>, false, State1),
+    [Flow] = [F || {'$gen_cast', {set_stream_flow_control, 0, F}} <- drain_mailbox()],
+    Flow.
+
+%% QUIC holds a peer's uni stream until its type is read: every stream
+%% that is not claimed is then released, known or not.
+uni_streams_are_released_once_their_type_is_read_test() ->
+    lists:foreach(
+        fun({StreamId, Bytes}) ->
+            State0 = make_test_state(#{role => server, quic_conn => self()}),
+            State1 = mark_uni_stream_open(StreamId, State0),
+            flush_mailbox(),
+            {ok, _} = quic_h3_connection:handle_stream_data(StreamId, Bytes, false, State1),
+            Release = {'$gen_cast', {set_stream_flow_control, StreamId, auto}},
+            ?assert(lists:member(Release, drain_mailbox()))
+        end,
+        [
+            {2, <<?H3_STREAM_CONTROL>>},
+            {6, <<?H3_STREAM_QPACK_ENCODER>>},
+            {10, <<?H3_STREAM_QPACK_DECODER>>},
+            {14, <<16#21, "ignored">>}
+        ]
+    ).
+
+drain_mailbox() ->
+    receive
+        M -> [M | drain_mailbox()]
+    after 0 -> []
     end.
 
 flush_mailbox() ->
