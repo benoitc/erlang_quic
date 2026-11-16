@@ -2,6 +2,46 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `fullsweep_after` connection option, passed to the connection process
+  as its spawn option of the same name. Unset, the VM default applies as
+  before. `0` keeps the heap of a mostly idle connection close to its
+  live data between hibernations, and costs collector time on a busy
+  one.
+
+### Changed
+- A connection uses less CPU and memory, idle ones most of all.
+- Keep-alive sends its PING once the connection has been idle for seven
+  eighths of `keep_alive_interval`, instead of waking at the interval
+  and again a round trip later. When both ends use the same interval, as
+  with `auto`, only the client sends PINGs; the server takes over if the
+  client stops (RFC 9000 Section 10.1.2).
+- In a request-response exchange the PTO timer is no longer cancelled
+  and started again on every round trip: when everything in flight is
+  acknowledged twice within 100 ms the timer stays armed for the next
+  send. Probes go out at the same times as before (RFC 9002 Section
+  6.2.1 and Appendix A.8).
+- The `disconnect_timeout` check no longer wakes an established
+  connection every `disconnect_timeout` when nothing is waiting for an
+  acknowledgement. It runs during the handshake as before, and from the
+  first probe timeout of data in flight, so an unresponsive peer is
+  still given up on at the same time.
+- A connection lets go of its handshake state once the handshake is
+  confirmed: the TLS transcript, the handshake and master secrets, the
+  key-exchange private key, its copy of the signing key and the cipher
+  contexts of the discarded Initial and Handshake keys (RFC 9846 Section
+  7.1, RFC 9001 Section 4.9). A client keeps only the resumption secret
+  its session tickets need.
+- qlog reports a run of PADDING frames as a single `padding` frame.
+
+### Fixed
+- No timer of a connection was ever cancelled: the PTO, idle,
+  keep-alive, pacing, disconnect and PMTU timers were "cancelled"
+  through a reference that was not the timer, so each ran to its end and
+  woke the connection for nothing. They are now stopped when cancelled.
+
 ## [3.1.0] - 2026-11-15
 
 ### Added
@@ -74,11 +114,6 @@ Upgrading from 2.x:
   immediate ACK, so loss recovery, path MTU discovery and migration are
   not slowed by the peer's ACK delay. Until a peer sends a request,
   acknowledgments go out as before.
-- `fullsweep_after` connection option, passed to the connection process
-  as its spawn option of the same name. Unset, the VM default applies as
-  before. `0` keeps the heap of a mostly idle connection close to its
-  live data between hibernations, and costs collector time on a busy
-  one.
 
 ### Changed
 - Breaking: the `stream_cipher` and `block_cipher` QUIC-LB algorithms
@@ -134,29 +169,6 @@ Upgrading from 2.x:
   answer before the handshake completes, from what is known of the peer
   so far: for a client sending 0-RTT, the parameters remembered with the
   session ticket. HTTP/3 uses them to advertise datagrams in 0-RTT.
-- A connection uses less CPU and memory, idle ones most of all.
-- Keep-alive sends its PING once the connection has been idle for seven
-  eighths of `keep_alive_interval`, instead of waking at the interval
-  and again a round trip later. When both ends use the same interval, as
-  with `auto`, only the client sends PINGs; the server takes over if the
-  client stops (RFC 9000 Section 10.1.2).
-- In a request-response exchange the PTO timer is no longer cancelled
-  and started again on every round trip: when everything in flight is
-  acknowledged twice within 100 ms the timer stays armed for the next
-  send. Probes go out at the same times as before (RFC 9002 Section
-  6.2.1 and Appendix A.8).
-- The `disconnect_timeout` check no longer wakes an established
-  connection every `disconnect_timeout` when nothing is waiting for an
-  acknowledgement. It runs during the handshake as before, and from the
-  first probe timeout of data in flight, so an unresponsive peer is
-  still given up on at the same time.
-- A connection lets go of its handshake state once the handshake is
-  confirmed: the TLS transcript, the handshake and master secrets, the
-  key-exchange private key, its copy of the signing key and the cipher
-  contexts of the discarded Initial and Handshake keys (RFC 9846 Section
-  7.1, RFC 9001 Section 4.9). A client keeps only the resumption secret
-  its session tickets need.
-- qlog reports a run of PADDING frames as a single `padding` frame.
 
 ### Fixed
 - An HTTP/3 connection kept an entry and a monitor for every finished
@@ -342,10 +354,6 @@ Upgrading from 2.x:
   asked to stop sending the rest of the body with `H3_NO_ERROR` and what
   was buffered for it is dropped (RFC 9114 Section 4.1). Such a body
   used to be buffered up to `max_buffered_body` and its stream reset.
-- No timer of a connection was ever cancelled: the PTO, idle,
-  keep-alive, pacing, disconnect and PMTU timers were "cancelled"
-  through a reference that was not the timer, so each ran to its end and
-  woke the connection for nothing. They are now stopped when cancelled.
 
 ## [2.7.0] - 2026-11-13
 
