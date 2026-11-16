@@ -18,11 +18,11 @@ All notable changes to this project will be documented in this file.
   and again a round trip later. When both ends use the same interval, as
   with `auto`, only the client sends PINGs; the server takes over if the
   client stops (RFC 9000 Section 10.1.2).
-- In a request-response exchange the PTO timer is no longer cancelled
-  and started again on every round trip: when everything in flight is
-  acknowledged twice within 100 ms the timer stays armed for the next
-  send. Probes go out at the same times as before (RFC 9002 Section
-  6.2.1 and Appendix A.8).
+- The PTO timer is no longer cancelled and started again on every round
+  trip of a request-response exchange: once everything in flight is
+  acknowledged, the armed timer stays for the next send and does
+  nothing if it fires first. Probes go out at the same times as before
+  (RFC 9002 Section 6.2.1 and Appendix A.8).
 - The `disconnect_timeout` check no longer wakes an established
   connection every `disconnect_timeout` when nothing is waiting for an
   acknowledgement. It runs during the handshake as before, and from the
