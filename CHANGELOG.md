@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.1.2] - 2026-11-17
 
 ### Fixed
 - 0-RTT keys were kept for the life of the connection. A client now

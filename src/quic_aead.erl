@@ -262,6 +262,11 @@ compute_hp_mask(chacha20_poly1305, HP, Sample) ->
     Zeros = <<0, 0, 0, 0, 0>>,
     crypto:crypto_one_time(chacha20, HP, <<Counter:32/little, Nonce/binary>>, Zeros, true).
 
+%% ChaCha20-Poly1305 header protection has no ECB step (RFC 9001
+%% Section 5.4.4) and never touches the ECB cache below: it runs
+%% crypto_one_time per mask. Only the AES suites reach ecb_ctx/2, so
+%% a cipher argument here is always aes_128_ecb or aes_256_ecb.
+
 %% Header protection runs on every packet in both directions, and
 %% crypto:crypto_one_time/4 re-runs the key schedule on each call: a
 %% 16-byte ECB block costs 0.77us against 0.88us for a 1200-byte AEAD
