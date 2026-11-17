@@ -596,6 +596,13 @@
     %% Pacing (RFC 9002 Section 7.7)
     pacing_timer :: reference() | undefined,
 
+    %% 0-RTT key disposal (RFC 9001 Section 4.9.3): a server retains
+    %% its 0-RTT keys for three PTOs after receiving a 1-RTT packet,
+    %% then drops them. The deadline never moves; an early-delivered
+    %% timer message re-arms for the remainder.
+    early_keys_discard_timer :: reference() | undefined,
+    early_keys_discard_deadline = undefined :: integer() | undefined,
+
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
     send_queue = {

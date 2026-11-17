@@ -1386,6 +1386,7 @@ terminate(
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
         ack_timer = AckTimer,
+        early_keys_discard_timer = EarlyKeysDiscardTimer,
         cfg = #conn_cfg{
             send_socket = SendSocket,
             role = Role,
@@ -1439,6 +1440,7 @@ terminate(
     cancel_timer(KeepAliveTimer),
     cancel_timer(PacingTimer),
     cancel_timer(AckTimer),
+    cancel_timer(EarlyKeysDiscardTimer),
     %% Close dedicated send socket for server connections (SO_REUSEPORT socket)
     case SendSocket of
         undefined -> ok;
@@ -2538,6 +2540,39 @@ handle_common_event(
     {keep_state, NewState};
 handle_common_event(info, {timeout, _StaleRef, pacing_timeout}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
+    {keep_state, State};
+%% RFC 9001 Section 4.9.3: the 0-RTT disposal window closed (or claims
+%% to - the deadline is re-checked, since a timer message can arrive
+%% early). Any state name: keys can be dropped in idle through closed.
+handle_common_event(
+    info,
+    {timeout, Ref, early_keys_discard_timeout},
+    StateName,
+    #state{early_keys_discard_timer = Ref} = State
+) when
+    Ref =/= undefined andalso is_integer(State#state.early_keys_discard_deadline)
+->
+    Now = erlang:monotonic_time(millisecond),
+    Deadline = State#state.early_keys_discard_deadline,
+    case Now >= Deadline of
+        true ->
+            {keep_state,
+                discard_early_keys(State#state{
+                    early_keys_discard_timer = undefined,
+                    early_keys_discard_deadline = undefined
+                })};
+        false ->
+            %% Delivered early (timer-wheel granularity, or a test
+            %% delivering the message by hand): re-arm for the
+            %% remainder, deadline unchanged.
+            _ = cancel_timer(Ref),
+            Delay = max(0, Deadline - Now),
+            {keep_state, State#state{
+                early_keys_discard_timer = start_timer(Delay, early_keys_discard_timeout)
+            }}
+    end;
+handle_common_event(info, {timeout, _StaleRef, early_keys_discard_timeout}, _StateName, State) ->
+    %% Stale disposal timer (ref doesn't match)
     {keep_state, State};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
 handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
@@ -4845,6 +4880,38 @@ server_discard_initial(handshake, #state{cfg = #conn_cfg{role = server}} = State
 server_discard_initial(_Type, State) ->
     State.
 
+%% RFC 9001 Section 4.9.3: after receiving a 1-RTT packet a server MUST
+%% discard its 0-RTT keys within a short time, three PTOs recommended.
+%% Packet reordering can deliver a 0-RTT packet after a 1-RTT one, so
+%% the keys are retained for the window and dropped when it closes.
+%% Runs after the packet decrypted and its frames processed, which is
+%% the receive event the section names. Arms once; the deadline never
+%% moves, and the timer is re-armed for the remainder when its message
+%% arrives early.
+server_schedule_0rtt_discard(
+    app,
+    #state{
+        cfg = #conn_cfg{role = server},
+        early_keys_discard_timer = undefined,
+        early_keys_discard_deadline = undefined,
+        hs = #hs{early_keys = {_, _}},
+        loss_state = LossState
+    } = State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    Delay = early_keys_discard_delay(LossState),
+    State#state{
+        early_keys_discard_deadline = Now + Delay,
+        early_keys_discard_timer = start_timer(Delay, early_keys_discard_timeout)
+    };
+server_schedule_0rtt_discard(_Type, State) ->
+    State.
+
+%% Three times the application-space PTO (RFC 9001 Section 4.9.3), the
+%% same measure the drain timer uses (RFC 9000 Section 10.2).
+early_keys_discard_delay(undefined) -> 3000;
+early_keys_discard_delay(LossState) -> 3 * quic_loss:get_pto(LossState, app).
+
 %% Batched variant of handle_packet/2: same anti-amplification
 %% accounting per datagram, one drain per batch. The batched delivery
 %% path previously skipped accounting entirely, so a server's amp budget
@@ -5457,8 +5524,11 @@ handle_packet_loop(Data, State) ->
             ?QLOG_EMIT_FRAMES_PROCESSED((NewState#state.cfg)#conn_cfg.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
-            State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
+            State2 = server_schedule_0rtt_discard(
+                Type,
+                server_discard_initial(
+                    Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
+                )
             ),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State2);
@@ -5472,8 +5542,11 @@ handle_packet_loop(Data, State) ->
             bump(?C_PACKETS_RECEIVED, 1, NewState),
             State1 = process_frames_noreenbl(Type, Frames, NewState),
             ?QLOG_EMIT_FRAMES_PROCESSED((State1#state.cfg)#conn_cfg.qlog_ctx, Frames),
-            State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
+            State2 = server_schedule_0rtt_discard(
+                Type,
+                server_discard_initial(
+                    Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
+                )
             ),
             handle_packet_loop(RemainingData, State2);
         {duplicate, RemainingData} ->
@@ -14617,6 +14690,11 @@ pto_due(#state{pto_scheduled_at = Deadline}) ->
 %% Helper to cancel a timer reference
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref, [{async, true}, {info, false}]).
+
+%% One-shot connection timer keyed by its timeout message. The returned
+%% reference is both the handle for cancel_timer/1 and the ref the
+%% {timeout, Ref, Message} event carries.
+start_timer(Delay, Message) -> erlang:start_timer(Delay, self(), Message).
 
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
