@@ -214,20 +214,40 @@ with_open_ctx(Cipher, Key, HP, LargestRecv, Fun) ->
     end.
 
 %% @doc Drop the cached contexts of keys that are being discarded, so
-%% the key schedules go with the keys (RFC 9001 Section 4.9).
--spec discard({#crypto_keys{}, #crypto_keys{}} | undefined) -> ok.
+%% the key schedules go with the keys (RFC 9001 Section 4.9). Takes
+%% either the two key records of a discarded packet-number space, one
+%% key record (0-RTT holds a single pair of directions in one record
+%% set), or undefined. Erases both the NIF-path entries and, through
+%% quic_aead:forget_ctx/4, the OTP-path cipher contexts the default
+%% implementation caches; see quic_aead:aead_ctx/3 and ecb_ctx/2.
+-spec discard(
+    [{#crypto_keys{}, #crypto_keys{}} | #crypto_keys{}]
+    | {#crypto_keys{}, #crypto_keys{}}
+    | #crypto_keys{}
+    | undefined
+) -> ok.
 discard({#crypto_keys{} = K1, #crypto_keys{} = K2}) ->
+    discard([K1, K2]);
+discard(#crypto_keys{} = Key) ->
+    discard([Key]);
+discard(undefined) ->
+    ok;
+discard(Keys) when is_list(Keys) ->
     Gone = lists:append([
         [{qc_enc, C, key_id(Key)}, {qc_dec, C, key_id(Key)}, {qc_hp, hp_cipher(C), key_id(HP)}]
-     || #crypto_keys{cipher = C, key = Key, hp = HP} <- [K1, K2]
+     || #crypto_keys{cipher = C, key = Key, hp = HP} <- Keys
     ]),
     lists:foreach(fun erlang:erase/1, Gone),
     case erlang:get(qc_ctx_live) of
         undefined -> ok;
         Live -> erlang:put(qc_ctx_live, Live -- Gone)
     end,
-    ok;
-discard(undefined) ->
+    lists:foreach(
+        fun(#crypto_keys{cipher = C, key = Key, hp = HP}) ->
+            quic_aead:forget_ctx(C, Key, hp_cipher(C), HP)
+        end,
+        Keys
+    ),
     ok.
 
 %%====================================================================
