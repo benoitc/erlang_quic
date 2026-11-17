@@ -3488,6 +3488,20 @@ discard_initial(State) ->
     end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
 
+%% RFC 9001 Section 4.9.3: a client discards its 0-RTT keys as soon as
+%% it installs 1-RTT keys, as they have no use from that moment (0-RTT
+%% and 1-RTT share the application packet number space and nothing is
+%% sent as 0-RTT afterwards, Section 5.6). Drops every
+%% connection-state reference to the keys and the early secret; the
+%% immutable binaries are then unreferenced and left to the collector.
+%% A no-op when no 0-RTT was offered, so every 1-RTT install can call
+%% it.
+discard_early_keys(#state{hs = #hs{early_keys = undefined}} = State) ->
+    State;
+discard_early_keys(#state{hs = #hs{early_keys = {Keys, _Secret}} = Hs} = State) ->
+    quic_aead_ctx:discard(Keys),
+    State#state{hs = Hs#hs{early_keys = undefined}}.
+
 %% Drop a packet number space from both byte counters at once. They are
 %% tracked separately, so subtracting from one and not the other leaves
 %% the congestion window charged for packets that no longer exist.
@@ -8269,7 +8283,7 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = State#state{
+                    State1 = discard_early_keys(State#state{
                         app_keys = {ClientAppKeys, ServerAppKeys},
                         key_state = KeyState,
                         hs = (State#state.hs)#hs{
@@ -8278,7 +8292,7 @@ process_tls_message(
                             tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                             master_secret = MasterSecret
                         }
-                    },
+                    }),
 
                     %% Send client Certificate(+CertificateVerify)+Finished,
                     %% segmented so no datagram exceeds max_udp_payload_size.
@@ -11857,7 +11871,9 @@ finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
         data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
     };
 finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
-    State = discard_zero_rtt_packets(State0),
+    %% The server rejected 0-RTT: the early keys have no further use,
+    %% and nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2).
+    State = discard_early_keys(discard_zero_rtt_packets(State0)),
     case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;
         RejectedIds -> reset_zero_rtt_streams(RejectedIds, State)
