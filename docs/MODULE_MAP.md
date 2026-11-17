@@ -1,18 +1,18 @@
 # Module Map
 
-Where the code lives and what to read first. The source is 68 modules and about 47,000 lines, and roughly a quarter of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
+Where the code lives and what to read first. The source is 69 modules and about 57,000 lines, and roughly a third of it is one module, so reading in file order does not work. Read this when you are new to the tree, or when you know what you want to change but not where it lives. [docs/DESIGN.md](DESIGN.md) covers how the protocol works; this page covers where it is.
 
 ## Read these seven first
 
 In this order, they give you the whole path of a connection without opening the big module:
 
-1. `src/quic.erl` (976 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
-2. `src/quic_listener.erl` (1,411) accepts connections. Its header is the clearest writing in the tree on connection ownership and the handover race.
+1. `src/quic.erl` (1,188 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
+2. `src/quic_listener.erl` (1,712) accepts connections. Its header is the clearest writing in the tree on connection ownership and the handover race.
 3. `src/quic_packet.erl` (405) and `src/quic_frame.erl` (443) are the wire format, with the header diagrams in the packet module.
 4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (401) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (12,691) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (17,825) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
