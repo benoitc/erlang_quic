@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.1.1] - 2026-11-17
 
 ### Added
 - `fullsweep_after` connection option, passed to the connection process
