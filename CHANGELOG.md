@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- 0-RTT keys were kept for the life of the connection. A client now
+  drops them when it installs 1-RTT keys and when the server rejects
+  0-RTT; a server keeps them no longer than three probe timeouts
+  after receiving a 1-RTT packet, as reordered 0-RTT packets may
+  still be in flight (RFC 9001 Section 4.9.3).
+- Discarded Initial, Handshake and key-update keys left their cipher
+  contexts in the connection process unless the optional crypto NIF
+  was in use; they now go with the keys. With a negotiated cipher
+  other than AES-128-GCM the always-AES-128 Initial contexts were
+  never evicted at all (RFC 9001 Sections 4.9.1 and 4.9.2).
+- The previous generation of a key update was held until the next
+  update replaced it, however long that takes. It is now dropped
+  three probe timeouts after the first packet protected with the new
+  keys arrives; the header-protection context the live keys share
+  stays (RFC 9001 Section 6.5). Waiting three probe timeouts before
+  *initiating* the next key update, the section's other
+  recommendation, is tracked in issue #569 and not part of this
+  change.
+
 ## [3.1.1] - 2026-11-17
 
 ### Added
