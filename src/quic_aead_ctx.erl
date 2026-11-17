@@ -21,7 +21,8 @@
     open_packet/8,
     open_run/8,
     key_id/1,
-    discard/1
+    discard/1,
+    discard_aead/1
 ]).
 
 -include("quic.hrl").
@@ -237,17 +238,48 @@ discard(Keys) when is_list(Keys) ->
         [{qc_enc, C, key_id(Key)}, {qc_dec, C, key_id(Key)}, {qc_hp, hp_cipher(C), key_id(HP)}]
      || #crypto_keys{cipher = C, key = Key, hp = HP} <- Keys
     ]),
-    lists:foreach(fun erlang:erase/1, Gone),
-    case erlang:get(qc_ctx_live) of
-        undefined -> ok;
-        Live -> erlang:put(qc_ctx_live, Live -- Gone)
-    end,
+    erase_ctx_entries(Gone),
     lists:foreach(
         fun(#crypto_keys{cipher = C, key = Key, hp = HP}) ->
             quic_aead:forget_ctx(C, Key, hp_cipher(C), HP)
         end,
         Keys
     ),
+    ok.
+
+%% @doc Drop the AEAD contexts of keys whose header-protection context
+%% must survive: on a key update the new keys keep the same HP key
+%% (RFC 9001 Sections 5.4 and 6.1), so dropping it would evict the
+%% context the live keys use on every packet. Only the AEAD contexts
+%% and cache entries of the retired keys go.
+-spec discard_aead(
+    {#crypto_keys{}, #crypto_keys{}} | #crypto_keys{} | undefined
+) -> ok.
+discard_aead({K1, K2}) ->
+    discard_aead([K1, K2]);
+discard_aead(undefined) ->
+    ok;
+discard_aead(Keys) when is_list(Keys) ->
+    Gone = lists:append([
+        [{qc_enc, C, key_id(Key)}, {qc_dec, C, key_id(Key)}]
+     || #crypto_keys{cipher = C, key = Key} <- Keys
+    ]),
+    erase_ctx_entries(Gone),
+    lists:foreach(
+        fun(#crypto_keys{cipher = C, key = Key}) ->
+            quic_aead:forget_aead_ctx(C, Key)
+        end,
+        Keys
+    ),
+    ok.
+
+%% Remove process-dictionary entries and their live-cache registrations.
+erase_ctx_entries(Gone) ->
+    lists:foreach(fun erlang:erase/1, Gone),
+    case erlang:get(qc_ctx_live) of
+        undefined -> ok;
+        Live -> erlang:put(qc_ctx_live, Live -- Gone)
+    end,
     ok.
 
 %%====================================================================

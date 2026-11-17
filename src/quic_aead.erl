@@ -31,6 +31,7 @@
 -export([
     ecb_mask/3,
     forget_ctx/4,
+    forget_aead_ctx/2,
     otp_seal/5,
     otp_open/5,
     encrypt/5,
@@ -327,6 +328,31 @@ forget_ctx(Cipher, Key, HpCipher, HP) ->
                 Kept -> erlang:put(HpCacheKey, Kept)
             end
     end,
+    ok.
+
+%% @doc Drop the cached AEAD cipher contexts of retired keys, leaving
+%% the header-protection cache alone: on a key update the new keys
+%% keep the same HP key (RFC 9001 Sections 5.4 and 6.1), and its
+%% context is shared with the live keys. Shape and rationale match
+%% forget_ctx/4; see aead_ctx/3.
+%% @private
+forget_aead_ctx(Cipher, Key) ->
+    KeyId = quic_aead_ctx:key_id(Key),
+    lists:foreach(
+        fun(Enc) ->
+            CacheKey = {aead_ctx, Cipher, Enc},
+            case erlang:get(CacheKey) of
+                undefined ->
+                    ok;
+                Cache ->
+                    case maps:remove(KeyId, Cache) of
+                        Empty when map_size(Empty) =:= 0 -> erlang:erase(CacheKey);
+                        Kept -> erlang:put(CacheKey, Kept)
+                    end
+            end
+        end,
+        [true, false]
+    ),
     ok.
 
 %% @private

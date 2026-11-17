@@ -6350,9 +6350,12 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
         {error, Reason} ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
-            %% Select keys based on key_phase
+            %% Select keys based on key_phase. The candidate state may
+            %% carry a key-update transition whose cleanup has not run:
+            %% commit_key_selection/2 applies it below, only on the
+            %% branches where the packet authenticated.
             PN0 = quic_aead:reconstruct_pn(get_largest_recv(app, State), TruncatedPN, PNLen),
-            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, PN0, State),
+            {DecryptKeys, State1, Retire} = select_decrypt_keys(KeyPhase, PN0, State),
             PeerDecryptKeys =
                 case (State1#state.cfg)#conn_cfg.role of
                     % ClientKeys
@@ -6377,13 +6380,22 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
             case drop_duplicate(Opened, State1#state.pn_app) of
                 duplicate ->
+                    %% Nothing new authenticated: the candidate stays a
+                    %% candidate and its cleanup does not run.
                     duplicate;
                 {ok, _PN, _Plaintext} when ?SHORT_RESERVED_BITS(UnprotectedFirstByte) ->
-                    {ok, app, [], <<>>, reserved_bits_close(app, State1), processed};
+                    %% An authenticated packet with corrupted reserved
+                    %% bits: the transition it carried commits before
+                    %% the close (RFC 9000 Section 17.3).
+                    Committed = commit_key_selection(Retire, State1),
+                    {ok, app, [], <<>>, reserved_bits_close(app, Committed), processed};
                 {ok, PN, Plaintext} ->
-                    case opened_with(DecryptKeys, PN, State1) of
+                    Committed = commit_key_selection(Retire, State1),
+                    case opened_with(DecryptKeys, PN, Committed) of
                         out_of_order ->
-                            {ok, app, [], <<>>, key_update_close(State1), processed};
+                            %% Authenticated but opened with keys it
+                            %% must not use (RFC 9001 Section 6.4).
+                            {ok, app, [], <<>>, key_update_close(Committed), processed};
                         {ok, State2} ->
                             %% Single monotonic_time sample shared by
                             %% recv_time and last_activity to save one BIF
@@ -15176,19 +15188,23 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
     %% Toggle key phase
     NewPhase = 1 - CurrentPhase,
 
-    %% Update key state
-    NewKeyState = KeyState#key_update_state{
-        current_phase = NewPhase,
-        current_keys = {NewClientKeys, NewServerKeys},
-        % Keep old keys for decryption during transition
-        prev_keys = CurrentKeys,
-        client_app_secret = NewClientSecret,
-        server_app_secret = NewServerSecret,
-        update_state = initiated,
-        % New phase: reset the AEAD send counter.
-        send_count = 0,
-        recv_first_pn = undefined
-    },
+    %% Update key state. Locally initiated: this transition is not
+    %% driven by unauthenticated input (the key_update API call or the
+    %% AEAD confidentiality limit), so the replaced generation's
+    %% contexts drop immediately rather than through a deferred commit.
+    NewKeyState = replace_prev_keys(
+        CurrentKeys,
+        KeyState#key_update_state{
+            current_phase = NewPhase,
+            current_keys = {NewClientKeys, NewServerKeys},
+            client_app_secret = NewClientSecret,
+            server_app_secret = NewServerSecret,
+            update_state = initiated,
+            % New phase: reset the AEAD send counter.
+            send_count = 0,
+            recv_first_pn = undefined
+        }
+    ),
 
     State#state{
         app_keys = {NewClientKeys, NewServerKeys},
@@ -15209,15 +15225,15 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
 
     case UpdateState of
         initiated ->
-            %% We initiated, peer responded - complete the update
-            NewKeyState = KeyState#key_update_state{
-                prev_keys = undefined,
-                update_state = idle
-            },
-            State#state{key_state = NewKeyState};
+            %% We initiated, peer responded - complete the update.
+            %% The transitioning generation leaves with the candidate;
+            %% its contexts drop only once the packet that completed
+            %% the update has authenticated (commit_key_selection/2).
+            {NewKeyState, Retire} = candidate_replace_prev_keys(undefined, KeyState),
+            {State#state{key_state = NewKeyState}, Retire};
         idle ->
             %% Peer initiated - we need to respond by deriving new keys
-            %% RFC 9001 Section 6.6: HP keys are NOT rotated during key updates
+            %% RFC 9001 Section 5.4: HP keys are NOT rotated during key updates
             {OldClientKeys, OldServerKeys} = CurrentKeys,
             Cipher = OldClientKeys#crypto_keys.cipher,
 
@@ -15243,30 +15259,40 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
             },
 
             NewPhase = 1 - CurrentPhase,
-            NewKeyState = KeyState#key_update_state{
-                current_phase = NewPhase,
-                current_keys = {NewClientKeys, NewServerKeys},
-                prev_keys = CurrentKeys,
-                client_app_secret = NewClientSecret,
-                server_app_secret = NewServerSecret,
-                update_state = responding,
-                send_count = 0,
-                recv_first_pn = undefined
-            },
-            State#state{
-                app_keys = {NewClientKeys, NewServerKeys},
-                key_state = NewKeyState
+            {NewKeyState, Retire} = candidate_replace_prev_keys(
+                CurrentKeys,
+                KeyState#key_update_state{
+                    current_phase = NewPhase,
+                    current_keys = {NewClientKeys, NewServerKeys},
+                    client_app_secret = NewClientSecret,
+                    server_app_secret = NewServerSecret,
+                    update_state = responding,
+                    send_count = 0,
+                    recv_first_pn = undefined
+                }
+            ),
+            {
+                State#state{
+                    app_keys = {NewClientKeys, NewServerKeys},
+                    key_state = NewKeyState
+                },
+                Retire
             };
         responding ->
             %% Already responding, just continue
-            State
+            {State, none}
     end.
 
 %% @doc Select the appropriate keys for decryption based on the received key phase.
-%% Returns {Keys, State} where State may be updated if a key update is detected.
+%% Returns {Keys, CandidateState, Retire} where CandidateState carries a
+%% key-update transition that has NOT happened yet, and Retire names what
+%% it would replace: none, or {retire_prev, OldPrev}. The candidate and
+%% its cleanup commit only after the packet authenticates
+%% (commit_key_selection/2, called from the decode success branch) — a
+%% forged packet reaches key selection but never its side effects.
 select_decrypt_keys(_ReceivedKeyPhase, _PN, #state{key_state = undefined} = State) ->
     %% No key state yet, use app_keys directly (should not happen in practice)
-    {State#state.app_keys, State};
+    {State#state.app_keys, State, none};
 select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
@@ -15278,7 +15304,7 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
     case ReceivedKeyPhase of
         CurrentPhase when UpdateState =:= idle ->
             %% Same phase, no update in progress.
-            {CurrentKeys, State};
+            {CurrentKeys, State, none};
         CurrentPhase ->
             %% A packet in the current phase confirms the in-progress key
             %% update: return to idle so the next update (ours or, after a
@@ -15287,9 +15313,11 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
             %% still decrypts, while never re-deriving keys for an old phase
             %% (that path requires prev_keys = undefined), which avoids a
             %% replayed old-phase packet flipping keys backward.
-            {CurrentKeys, State#state{
-                key_state = KeyState#key_update_state{update_state = idle}
-            }};
+            {CurrentKeys,
+                State#state{
+                    key_state = KeyState#key_update_state{update_state = idle}
+                },
+                none};
         _ ->
             %% RFC 9001 §6.5: once the current phase is confirmed, a packet
             %% in the other phase numbered above everything received so far
@@ -15303,12 +15331,48 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
             PeerUpdate = PrevKeys =:= undefined orelse (UpdateState =:= idle andalso NewerThanAll),
             case PeerUpdate of
                 true ->
-                    State1 = handle_peer_key_update(State),
-                    {State1#state.key_state#key_update_state.current_keys, State1};
+                    {State1, Retire} = handle_peer_key_update(State),
+                    {State1#state.key_state#key_update_state.current_keys, State1, Retire};
                 false ->
-                    {PrevKeys, State}
+                    {PrevKeys, State, none}
             end
     end.
+
+%% A key-update transition as a pure record transformation: NewKeyState
+%% carries NewPrev, and the action names the generation it replaces, for
+%% the commit step to clean up after authentication. No side effects.
+candidate_replace_prev_keys(NewPrev, KeyState) ->
+    OldPrev = KeyState#key_update_state.prev_keys,
+    Retire =
+        case OldPrev of
+            undefined -> none;
+            _ -> {retire_prev, OldPrev}
+        end,
+    {KeyState#key_update_state{prev_keys = NewPrev}, Retire}.
+
+%% Commit a key selection after the packet authenticated: apply the
+%% deferred cleanup the transition named. The candidate's record state
+%% is already in place; nothing is reinstalled or rediscovered here.
+%% The second argument is the candidate state, returned unchanged so
+%% the decode path can keep going through it; replace_prev_keys/2
+%% passes ok and discards the result.
+commit_key_selection(none, State) ->
+    State;
+commit_key_selection({retire_prev, OldPrev}, State) ->
+    %% Only the replaced value's AEAD contexts go; the HP context is
+    %% shared with the live keys (RFC 9001 Sections 5.4 and 6.1) and
+    %% stays. The early-delivery cancellation of a pending retirement
+    %% timer belongs to the same transition and is added with it.
+    quic_aead_ctx:discard_aead(OldPrev),
+    State.
+
+%% Trusted local transitions only: replace prev_keys and clean up the
+%% replaced generation in one step. Never reached from the decode path,
+%% where the same cleanup waits for authentication.
+replace_prev_keys(NewPrev, KeyState) ->
+    {NewKeyState, Retire} = candidate_replace_prev_keys(NewPrev, KeyState),
+    commit_key_selection(Retire, ok),
+    NewKeyState.
 
 %% @doc Get the current key phase for sending.
 get_current_key_phase(#state{key_state = undefined}) -> 0;
