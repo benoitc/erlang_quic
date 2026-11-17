@@ -253,7 +253,7 @@ discard(Keys) when is_list(Keys) ->
 %% context the live keys use on every packet. Only the AEAD contexts
 %% and cache entries of the retired keys go.
 -spec discard_aead(
-    [{#crypto_keys{}, #crypto_keys{}} | #crypto_keys()]
+    [{#crypto_keys{}, #crypto_keys{}} | #crypto_keys{}]
     | {#crypto_keys{}, #crypto_keys{}}
     | #crypto_keys{}
     | undefined
