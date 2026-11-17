@@ -311,11 +311,16 @@ start_server(Opts) ->
 %% KiB. Busy connections are unaffected (the timer only fires after
 %% `hibernate_after' ms without any event).
 statem_opts(Opts) ->
-    case maps:get(hibernate_after, Opts, 5000) of
-        infinity ->
-            [];
-        T when is_integer(T), T > 0 ->
-            [{hibernate_after, T}]
+    Hibernate =
+        case maps:get(hibernate_after, Opts, 5000) of
+            infinity ->
+                [];
+            T when is_integer(T), T > 0 ->
+                [{hibernate_after, T}]
+        end,
+    case maps:get(fullsweep_after, Opts, undefined) of
+        undefined -> Hibernate;
+        N when is_integer(N), N >= 0 -> [{spawn_opt, [{fullsweep_after, N}]} | Hibernate]
     end.
 
 %% @doc Send data on a stream.
@@ -2223,7 +2228,9 @@ connected(info, {timeout, _StaleRef, send_delayed_ack}, State) ->
 %% Handle PMTU probe timeout (RFC 8899)
 %% Validates reference to ignore stale timer events
 connected(
-    info, {pmtu_probe_timeout, Ref}, #state{pmtu_probe_timer = Ref, pmtu_state = PMTUState} = State
+    info,
+    {timeout, Ref, pmtu_probe_timeout},
+    #state{pmtu_probe_timer = Ref, pmtu_state = PMTUState} = State
 ) when
     Ref =/= undefined
 ->
@@ -2235,13 +2242,15 @@ connected(
     %% Retry probing if needed
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
-connected(info, {pmtu_probe_timeout, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, pmtu_probe_timeout}, State) ->
     %% Stale PMTU probe timer - ignore
     {keep_state, State};
 %% Handle PMTU raise timer (periodic re-probing)
 %% Validates reference to ignore stale timer events
 connected(
-    info, {pmtu_raise_timeout, Ref}, #state{pmtu_raise_timer = Ref, pmtu_state = PMTUState} = State
+    info,
+    {timeout, Ref, pmtu_raise_timeout},
+    #state{pmtu_raise_timer = Ref, pmtu_state = PMTUState} = State
 ) when
     Ref =/= undefined
 ->
@@ -2253,7 +2262,7 @@ connected(
     },
     State2 = maybe_send_pmtu_probe(State1),
     {keep_state, State2};
-connected(info, {pmtu_raise_timeout, _StaleRef}, State) ->
+connected(info, {timeout, _StaleRef, pmtu_raise_timeout}, State) ->
     %% Stale PMTU raise timer - ignore
     {keep_state, State};
 %% Handle stream deadline expiry
@@ -2449,7 +2458,9 @@ handle_common_event(cast, handle_timeout, StateName, State) when
 %% `idle' is included because the early handshake runs there: a probe
 %% for the Initial or Handshake space fires before the state machine has
 %% reached `handshaking', and dropping it wedges the handshake.
-handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, pto_timeout}, StateName, #state{pto_timer = Ref} = State
+) when
     Ref =/= undefined andalso
         (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
@@ -2464,14 +2475,14 @@ handle_common_event(info, {pto_timeout, Ref}, StateName, #state{pto_timer = Ref}
                 true when not is_tuple(State1#state.disconnect_timer) ->
                     disconnect_deadline(State1);
                 _ when State1#state.pto_kind =:= loss ->
-                    {keep_state, handle_loss_timeout(State1)};
+                    {keep_state, ensure_disconnect_timer(handle_loss_timeout(State1))};
                 _ ->
                     %% Handle PTO timeout - send probe packet
-                    {keep_state, handle_pto_timeout(State1)}
+                    {keep_state, ensure_disconnect_timer(handle_pto_timeout(State1))}
             end
     end;
 handle_common_event(
-    info, {disconnect_check, Ref}, StateName, #state{disconnect_timer = Ref} = State
+    info, {timeout, Ref, disconnect_check}, StateName, #state{disconnect_timer = Ref} = State
 ) when
     Ref =/= undefined andalso (StateName =:= connected orelse StateName =:= handshaking)
 ->
@@ -2479,43 +2490,53 @@ handle_common_event(
     case disconnect_timeout_expired(State1) of
         true ->
             disconnect_deadline(State1);
+        false when StateName =:= connected ->
+            {keep_state, rearm_disconnect_timer(State1)};
         false ->
             {keep_state, arm_disconnect_timer(State1)}
     end;
 handle_common_event(
-    info, {disconnect_final, Ref}, StateName, #state{disconnect_timer = {final, Ref}} = State
+    info,
+    {timeout, Ref, disconnect_final},
+    StateName,
+    #state{disconnect_timer = {final, Ref}} = State
 ) when
     StateName =:= connected orelse StateName =:= handshaking
 ->
     State1 = State#state{disconnect_timer = undefined},
     case disconnect_timeout_expired(State1) of
         true -> {next_state, draining, declare_peer_dead(State1)};
+        false when StateName =:= connected -> {keep_state, rearm_disconnect_timer(State1)};
         false -> {keep_state, arm_disconnect_timer(State1)}
     end;
-handle_common_event(info, {disconnect_final, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, disconnect_final}, _StateName, State) ->
     {keep_state, State};
-handle_common_event(info, {credit_retry, Ref}, StateName, #state{credit_timer = Ref} = State) ->
+handle_common_event(
+    info, {timeout, Ref, credit_retry}, StateName, #state{credit_timer = Ref} = State
+) ->
     State1 = State#state{credit_timer = undefined},
     case StateName of
         connected -> {keep_state, flush_after_grant(connected, release_withheld_credit(State1))};
         _ -> {keep_state, State1}
     end;
-handle_common_event(info, {credit_retry, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, credit_retry}, _StateName, State) ->
     {keep_state, State};
-handle_common_event(info, {disconnect_check, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, disconnect_check}, _StateName, State) ->
     %% Stale disconnect timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, {pto_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, pto_timeout}, _StateName, State) ->
     %% Ignore stale PTO timer (ref doesn't match or wrong state)
     {keep_state, State};
-handle_common_event(info, {pacing_timeout, Ref}, StateName, #state{pacing_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, pacing_timeout}, StateName, #state{pacing_timer = Ref} = State
+) when
     Ref =/= undefined andalso
         (StateName =:= connected orelse StateName =:= handshaking orelse StateName =:= idle)
 ->
     %% Handle pacing timeout - process send queue
     NewState = handle_pacing_timeout(State#state{pacing_timer = undefined}),
     {keep_state, NewState};
-handle_common_event(info, {pacing_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, pacing_timeout}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
@@ -2529,7 +2550,9 @@ handle_common_event({timeout, handshake_deadline}, expired, StateName, State) wh
         end,
     emit_qlog_state_change(StateName, draining, State),
     {next_state, draining, flush_event(initiate_close(Reason, State), event)};
-handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Ref} = State) when
+handle_common_event(
+    info, {timeout, Ref, idle_timeout}, StateName, #state{idle_timer = Ref} = State
+) when
     Ref =/= undefined andalso StateName =/= draining andalso StateName =/= closed
 ->
     case idle_expired(State) of
@@ -2541,23 +2564,28 @@ handle_common_event(info, {idle_timeout, Ref}, StateName, #state{idle_timer = Re
             %% Spurious timeout (activity occurred) - reset timer
             {keep_state, set_idle_timer(State#state{idle_timer = undefined})}
     end;
-handle_common_event(info, {idle_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, idle_timeout}, _StateName, State) ->
     %% Ignore stale idle timer (ref doesn't match or wrong state)
     {keep_state, State};
 handle_common_event(
-    info, {keep_alive_timeout, Ref}, connected, #state{keep_alive_timer = Ref} = State
+    info, {timeout, Ref, keep_alive_timeout}, connected, #state{keep_alive_timer = Ref} = State
 ) when
     Ref =/= undefined
 ->
     Now = erlang:monotonic_time(millisecond),
-    case (Now - State#state.last_activity) < (State#state.cfg)#conn_cfg.keep_alive_interval of
+    Interval = (State#state.cfg)#conn_cfg.keep_alive_interval,
+    %% The answer to the last PING moved last_activity a round trip past
+    %% the arm, so a comparison with the full interval fires twice for
+    %% every PING.
+    case (Now - State#state.last_activity) < Interval - Interval div 8 of
         true ->
             %% Activity since the timer was armed: re-arm for the remainder,
             %% no PING needed.
-            {keep_state, set_keep_alive_timer(State#state{keep_alive_timer = undefined})};
+            {keep_state,
+                set_keep_alive_timer(set_idle_timer(State#state{keep_alive_timer = undefined}))};
         false ->
-            %% Idle for a full interval: send a PING, then wait a full
-            %% interval before the next one.
+            %% Idle for the interval: send a PING, then wait an interval
+            %% before the next one.
             %%
             %% The re-arm must count from now, not from last_activity:
             %% last_activity only moves on the FIRST ack-eliciting packet
@@ -2569,11 +2597,10 @@ handle_common_event(
             %% rate (measured: ~930/s per connection, 46k/s across 50 idle
             %% connections) until the peer happens to send something.
             State1 = send_keep_alive_ping(State#state{keep_alive_timer = undefined}),
-            State2 = flush_event(State1, event),
-            {keep_state,
-                arm_keep_alive_timer(State2, (State2#state.cfg)#conn_cfg.keep_alive_interval)}
+            State2 = set_idle_timer(flush_event(State1, event)),
+            {keep_state, arm_keep_alive_timer(State2, keep_alive_period(State2))}
     end;
-handle_common_event(info, {keep_alive_timeout, _StaleRef}, _StateName, State) ->
+handle_common_event(info, {timeout, _StaleRef, keep_alive_timeout}, _StateName, State) ->
     %% Ignore stale keep-alive timer (ref doesn't match or wrong state)
     {keep_state, State};
 %% Handle socket going passive ({active, N} exhausted)
@@ -3407,13 +3434,58 @@ confirm_handshake(#state{loss_state = LossState} = State) ->
     Confirmed = discard_space(handshake, State#state{
         loss_state = quic_loss:on_handshake_confirmed(LossState)
     }),
-    Confirmed#state{hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}}.
+    quic_aead_ctx:discard((Confirmed#state.hs)#hs.handshake_keys),
+    release_handshake_state(Confirmed#state{
+        hs = (Confirmed#state.hs)#hs{handshake_keys = undefined}
+    }).
+
+%% RFC 9846 Section 7.1: a secret is erased once everything derived from
+%% it has been. Nothing reads the transcript, the handshake secrets, the
+%% key-exchange private key or the signing key after confirmation; a
+%% client first derives the one secret its session tickets need.
+release_handshake_state(#state{hs = Hs} = State) ->
+    State#state{
+        hs = Hs#hs{
+            resumption_secret = confirmed_resumption_secret(State),
+            tls_transcript = <<>>,
+            tls_private_key = undefined,
+            handshake_secret = undefined,
+            master_secret = undefined,
+            server_hs_secret = undefined,
+            client_hs_secret = undefined,
+            tls_ch1_random = undefined,
+            tls_ch1_opts = undefined,
+            peer_sig_algs = [],
+            server_private_key = undefined
+        }
+    }.
+
+confirmed_resumption_secret(#state{
+    app_keys = {#crypto_keys{cipher = Cipher}, _},
+    cfg = #conn_cfg{role = client},
+    hs = #hs{
+        tls_state = ?TLS_HANDSHAKE_COMPLETE,
+        master_secret = MasterSecret,
+        tls_transcript = Transcript
+    }
+}) when is_binary(MasterSecret) ->
+    quic_ticket:derive_resumption_secret(
+        Cipher, MasterSecret, quic_crypto:transcript_hash(Cipher, Transcript), <<>>
+    );
+confirmed_resumption_secret(#state{hs = #hs{resumption_secret = Secret}}) ->
+    Secret.
 
 %% RFC 9001 Section 4.9.1: the keys go with the packets. Discarding the
 %% space alone would leave the connection able to send at a level it must
 %% not, and able to decrypt packets it must drop.
 discard_initial(State) ->
     State1 = discard_space(initial, State),
+    #hs{initial_keys = Keys, initial_keys_alt = Alt} = State1#state.hs,
+    quic_aead_ctx:discard(Keys),
+    case Alt of
+        {_Version, AltKeys} -> quic_aead_ctx:discard(AltKeys);
+        undefined -> ok
+    end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
 
 %% Drop a packet number space from both byte counters at once. They are
@@ -5217,12 +5289,25 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
             true ->
                 Mig = NewState#state.mig,
                 PassDCID = pass_dcid(Packets, NewState),
-                Changed = maybe_handle_address_change(
-                    {path, Via, RemoteAddr},
-                    TotalSize,
-                    NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
-                ),
-                note_peer_dcid(RemoteAddr, PassDCID, Changed);
+                SamePath =
+                    RemoteAddr =:= NewState#state.remote_addr andalso
+                        Via =:= current_via(NewState),
+                case Mig of
+                    #mig{peer_dcid = PassDCID, pass_dcid = undefined} when
+                        SamePath, PassDCID =/= undefined
+                    ->
+                        %% Nothing moved: the address-change check and the
+                        %% two updates around it would write back what is
+                        %% already there.
+                        NewState;
+                    _ ->
+                        Changed = maybe_handle_address_change(
+                            {path, Via, RemoteAddr},
+                            TotalSize,
+                            NewState#state{mig = Mig#mig{pass_dcid = PassDCID}}
+                        ),
+                        note_peer_dcid(RemoteAddr, PassDCID, Changed)
+                end;
             false ->
                 NewState
         end,
@@ -5230,6 +5315,8 @@ server_recv_pass(Packets, RemoteAddr, Via, State) ->
 
 %% The frames held while the pass decided where the peer is, sent to
 %% wherever that is now; dropped when the pass closed the connection.
+send_pass_frames(#state{hold_pass_frames = false, pass_frames = []} = State) ->
+    State;
 send_pass_frames(#state{close_reason = CR} = State) when CR =/= undefined ->
     State#state{hold_pass_frames = false, pass_frames = []};
 send_pass_frames(#state{pass_frames = Held} = State) ->
@@ -5247,11 +5334,15 @@ space_largest(_) -> undefined.
 
 %% The destination CID of the pass's first 1-RTT packet, one of ours.
 pass_dcid(Packets, #state{cfg = #conn_cfg{scid = SCID}}) ->
-    Len = byte_size(SCID),
-    case [D || <<0:1, 1:1, _:6, D:Len/binary, _/binary>> <- Packets] of
-        [DCID | _] -> DCID;
-        [] -> undefined
-    end.
+    first_short_dcid(Packets, byte_size(SCID)).
+
+first_short_dcid([Packet | Rest], Len) ->
+    case Packet of
+        <<0:1, 1:1, _:6, DCID:Len/binary, _/binary>> -> DCID;
+        _ -> first_short_dcid(Rest, Len)
+    end;
+first_short_dcid([], _Len) ->
+    undefined.
 
 note_peer_dcid(RemoteAddr, DCID, #state{remote_addr = RemoteAddr, mig = Mig} = State) when
     DCID =/= undefined
@@ -6346,6 +6437,9 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
                 State
             ),
             {ok, NewState, lists:reverse(Acc)};
+        {padding, Rest} ->
+            NewState = process_frame_track_probing(Level, padding, State),
+            decode_and_process_streaming(Level, skip_padding(Rest), NewState, [padding | Acc]);
         {Frame, Rest} ->
             NewState =
                 case datagram_too_large(Level, Frame, byte_size(Data) - byte_size(Rest), State) of
@@ -6354,6 +6448,11 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
                 end,
             decode_and_process_streaming(Level, Rest, NewState, [Frame | Acc])
     end.
+
+%% A padded Initial carries about a thousand PADDING frames, one byte
+%% each; a run is handled as one.
+skip_padding(<<0, Rest/binary>>) -> skip_padding(Rest);
+skip_padding(Rest) -> Rest.
 
 %% RFC 9221 Section 3: a DATAGRAM frame of Size bytes, type and length
 %% included, larger than the max_datagram_frame_size we sent.
@@ -6614,15 +6713,16 @@ process_frame(Level, {ack, Ranges, AckDelay, ECN}, State0) ->
             },
 
             %% Emit qlog packets_acked event
-            AckedPNs = [P#sent_packet.pn || P <- AckedPackets],
             RTTSample =
                 case AckedPackets of
                     [] -> undefined;
                     _ -> Now - LargestAckedSentTime
                 end,
-            ?QLOG_EMIT_PACKETS_ACKED((State1#state.cfg)#conn_cfg.qlog_ctx, AckedPNs, #{
-                rtt_sample => RTTSample
-            }),
+            ?QLOG_EMIT_PACKETS_ACKED(
+                (State1#state.cfg)#conn_cfg.qlog_ctx,
+                [P#sent_packet.pn || P <- AckedPackets],
+                #{rtt_sample => RTTSample}
+            ),
 
             %% Emit qlog packet_lost events
             lists:foreach(
@@ -8265,7 +8365,8 @@ process_tls_message(
             tls_state = ?TLS_HANDSHAKE_COMPLETE,
             server_name = ServerName,
             master_secret = MasterSecret,
-            tls_transcript = Transcript
+            tls_transcript = Transcript,
+            resumption_secret = ConfirmedSecret
         }
     } = State
 ) ->
@@ -8290,12 +8391,21 @@ process_tls_message(
             %% protected with anyway.
             Cipher = ClientAppKeys#crypto_keys.cipher,
 
-            %% Derive resumption_master_secret from master secret
-            %% The transcript should include client Finished
-            FinalTranscriptHash = quic_crypto:transcript_hash(Cipher, Transcript),
-            ResumptionSecret = quic_ticket:derive_resumption_secret(
-                Cipher, MasterSecret, FinalTranscriptHash, <<>>
-            ),
+            %% resumption_master_secret, over the transcript up to the
+            %% client Finished. Confirmation derived it and released what
+            %% it is derived from; a ticket can also arrive before that.
+            ResumptionSecret =
+                case MasterSecret of
+                    undefined ->
+                        ConfirmedSecret;
+                    _ ->
+                        quic_ticket:derive_resumption_secret(
+                            Cipher,
+                            MasterSecret,
+                            quic_crypto:transcript_hash(Cipher, Transcript),
+                            <<>>
+                        )
+                end,
 
             %% Create session ticket record
             Ticket = #session_ticket{
@@ -9542,8 +9652,7 @@ credit_allowed(#state{credit_timer = Ref} = State) when Ref =/= undefined ->
 credit_allowed(State) ->
     case owner_behind(State) of
         true ->
-            Ref = make_ref(),
-            erlang:send_after(?CREDIT_RETRY_MS, self(), {credit_retry, Ref}),
+            Ref = erlang:start_timer(?CREDIT_RETRY_MS, self(), credit_retry),
             {false, State#state{credit_timer = Ref}};
         false ->
             {true, State}
@@ -12209,6 +12318,12 @@ send_run_limited([Packet | Pkts], [Frame | Frs], PN, State0, Tracked) ->
 %% sends are collected as [{PN, Size, Frame}] (reversed) for
 %% one batched loss/CC update afterwards. Packet I carries PN0 + I. A
 %% refused packet is tracked too, so loss detection resends it.
+send_run_packets(Packets, Frames, PN, State, SS, []) when
+    SS =/= undefined, not ?QLOG_ENABLED((State#state.cfg)#conn_cfg.qlog_ctx)
+->
+    {IP, Port} = State#state.remote_addr,
+    {SS1, Failed} = quic_socket:send_run(SS, IP, Port, Packets),
+    {SS1, track_run(Packets, Frames, PN, Failed, 0, [])};
 send_run_packets([], [], _PN, _State, SS, Tracked) ->
     {SS, Tracked};
 send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
@@ -12236,6 +12351,18 @@ send_run_packets([Packet | Pkts], [Frame | Frs], PN, State, SS, Tracked) ->
             SS1 -> SS1
         end,
     send_run_packets(Pkts, Frs, PN + 1, State, SS2, [{PN, PacketSize, Frame} | Tracked]).
+
+%% Failed holds the run positions whose send failed; they are tracked like
+%% the rest, so loss detection resends them.
+track_run([], [], _PN, _Failed, _I, Tracked) ->
+    Tracked;
+track_run([Packet | Pkts], [Frame | Frs], PN, Failed, I, Tracked) ->
+    Size = byte_size(Packet),
+    case Failed =/= [] andalso lists:keyfind(I, 1, Failed) of
+        {I, Reason} -> log_send_failed(Reason, PN, Size);
+        false -> ok
+    end,
+    track_run(Pkts, Frs, PN + 1, Failed, I + 1, [{PN, Size, Frame} | Tracked]).
 
 %% Build the iodata payload `[Header, Chunk]' for a chunked stream
 %% send, reusing the pre-computed header pieces when `Offset > 0'.
@@ -14366,7 +14493,9 @@ set_pto_timer(State) ->
     }.
 
 %% The PTO fields set_pto_timer/1 stores, cancelling or arming the timer
-%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind}.
+%% as needed: {Timer, ArmedAt, ScheduledAt, Space, Kind}. A drained
+%% flight leaves an armed timer alone: its fire finds nothing to probe
+%% (RFC 9002 Appendix A.8), and the next flight reuses it.
 pto_plan(
     #state{
         loss_state = LossState,
@@ -14405,9 +14534,6 @@ pto_plan(
                     {Ref, NewArmedAt, Deadline, Space, Kind}
             end;
         none ->
-            cancel_timer(OldTimer),
-            {undefined, ArmedAt, undefined, OldSpace, OldKind};
-        _ ->
             {OldTimer, ArmedAt, undefined, OldSpace, OldKind}
     end.
 
@@ -14458,8 +14584,7 @@ arm_pto_timer(Delay, State) ->
     State#state{pto_timer = Ref, pto_armed_at = ArmedAt}.
 
 start_pto_timer(Delay) ->
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {pto_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), pto_timeout),
     {Ref, erlang:monotonic_time(millisecond) + Delay}.
 
 %% What a firing PTO timer should do: nothing (flight drained since it
@@ -14475,7 +14600,7 @@ pto_due(#state{pto_scheduled_at = Deadline}) ->
 
 %% Helper to cancel a timer reference
 cancel_timer(undefined) -> ok;
-cancel_timer(Ref) -> erlang:cancel_timer(Ref).
+cancel_timer(Ref) -> erlang:cancel_timer(Ref, [{async, true}, {info, false}]).
 
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
@@ -14548,8 +14673,7 @@ set_idle_timer(Timeout, #state{idle_timer = OldTimer, last_activity = LastActivi
     %% re-arm is the remaining time, not a fresh full timeout.
     Now = erlang:monotonic_time(millisecond),
     Delay = max(0, (LastActivity + Timeout) - Now),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {idle_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), idle_timeout),
     State#state{idle_timer = Ref}.
 
 %% RFC 9000 Section 10.1: the smaller of the two advertised timeouts, 0
@@ -14635,9 +14759,8 @@ disconnect_timeout_expired(#state{loss_state = LossState, cfg = #conn_cfg{discon
 %% (a new NAT mapping, a link rejoining) is often slower than the RTT says.
 disconnect_deadline(#state{loss_state = LossState} = State) ->
     State1 = flush_event(send_probe_packet(app, State), event),
-    Ref = make_ref(),
     Grace = max(quic_loss:base_pto(LossState), ?DISCONNECT_GRACE_MS),
-    erlang:send_after(Grace, self(), {disconnect_final, Ref}),
+    Ref = erlang:start_timer(Grace, self(), disconnect_final),
     {keep_state, State1#state{disconnect_timer = {final, Ref}}}.
 
 %% The disconnect timeout elapsed with ack-eliciting data in flight and
@@ -14663,6 +14786,24 @@ cancel_disconnect_timer(#state{disconnect_timer = Ref} = State) ->
     cancel_timer(Ref),
     State#state{disconnect_timer = undefined}.
 
+%% A confirmed connection with nothing in flight has no deadline to
+%% check: the first PTO or loss timeout of a later flight arms the check
+%% again. Before confirmation no PTO runs for Application Data, so the
+%% check keeps itself armed.
+rearm_disconnect_timer(#state{loss_state = LossState} = State) ->
+    case
+        quic_loss:handshake_confirmed(LossState) andalso
+            quic_loss:bytes_in_flight(LossState) =:= 0
+    of
+        true -> State;
+        false -> arm_disconnect_timer(State)
+    end.
+
+ensure_disconnect_timer(#state{disconnect_timer = undefined} = State) ->
+    arm_disconnect_timer(State);
+ensure_disconnect_timer(State) ->
+    State.
+
 %% Arm the disconnect check at the deadline itself. Lazy, like the idle
 %% timer: a fire that finds the deadline moved re-arms the remainder.
 %% The delay is never zero, so this cannot spin the way a re-arm derived
@@ -14683,8 +14824,7 @@ arm_disconnect_timer(
                 end
         end,
     State1 = cancel_disconnect_timer(State),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {disconnect_check, Ref}),
+    Ref = erlang:start_timer(Delay, self(), disconnect_check),
     State1#state{disconnect_timer = Ref}.
 
 %% Disconnect-timeout option: how long ack-eliciting data may stay in
@@ -14740,13 +14880,20 @@ set_keep_alive_timer(
     Now = erlang:monotonic_time(millisecond),
     arm_keep_alive_timer(State, max(0, (LastActivity + Interval) - Now)).
 
+%% Time to the next PING after one was sent. With both ends on the same
+%% interval the client goes first, so each interval carries one PING, not
+%% one from each end (RFC 9000 Section 10.1.2).
+keep_alive_period(#state{cfg = #conn_cfg{role = client, keep_alive_interval = Interval}}) ->
+    Interval - Interval div 16;
+keep_alive_period(#state{cfg = #conn_cfg{keep_alive_interval = Interval}}) ->
+    Interval.
+
 %% Arm the keep-alive timer with an explicit delay.
 arm_keep_alive_timer(#state{cfg = #conn_cfg{keep_alive_interval = disabled}} = State, _Delay) ->
     State#state{keep_alive_timer = undefined};
 arm_keep_alive_timer(#state{keep_alive_timer = OldTimer} = State, Delay) ->
     cancel_timer(OldTimer),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {keep_alive_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), keep_alive_timeout),
     State#state{keep_alive_timer = Ref}.
 
 %%====================================================================
@@ -14765,8 +14912,7 @@ maybe_set_pacing_timer(_Delay, #state{pacing_timer = Ref} = State) when Ref =/= 
 maybe_set_pacing_timer(Delay, #state{pacing_timer = undefined} = State) ->
     %% Set new pacing timer
     ?LOG_DEBUG(#{what => pacing_timer_set, delay_ms => Delay}, ?QUIC_LOG_META),
-    Ref = make_ref(),
-    erlang:send_after(Delay, self(), {pacing_timeout, Ref}),
+    Ref = erlang:start_timer(Delay, self(), pacing_timeout),
     State#state{pacing_timer = Ref}.
 
 %% Burst budget: bounds packets emitted per drain (see burst_budget).
@@ -14784,7 +14930,7 @@ arm_burst_continuation(#state{pacing_timer = Ref} = State) when Ref =/= undefine
     State;
 arm_burst_continuation(State) ->
     Ref = make_ref(),
-    self() ! {pacing_timeout, Ref},
+    self() ! {timeout, Ref, pacing_timeout},
     State#state{pacing_timer = Ref}.
 
 %% Convert state to map for debugging
@@ -17259,17 +17405,15 @@ set_pmtu_probe_timer(#state{pmtu_probe_timer = OldTimer, loss_state = LossState}
                 SRTT = quic_rtt:smoothed(quic_loss:rtt(LossState)),
                 max(1000, 5 * SRTT)
         end,
-    Ref = make_ref(),
-    erlang:send_after(Timeout, self(), {pmtu_probe_timeout, Ref}),
+    Ref = erlang:start_timer(Timeout, self(), pmtu_probe_timeout),
     State#state{pmtu_probe_timer = Ref}.
 
 %% @doc Set the PMTU raise timer for periodic re-probing.
 %% Uses unique reference in message to detect stale timer events
 -spec maybe_set_pmtu_raise_timer(#state{}) -> #state{}.
 maybe_set_pmtu_raise_timer(#state{pmtu_raise_timer = undefined} = State) ->
-    Ref = make_ref(),
-    erlang:send_after(
-        (State#state.cfg)#conn_cfg.pmtu_raise_interval, self(), {pmtu_raise_timeout, Ref}
+    Ref = erlang:start_timer(
+        (State#state.cfg)#conn_cfg.pmtu_raise_interval, self(), pmtu_raise_timeout
     ),
     State#state{pmtu_raise_timer = Ref};
 maybe_set_pmtu_raise_timer(State) ->
@@ -17357,8 +17501,13 @@ handle_pmtu_ack_event(_Acked, #state{pmtu_state = undefined} = State) ->
 handle_pmtu_ack_event([], State) ->
     State;
 handle_pmtu_ack_event(Acked, #state{pmtu_state = PMTUState} = State) ->
-    Sizes = [Size || #sent_packet{size = Size} <- Acked],
-    State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)}.
+    case quic_pmtu:has_black_hole_strikes(PMTUState) of
+        true ->
+            Sizes = [Size || #sent_packet{size = Size} <- Acked],
+            State#state{pmtu_state = quic_pmtu:on_ack_event(Sizes, PMTUState)};
+        false ->
+            State
+    end.
 
 %% @doc Black hole detection, loss side: the newly declared losses of one
 %% ACK are one strike if any of them was a large packet. Drops the MTU

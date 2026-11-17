@@ -12,7 +12,7 @@ continuation_is_in_the_mailbox_immediately_test() ->
     Ref = quic_connection_test_support:pacing_timer(S1),
     ?assert(is_reference(Ref)),
     receive
-        {pacing_timeout, Ref} -> ok
+        {timeout, Ref, pacing_timeout} -> ok
     after 0 ->
         ?assert(false)
     end.
@@ -25,12 +25,12 @@ armed_continuation_is_not_duplicated_test() ->
         quic_connection_test_support:pacing_timer(S1), quic_connection_test_support:pacing_timer(S2)
     ),
     receive
-        {pacing_timeout, _} -> ok
+        {timeout, _, pacing_timeout} -> ok
     after 0 ->
         ?assert(false)
     end,
     receive
-        {pacing_timeout, _} -> ?assert(false)
+        {timeout, _, pacing_timeout} -> ?assert(false)
     after 0 ->
         ok
     end.

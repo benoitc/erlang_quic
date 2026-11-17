@@ -826,9 +826,10 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
         {short, DCID, _Rest} ->
             case ets:lookup(Conns, DCID) of
                 [{DCID, ConnPid}] ->
+                    {Run, Rest1} = take_dcid_run(Rest, DCID, DCIDLen, [Packet]),
                     Key = {conn, ConnPid},
-                    Acc1 = maps:update_with(Key, fun(L) -> [Packet | L] end, [Packet], Acc),
-                    group_packets_by_conn(Rest, DCIDLen, Conns, Acc1);
+                    Acc1 = maps:update_with(Key, fun(L) -> Run ++ L end, Run, Acc),
+                    group_packets_by_conn(Rest1, DCIDLen, Conns, Acc1);
                 [] ->
                     %% Unknown: a lone datagram's handling, stateless reset included
                     Acc1 = maps:update_with(unrouted, fun(L) -> [Packet | L] end, [Packet], Acc),
@@ -851,6 +852,19 @@ group_packets_by_conn([Packet | Rest], DCIDLen, Conns, Acc) ->
             %% Skip invalid packets
             group_packets_by_conn(Rest, DCIDLen, Conns, Acc)
     end.
+
+%% The short-header packets for DCID at the head of the list, newest
+%% first, on top of Acc: a train is mostly one connection's packets in a
+%% row, and they need no lookup of their own.
+take_dcid_run([Packet | Rest] = Packets, DCID, DCIDLen, Acc) ->
+    case Packet of
+        <<0:1, _:7, DCID:DCIDLen/binary, _/binary>> ->
+            take_dcid_run(Rest, DCID, DCIDLen, [Packet | Acc]);
+        _ ->
+            {Acc, Packets}
+    end;
+take_dcid_run([], _DCID, _DCIDLen, Acc) ->
+    {Acc, []}.
 
 %% Send batched packets to a connection. Tail-drops when the
 %% connection's mailbox is over QueueMax, see

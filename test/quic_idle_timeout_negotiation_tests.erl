@@ -95,7 +95,9 @@ handle_timeout_leaves_an_active_connection_test() ->
 fire(Local, PeerTP, Idle) ->
     Ref = make_ref(),
     quic_connection:handle_common_event(
-        info, {idle_timeout, Ref}, connected, (state(Local, PeerTP, Idle))#state{idle_timer = Ref}
+        info, {timeout, Ref, idle_timeout}, connected, (state(Local, PeerTP, Idle))#state{
+            idle_timer = Ref
+        }
     ).
 
 state(Local, PeerTP, Idle) ->
