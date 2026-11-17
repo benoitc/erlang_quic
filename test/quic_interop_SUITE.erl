@@ -674,6 +674,8 @@ resumption(Config) ->
 do_resumption(Host, Port) ->
     {ok, First} = connect(Host, Port, interop_opts()),
     _ = await_connected(First, Host, Port),
+    %% A full handshake presented a certificate.
+    ?assertMatch({ok, _}, quic:peercert(First)),
     Ticket = await_ticket(First),
     quic:close(First, normal),
     case Ticket of
@@ -682,12 +684,14 @@ do_resumption(Host, Port) ->
     end,
     {ok, Second} = connect(Host, Port, (interop_opts())#{session_ticket => Ticket}),
     _ = await_connected(Second, Host, Port),
-    %% Early keys exist only where a pre-shared key was used, so their
-    %% presence is what distinguishes a resumed handshake from a fresh
-    %% one that merely succeeded.
-    Resumed = quic:has_early_keys(Second),
+    %% A resumed PSK handshake carries no Certificate, so peercert/1
+    %% distinguishes resumption from a fresh handshake that merely
+    %% succeeded. (has_early_keys/1 cannot: the client drops its
+    %% 0-RTT keys once 1-RTT keys are installed, RFC 9001 Section
+    %% 4.9.3, so it is false here regardless.) Both sides asserted,
+    %% so a peer that resumed without PSK fails this too.
+    ?assertMatch({error, no_peercert}, quic:peercert(Second)),
     quic:close(Second, normal),
-    ?assert(Resumed),
     {comment, "second handshake resumed"}.
 
 %% The ticket is delivered to the owner rather than polled for.

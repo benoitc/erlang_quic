@@ -1386,6 +1386,8 @@ terminate(
         keep_alive_timer = KeepAliveTimer,
         pacing_timer = PacingTimer,
         ack_timer = AckTimer,
+        early_keys_discard_timer = EarlyKeysDiscardTimer,
+        prev_keys_retire_timer = PrevKeysRetireTimer,
         cfg = #conn_cfg{
             send_socket = SendSocket,
             role = Role,
@@ -1439,6 +1441,8 @@ terminate(
     cancel_timer(KeepAliveTimer),
     cancel_timer(PacingTimer),
     cancel_timer(AckTimer),
+    cancel_timer(EarlyKeysDiscardTimer),
+    cancel_timer(PrevKeysRetireTimer),
     %% Close dedicated send socket for server connections (SO_REUSEPORT socket)
     case SendSocket of
         undefined -> ok;
@@ -2539,6 +2543,68 @@ handle_common_event(
 handle_common_event(info, {timeout, _StaleRef, pacing_timeout}, _StateName, State) ->
     %% Ignore stale pacing timer (ref doesn't match or wrong state)
     {keep_state, State};
+%% RFC 9001 Section 4.9.3: the 0-RTT disposal window closed (or claims
+%% to - the deadline is re-checked, since a timer message can arrive
+%% early). Any state name: keys can be dropped in idle through closed.
+handle_common_event(
+    info,
+    {timeout, Ref, early_keys_discard_timeout},
+    StateName,
+    #state{early_keys_discard_timer = Ref} = State
+) when
+    Ref =/= undefined andalso is_integer(State#state.early_keys_discard_deadline)
+->
+    Now = erlang:monotonic_time(millisecond),
+    Deadline = State#state.early_keys_discard_deadline,
+    case Now >= Deadline of
+        true ->
+            {keep_state,
+                discard_early_keys(State#state{
+                    early_keys_discard_timer = undefined,
+                    early_keys_discard_deadline = undefined
+                })};
+        false ->
+            %% Delivered early (timer-wheel granularity, or a test
+            %% delivering the message by hand): re-arm for the
+            %% remainder, deadline unchanged.
+            _ = cancel_timer(Ref),
+            Delay = max(0, Deadline - Now),
+            {keep_state, State#state{
+                early_keys_discard_timer = start_timer(Delay, early_keys_discard_timeout)
+            }}
+    end;
+handle_common_event(info, {timeout, _StaleRef, early_keys_discard_timeout}, _StateName, State) ->
+    %% Stale disposal timer (ref doesn't match)
+    {keep_state, State};
+%% RFC 9001 Section 6.5: the three-PTO window for the previous key
+%% generation closed (or claims to - the deadline is re-checked). The
+%% old read keys and everything derived for them go; recv_first_pn
+%% describes the current generation and stays until the next update.
+handle_common_event(
+    info,
+    {timeout, Ref, prev_keys_retire_timeout},
+    StateName,
+    #state{prev_keys_retire_timer = Ref} = State
+) when
+    Ref =/= undefined andalso is_integer(State#state.prev_keys_retire_deadline)
+->
+    Now = erlang:monotonic_time(millisecond),
+    Deadline = State#state.prev_keys_retire_deadline,
+    case Now >= Deadline of
+        true ->
+            {keep_state, retire_prev_keys(State)};
+        false ->
+            %% Delivered early: re-arm for the remainder, deadline
+            %% unchanged.
+            _ = cancel_timer(Ref),
+            Delay = max(0, Deadline - Now),
+            {keep_state, State#state{
+                prev_keys_retire_timer = start_timer(Delay, prev_keys_retire_timeout)
+            }}
+    end;
+handle_common_event(info, {timeout, _StaleRef, prev_keys_retire_timeout}, _StateName, State) ->
+    %% Stale retirement timer (ref doesn't match, or no deadline armed)
+    {keep_state, State};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
 handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
     StateName =:= idle orelse StateName =:= handshaking
@@ -3487,6 +3553,20 @@ discard_initial(State) ->
         undefined -> ok
     end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
+
+%% RFC 9001 Section 4.9.3: a client discards its 0-RTT keys as soon as
+%% it installs 1-RTT keys, as they have no use from that moment (0-RTT
+%% and 1-RTT share the application packet number space and nothing is
+%% sent as 0-RTT afterwards, Section 5.6). Drops every
+%% connection-state reference to the keys and the early secret; the
+%% immutable binaries are then unreferenced and left to the collector.
+%% A no-op when no 0-RTT was offered, so every 1-RTT install can call
+%% it.
+discard_early_keys(#state{hs = #hs{early_keys = undefined}} = State) ->
+    State;
+discard_early_keys(#state{hs = #hs{early_keys = {Keys, _Secret}} = Hs} = State) ->
+    quic_aead_ctx:discard(Keys),
+    State#state{hs = Hs#hs{early_keys = undefined}}.
 
 %% Drop a packet number space from both byte counters at once. They are
 %% tracked separately, so subtracting from one and not the other leaves
@@ -4831,6 +4911,38 @@ server_discard_initial(handshake, #state{cfg = #conn_cfg{role = server}} = State
 server_discard_initial(_Type, State) ->
     State.
 
+%% RFC 9001 Section 4.9.3: after receiving a 1-RTT packet a server MUST
+%% discard its 0-RTT keys within a short time, three PTOs recommended.
+%% Packet reordering can deliver a 0-RTT packet after a 1-RTT one, so
+%% the keys are retained for the window and dropped when it closes.
+%% Runs after the packet decrypted and its frames processed, which is
+%% the receive event the section names. Arms once; the deadline never
+%% moves, and the timer is re-armed for the remainder when its message
+%% arrives early.
+server_schedule_0rtt_discard(
+    app,
+    #state{
+        cfg = #conn_cfg{role = server},
+        early_keys_discard_timer = undefined,
+        early_keys_discard_deadline = undefined,
+        hs = #hs{early_keys = {_, _}},
+        loss_state = LossState
+    } = State
+) ->
+    Now = erlang:monotonic_time(millisecond),
+    Delay = early_keys_discard_delay(LossState),
+    State#state{
+        early_keys_discard_deadline = Now + Delay,
+        early_keys_discard_timer = start_timer(Delay, early_keys_discard_timeout)
+    };
+server_schedule_0rtt_discard(_Type, State) ->
+    State.
+
+%% Three times the application-space PTO (RFC 9001 Section 4.9.3), the
+%% same measure the drain timer uses (RFC 9000 Section 10.2).
+early_keys_discard_delay(undefined) -> 3000;
+early_keys_discard_delay(LossState) -> 3 * quic_loss:get_pto(LossState, app).
+
 %% Batched variant of handle_packet/2: same anti-amplification
 %% accounting per datagram, one drain per batch. The batched delivery
 %% path previously skipped accounting entirely, so a server's amp budget
@@ -5443,8 +5555,11 @@ handle_packet_loop(Data, State) ->
             ?QLOG_EMIT_FRAMES_PROCESSED((NewState#state.cfg)#conn_cfg.qlog_ctx, Frames),
 
             %% Send ACK if packet contained ack-eliciting frames
-            State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
+            State2 = server_schedule_0rtt_discard(
+                Type,
+                server_discard_initial(
+                    Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, NewState))
+                )
             ),
             %% Continue with remaining coalesced packets
             handle_packet_loop(RemainingData, State2);
@@ -5458,8 +5573,11 @@ handle_packet_loop(Data, State) ->
             bump(?C_PACKETS_RECEIVED, 1, NewState),
             State1 = process_frames_noreenbl(Type, Frames, NewState),
             ?QLOG_EMIT_FRAMES_PROCESSED((State1#state.cfg)#conn_cfg.qlog_ctx, Frames),
-            State2 = server_discard_initial(
-                Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
+            State2 = server_schedule_0rtt_discard(
+                Type,
+                server_discard_initial(
+                    Type, amp_mark_validated(Type, maybe_send_ack(Type, Frames, State1))
+                )
             ),
             handle_packet_loop(RemainingData, State2);
         {duplicate, RemainingData} ->
@@ -6234,10 +6352,15 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
 %% The peer-direction keys for the fused path: only when no key update
 %% is in flight, so a same-phase packet cannot carry phase-transition
 %% side effects (select_decrypt_keys/2 handles those on the slow path).
+%% A held previous generation also takes the slow path: its retirement
+%% clock (RFC 9001 Section 6.5) starts at the first authenticated
+%% packet under the new keys, which the generic path's opened_with/3
+%% owns.
 fused_decrypt_keys(CurrentKeys, #state{key_state = undefined}) ->
     {ok, CurrentKeys};
 fused_decrypt_keys(_CurrentKeys, #state{
-    key_state = #key_update_state{update_state = idle, current_keys = {CK, SK}},
+    key_state =
+        #key_update_state{update_state = idle, current_keys = {CK, SK}, prev_keys = undefined},
     cfg = #conn_cfg{
         role = Role
     }
@@ -6263,9 +6386,12 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
         {error, Reason} ->
             {error, Reason};
         {ok, KeyPhase, PNLen, TruncatedPN, UnprotectedHeader} ->
-            %% Select keys based on key_phase
+            %% Select keys based on key_phase. The candidate state may
+            %% carry a key-update transition whose cleanup has not run:
+            %% commit_key_selection/2 applies it below, only on the
+            %% branches where the packet authenticated.
             PN0 = quic_aead:reconstruct_pn(get_largest_recv(app, State), TruncatedPN, PNLen),
-            {DecryptKeys, State1} = select_decrypt_keys(KeyPhase, PN0, State),
+            {DecryptKeys, State1, Retire} = select_decrypt_keys(KeyPhase, PN0, State),
             PeerDecryptKeys =
                 case (State1#state.cfg)#conn_cfg.role of
                     % ClientKeys
@@ -6290,13 +6416,22 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
             <<UnprotectedFirstByte, _/binary>> = UnprotectedHeader,
             case drop_duplicate(Opened, State1#state.pn_app) of
                 duplicate ->
+                    %% Nothing new authenticated: the candidate stays a
+                    %% candidate and its cleanup does not run.
                     duplicate;
                 {ok, _PN, _Plaintext} when ?SHORT_RESERVED_BITS(UnprotectedFirstByte) ->
-                    {ok, app, [], <<>>, reserved_bits_close(app, State1), processed};
+                    %% An authenticated packet with corrupted reserved
+                    %% bits: the transition it carried commits before
+                    %% the close (RFC 9000 Section 17.3).
+                    Committed = commit_key_selection(Retire, State1),
+                    {ok, app, [], <<>>, reserved_bits_close(app, Committed), processed};
                 {ok, PN, Plaintext} ->
-                    case opened_with(DecryptKeys, PN, State1) of
+                    Committed = commit_key_selection(Retire, State1),
+                    case opened_with(DecryptKeys, PN, Committed) of
                         out_of_order ->
-                            {ok, app, [], <<>>, key_update_close(State1), processed};
+                            %% Authenticated but opened with keys it
+                            %% must not use (RFC 9001 Section 6.4).
+                            {ok, app, [], <<>>, key_update_close(Committed), processed};
                         {ok, State2} ->
                             %% Single monotonic_time sample shared by
                             %% recv_time and last_activity to save one BIF
@@ -6318,6 +6453,34 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
 
 %% RFC 9001 Section 6.4: a packet numbered above one opened with newer
 %% keys must not open with older ones.
+%%
+%% The first clause is also the retirement trigger (Section 6.5): a
+%% packet opened with the current keys while a previous generation is
+%% still held is the first authenticated packet under those keys, so
+%% the three-PTO clock for the old read keys starts here - after AEAD
+%% succeeded, never from key selection alone. The deadline never
+%% moves once armed; the fire handler re-arms an early delivery.
+opened_with(
+    Keys,
+    PN,
+    #state{
+        key_state =
+            #key_update_state{
+                current_keys = Keys,
+                recv_first_pn = undefined,
+                prev_keys = PrevKeys
+            } = KS,
+        prev_keys_retire_timer = undefined,
+        loss_state = LossState
+    } = State
+) when PrevKeys =/= undefined ->
+    Now = erlang:monotonic_time(millisecond),
+    Delay = 3 * quic_loss:get_pto(LossState, app),
+    {ok, State#state{
+        key_state = KS#key_update_state{recv_first_pn = PN},
+        prev_keys_retire_deadline = Now + Delay,
+        prev_keys_retire_timer = start_timer(Delay, prev_keys_retire_timeout)
+    }};
 opened_with(
     Keys,
     PN,
@@ -8269,7 +8432,7 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = State#state{
+                    State1 = discard_early_keys(State#state{
                         app_keys = {ClientAppKeys, ServerAppKeys},
                         key_state = KeyState,
                         hs = (State#state.hs)#hs{
@@ -8278,7 +8441,7 @@ process_tls_message(
                             tls_transcript = <<Transcript2/binary, ClientFinishedMsg/binary>>,
                             master_secret = MasterSecret
                         }
-                    },
+                    }),
 
                     %% Send client Certificate(+CertificateVerify)+Finished,
                     %% segmented so no datagram exceeds max_udp_payload_size.
@@ -11857,7 +12020,9 @@ finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
         data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
     };
 finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
-    State = discard_zero_rtt_packets(State0),
+    %% The server rejected 0-RTT: the early keys have no further use,
+    %% and nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2).
+    State = discard_early_keys(discard_zero_rtt_packets(State0)),
     case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;
         RejectedIds -> reset_zero_rtt_streams(RejectedIds, State)
@@ -14602,6 +14767,11 @@ pto_due(#state{pto_scheduled_at = Deadline}) ->
 cancel_timer(undefined) -> ok;
 cancel_timer(Ref) -> erlang:cancel_timer(Ref, [{async, true}, {info, false}]).
 
+%% One-shot connection timer keyed by its timeout message. The returned
+%% reference is both the handle for cancel_timer/1 and the ref the
+%% {timeout, Ref, Message} event carries.
+start_timer(Delay, Message) -> erlang:start_timer(Delay, self(), Message).
+
 %% Handle pacing timeout - drain queued data
 %% Note: pacing_timer is already set to undefined by the handler before calling this
 %% Fast path: send_queue_count == 0 implies queue is empty, avoiding the
@@ -15082,24 +15252,30 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
     %% Toggle key phase
     NewPhase = 1 - CurrentPhase,
 
-    %% Update key state
-    NewKeyState = KeyState#key_update_state{
-        current_phase = NewPhase,
-        current_keys = {NewClientKeys, NewServerKeys},
-        % Keep old keys for decryption during transition
-        prev_keys = CurrentKeys,
-        client_app_secret = NewClientSecret,
-        server_app_secret = NewServerSecret,
-        update_state = initiated,
-        % New phase: reset the AEAD send counter.
-        send_count = 0,
-        recv_first_pn = undefined
-    },
+    %% Update key state. Locally initiated: this transition is not
+    %% driven by unauthenticated input (the key_update API call or the
+    %% AEAD confidentiality limit), so the replaced generation's
+    %% contexts drop and any pending retirement of it is cancelled
+    %% immediately rather than through a deferred commit.
+    NewKeyState = candidate_replace_prev_keys(
+        CurrentKeys,
+        KeyState#key_update_state{
+            current_phase = NewPhase,
+            current_keys = {NewClientKeys, NewServerKeys},
+            client_app_secret = NewClientSecret,
+            server_app_secret = NewServerSecret,
+            update_state = initiated,
+            % New phase: reset the AEAD send counter.
+            send_count = 0,
+            recv_first_pn = undefined
+        }
+    ),
 
-    State#state{
+    State1 = State#state{
         app_keys = {NewClientKeys, NewServerKeys},
-        key_state = NewKeyState
-    }.
+        key_state = element(1, NewKeyState)
+    },
+    commit_key_selection(element(2, NewKeyState), State1).
 
 %% @doc Handle receiving a packet with a different key phase.
 %% This is called when we receive a packet with a key phase that differs
@@ -15115,15 +15291,15 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
 
     case UpdateState of
         initiated ->
-            %% We initiated, peer responded - complete the update
-            NewKeyState = KeyState#key_update_state{
-                prev_keys = undefined,
-                update_state = idle
-            },
-            State#state{key_state = NewKeyState};
+            %% We initiated, peer responded - complete the update.
+            %% The transitioning generation leaves with the candidate;
+            %% its contexts drop only once the packet that completed
+            %% the update has authenticated (commit_key_selection/2).
+            {NewKeyState, Retire} = candidate_replace_prev_keys(undefined, KeyState),
+            {State#state{key_state = NewKeyState}, Retire};
         idle ->
             %% Peer initiated - we need to respond by deriving new keys
-            %% RFC 9001 Section 6.6: HP keys are NOT rotated during key updates
+            %% RFC 9001 Section 5.4: HP keys are NOT rotated during key updates
             {OldClientKeys, OldServerKeys} = CurrentKeys,
             Cipher = OldClientKeys#crypto_keys.cipher,
 
@@ -15149,30 +15325,40 @@ handle_peer_key_update(#state{key_state = KeyState} = State) ->
             },
 
             NewPhase = 1 - CurrentPhase,
-            NewKeyState = KeyState#key_update_state{
-                current_phase = NewPhase,
-                current_keys = {NewClientKeys, NewServerKeys},
-                prev_keys = CurrentKeys,
-                client_app_secret = NewClientSecret,
-                server_app_secret = NewServerSecret,
-                update_state = responding,
-                send_count = 0,
-                recv_first_pn = undefined
-            },
-            State#state{
-                app_keys = {NewClientKeys, NewServerKeys},
-                key_state = NewKeyState
+            {NewKeyState, Retire} = candidate_replace_prev_keys(
+                CurrentKeys,
+                KeyState#key_update_state{
+                    current_phase = NewPhase,
+                    current_keys = {NewClientKeys, NewServerKeys},
+                    client_app_secret = NewClientSecret,
+                    server_app_secret = NewServerSecret,
+                    update_state = responding,
+                    send_count = 0,
+                    recv_first_pn = undefined
+                }
+            ),
+            {
+                State#state{
+                    app_keys = {NewClientKeys, NewServerKeys},
+                    key_state = NewKeyState
+                },
+                Retire
             };
         responding ->
             %% Already responding, just continue
-            State
+            {State, none}
     end.
 
 %% @doc Select the appropriate keys for decryption based on the received key phase.
-%% Returns {Keys, State} where State may be updated if a key update is detected.
+%% Returns {Keys, CandidateState, Retire} where CandidateState carries a
+%% key-update transition that has NOT happened yet, and Retire names what
+%% it would replace: none, or {retire_prev, OldPrev}. The candidate and
+%% its cleanup commit only after the packet authenticates
+%% (commit_key_selection/2, called from the decode success branch) — a
+%% forged packet reaches key selection but never its side effects.
 select_decrypt_keys(_ReceivedKeyPhase, _PN, #state{key_state = undefined} = State) ->
     %% No key state yet, use app_keys directly (should not happen in practice)
-    {State#state.app_keys, State};
+    {State#state.app_keys, State, none};
 select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) ->
     #key_update_state{
         current_phase = CurrentPhase,
@@ -15184,7 +15370,7 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
     case ReceivedKeyPhase of
         CurrentPhase when UpdateState =:= idle ->
             %% Same phase, no update in progress.
-            {CurrentKeys, State};
+            {CurrentKeys, State, none};
         CurrentPhase ->
             %% A packet in the current phase confirms the in-progress key
             %% update: return to idle so the next update (ours or, after a
@@ -15193,9 +15379,11 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
             %% still decrypts, while never re-deriving keys for an old phase
             %% (that path requires prev_keys = undefined), which avoids a
             %% replayed old-phase packet flipping keys backward.
-            {CurrentKeys, State#state{
-                key_state = KeyState#key_update_state{update_state = idle}
-            }};
+            {CurrentKeys,
+                State#state{
+                    key_state = KeyState#key_update_state{update_state = idle}
+                },
+                none};
         _ ->
             %% RFC 9001 §6.5: once the current phase is confirmed, a packet
             %% in the other phase numbered above everything received so far
@@ -15209,12 +15397,85 @@ select_decrypt_keys(ReceivedKeyPhase, PN, #state{key_state = KeyState} = State) 
             PeerUpdate = PrevKeys =:= undefined orelse (UpdateState =:= idle andalso NewerThanAll),
             case PeerUpdate of
                 true ->
-                    State1 = handle_peer_key_update(State),
-                    {State1#state.key_state#key_update_state.current_keys, State1};
+                    {State1, Retire} = handle_peer_key_update(State),
+                    {State1#state.key_state#key_update_state.current_keys, State1, Retire};
                 false ->
-                    {PrevKeys, State}
+                    {PrevKeys, State, none}
             end
     end.
+
+%% A key-update transition as a pure record transformation: NewKeyState
+%% carries NewPrev, and the action names the generation it replaces, for
+%% the commit step to clean up after authentication. No side effects.
+candidate_replace_prev_keys(NewPrev, KeyState) ->
+    OldPrev = KeyState#key_update_state.prev_keys,
+    Retire =
+        case OldPrev of
+            undefined -> none;
+            _ -> {retire_prev, OldPrev}
+        end,
+    {KeyState#key_update_state{prev_keys = NewPrev}, Retire}.
+
+%% Commit a key selection after the packet authenticated: apply the
+%% deferred cleanup the transition named. The candidate's record state
+%% is already in place; nothing is reinstalled or rediscovered here.
+%% The second argument is the candidate state, returned unchanged so
+%% the decode path can keep going through it; replace_prev_keys/2
+%% passes ok and discards the result.
+%%
+%% The pending retirement timer of the replaced generation goes with
+%% it: its deadline described keys that are leaving, and firing it
+%% after a replacement would retire the new generation's previous
+%% keys too early. The fresh deadline is armed by the first
+%% authenticated packet under the new current keys (opened_with/3).
+commit_key_selection(none, State) ->
+    State;
+commit_key_selection({retire_prev, OldPrev}, State) ->
+    %% Only the replaced value's AEAD contexts go; the HP context is
+    %% shared with the live keys (RFC 9001 Sections 5.4 and 6.1) and
+    %% stays.
+    quic_aead_ctx:discard_aead(OldPrev),
+    cancel_prev_keys_retirement(State).
+
+%% Trusted local transitions: the same two stages the decode path
+%% uses, run back to back. initiate_key_update/1 is the only caller;
+%% nothing here is reachable from unauthenticated input.
+
+%% Cancel a pending old-read-key retirement and clear its fields. The
+%% deadline described keys that are being replaced; the next deadline
+%% is armed by the first authenticated packet under the new current
+%% keys (RFC 9001 Section 6.5).
+cancel_prev_keys_retirement(#state{prev_keys_retire_timer = undefined} = State) ->
+    State;
+cancel_prev_keys_retirement(
+    #state{
+        prev_keys_retire_timer = Timer, prev_keys_retire_deadline = _Deadline
+    } = State
+) ->
+    _ = cancel_timer(Timer),
+    State#state{prev_keys_retire_timer = undefined, prev_keys_retire_deadline = undefined}.
+
+%% RFC 9001 Section 6.5: after three PTOs the old read keys and their
+%% corresponding secrets are discarded. What that is here: the
+%% #crypto_keys{} pair in prev_keys - key, IV and the HP key record,
+%% whose contexts the retirement drops while the HP key value itself
+%% lives on in the current keys - and nothing else. The application
+%% traffic secrets are the current generation's (they derive the next
+%% update) and stay; recv_first_pn describes the current generation
+%% and stays until the next update resets it.
+retire_prev_keys(#state{key_state = #key_update_state{prev_keys = undefined}} = State) ->
+    cancel_prev_keys_retirement(State);
+retire_prev_keys(
+    #state{
+        key_state = #key_update_state{prev_keys = OldPrev} = KS
+    } = State
+) ->
+    quic_aead_ctx:discard_aead(OldPrev),
+    State#state{
+        key_state = KS#key_update_state{prev_keys = undefined},
+        prev_keys_retire_timer = undefined,
+        prev_keys_retire_deadline = undefined
+    }.
 
 %% @doc Get the current key phase for sending.
 get_current_key_phase(#state{key_state = undefined}) -> 0;

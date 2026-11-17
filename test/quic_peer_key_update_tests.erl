@@ -8,15 +8,16 @@
 
 -include_lib("eunit/include/eunit.hrl").
 
+%% The keys selected for a late old-phase packet are the previous
+%% generation's; the candidate state rides along uncommitted.
 late_old_phase_packet_uses_previous_keys_test() ->
     S0 = quic_connection_test_support:after_own_key_update(100),
-    {Keys, S1} = quic_connection:select_decrypt_keys(0, 90, S0),
-    ?assertEqual(quic_connection_test_support:state_get(S0, prev_app_keys), Keys),
-    ?assertEqual(1, quic_connection_test_support:key_phase(S1)).
+    {Keys, _S1, none} = quic_connection:select_decrypt_keys(0, 90, S0),
+    ?assertEqual(quic_connection_test_support:state_get(S0, prev_app_keys), Keys).
 
 newer_other_phase_packet_is_a_peer_update_test() ->
     S0 = quic_connection_test_support:after_own_key_update(100),
-    {Keys, S1} = quic_connection:select_decrypt_keys(0, 101, S0),
+    {Keys, S1, {retire_prev, _OldPrev}} = quic_connection:select_decrypt_keys(0, 101, S0),
     ?assertEqual(0, quic_connection_test_support:key_phase(S1)),
     ?assertNotEqual(quic_connection_test_support:state_get(S0, prev_app_keys), Keys),
     ?assertNotEqual(quic_connection_test_support:state_get(S0, app_keys), Keys).

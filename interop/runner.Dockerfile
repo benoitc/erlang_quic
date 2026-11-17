@@ -8,4 +8,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=docker /usr/local/bin/docker /usr/local/bin/docker
 COPY --from=docker /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
-RUN pip install --no-cache-dir pycryptodome random-slugs termcolor prettytable pyshark
+# pyshark is pinned: 0.6's FileCapture teardown crashes against tshark 4.4
+# (TSharkCrashException at capture close, retcode 255) and takes the run
+# down with it; 0.4.3 and older import distutils, which Python 3.12 removed.
+# 0.5.3 is the newest line that both imports on 3.12 and closes captures
+# cleanly; verified against a runner pcap before pinning.
+RUN pip install --no-cache-dir pycryptodome random-slugs termcolor prettytable pyshark==0.5.3

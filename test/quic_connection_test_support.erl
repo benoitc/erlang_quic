@@ -469,17 +469,21 @@ state_with_send_stream(StreamId, SendOffset, SendFin) ->
         data_sent = SendOffset
     }.
 
-%% A client holding 0-RTT keys with the given streams open.
+%% A client holding 0-RTT keys with the given streams open. The keys
+%% are what send_client_hello/1 derives: the pair's second element is
+%% the early secret, a binary (RFC 9001 Section 4.6), not a second key
+%% record.
 -spec zero_rtt_client([non_neg_integer()]) -> #state{}.
 zero_rtt_client([First | _] = StreamIds) ->
     S = state_with_send_stream(First, 0, false),
     #{First := Stream} = S#state.streams,
-    Keys = quic_connection:derive_initial_keys(<<"early-cid">>, ?QUIC_VERSION_1),
+    {ClientKeys, _} = quic_connection:derive_initial_keys(<<"early-cid">>, ?QUIC_VERSION_1),
+    EarlySecret = binary:copy(<<7>>, 32),
     S#state{
         loss_state = quic_loss:new(),
         cc_state = quic_cc:new(#{}),
         streams = maps:from_list([{Id, Stream#stream_state{id = Id}} || Id <- StreamIds]),
-        hs = (S#state.hs)#hs{early_keys = Keys}
+        hs = (S#state.hs)#hs{early_keys = {ClientKeys, EarlySecret}}
     }.
 
 -spec next_app_pn(#state{}) -> non_neg_integer().

@@ -30,6 +30,8 @@
 
 -export([
     ecb_mask/3,
+    forget_ctx/4,
+    forget_aead_ctx/2,
     otp_seal/5,
     otp_open/5,
     encrypt/5,
@@ -289,6 +291,69 @@ aead_seal(Cipher, Key, Nonce, AAD, Plaintext) ->
 %% or `error'. Same layering as aead_seal/5.
 aead_open(Cipher, Key, Nonce, AAD, CiphertextWithTag) ->
     quic_aead_ctx:aead_decrypt(Cipher, Key, Nonce, CiphertextWithTag, AAD).
+
+%% @doc Drop the cached cipher contexts of keys that are being
+%% discarded, so the key schedules go with the keys (RFC 9001 Section
+%% 4.9). Cipher is the AEAD the key protects packets with, Key its
+%% packet-protection key; HpCipher and HP the header-protection cipher
+%% and key. Erasing an emptied map keeps the process dictionary as
+%% clean as the NIF path's discard. Kept by the caller's other keys,
+%% and any context a later seal recreates, are untouched.
+%% @private
+forget_ctx(Cipher, Key, HpCipher, HP) ->
+    KeyId = quic_aead_ctx:key_id(Key),
+    lists:foreach(
+        fun(Enc) ->
+            CacheKey = {aead_ctx, Cipher, Enc},
+            case erlang:get(CacheKey) of
+                undefined ->
+                    ok;
+                Cache ->
+                    case maps:remove(KeyId, Cache) of
+                        Empty when map_size(Empty) =:= 0 -> erlang:erase(CacheKey);
+                        Kept -> erlang:put(CacheKey, Kept)
+                    end
+            end
+        end,
+        [true, false]
+    ),
+    HpCacheKey = {hp_ctx, HpCipher},
+    case erlang:get(HpCacheKey) of
+        undefined ->
+            ok;
+        HpCache ->
+            HpId = quic_aead_ctx:key_id(HP),
+            case maps:remove(HpId, HpCache) of
+                Empty when map_size(Empty) =:= 0 -> erlang:erase(HpCacheKey);
+                Kept -> erlang:put(HpCacheKey, Kept)
+            end
+    end,
+    ok.
+
+%% @doc Drop the cached AEAD cipher contexts of retired keys, leaving
+%% the header-protection cache alone: on a key update the new keys
+%% keep the same HP key (RFC 9001 Sections 5.4 and 6.1), and its
+%% context is shared with the live keys. Shape and rationale match
+%% forget_ctx/4; see aead_ctx/3.
+%% @private
+forget_aead_ctx(Cipher, Key) ->
+    KeyId = quic_aead_ctx:key_id(Key),
+    lists:foreach(
+        fun(Enc) ->
+            CacheKey = {aead_ctx, Cipher, Enc},
+            case erlang:get(CacheKey) of
+                undefined ->
+                    ok;
+                Cache ->
+                    case maps:remove(KeyId, Cache) of
+                        Empty when map_size(Empty) =:= 0 -> erlang:erase(CacheKey);
+                        Kept -> erlang:put(CacheKey, Kept)
+                    end
+            end
+        end,
+        [true, false]
+    ),
+    ok.
 
 %% @private
 %% Seal on OTP crypto alone, with a reusable cipher context where the

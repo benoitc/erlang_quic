@@ -242,7 +242,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:sockname/1` - Get local address
 - `quic:peercert/1` - Get peer certificate
 - `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
-- `quic:has_early_keys/1` - Whether 0-RTT (early data) keys are available
+- `quic:has_early_keys/1` - Whether 0-RTT (early data) keys are held right now (false once 1-RTT keys are installed, RFC 9001 §4.9.3)
 - `quic:early_data_accepted/1` - Whether the server accepted 0-RTT early data
 
 ### Datagrams (RFC 9221)

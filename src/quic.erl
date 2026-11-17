@@ -832,9 +832,14 @@ get_path_stats(Conn) when is_pid(Conn) ->
 get_stats(Conn) when is_pid(Conn) ->
     quic_connection:get_stats(Conn).
 
-%% @doc Returns whether the connection has derived early keys (i.e. a
-%% session ticket was provided and 0-RTT is possible). Used by the H3
-%% layer to choose between the fresh-handshake and 0-RTT paths.
+%% @doc Returns whether the connection currently holds 0-RTT (early
+%% data) keys: a session ticket was provided, 0-RTT is possible, and
+%% the handshake has not yet reached 1-RTT. A client drops the keys
+%% when it installs 1-RTT keys and when the server rejects 0-RTT
+%% (RFC 9001 Section 4.9.3), so the answer is false from then on even
+%% on a resumed connection. Used by the H3 layer to choose between the
+%% fresh-handshake and 0-RTT paths at bootstrap; for "did the server
+%% accept early data" use {@link early_data_accepted/1} instead.
 -spec has_early_keys(Conn) -> boolean() when
     Conn :: pid().
 has_early_keys(Conn) when is_pid(Conn) ->
