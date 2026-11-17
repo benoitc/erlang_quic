@@ -603,6 +603,13 @@
     early_keys_discard_timer :: reference() | undefined,
     early_keys_discard_deadline = undefined :: integer() | undefined,
 
+    %% Old-read-key retirement (RFC 9001 Section 6.5): the previous
+    %% key-update generation is kept no longer than three PTOs after
+    %% the first packet protected with the new keys arrives. Same
+    %% never-moves deadline and early-delivery re-arm rules.
+    prev_keys_retire_timer :: reference() | undefined,
+    prev_keys_retire_deadline = undefined :: integer() | undefined,
+
     %% Pending data - priority queue with 8 buckets (one per urgency 0-7)
     %% Each bucket is a queue:queue() for FIFO within same priority
     send_queue = {

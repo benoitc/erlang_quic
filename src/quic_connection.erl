@@ -1387,6 +1387,7 @@ terminate(
         pacing_timer = PacingTimer,
         ack_timer = AckTimer,
         early_keys_discard_timer = EarlyKeysDiscardTimer,
+        prev_keys_retire_timer = PrevKeysRetireTimer,
         cfg = #conn_cfg{
             send_socket = SendSocket,
             role = Role,
@@ -1441,6 +1442,7 @@ terminate(
     cancel_timer(PacingTimer),
     cancel_timer(AckTimer),
     cancel_timer(EarlyKeysDiscardTimer),
+    cancel_timer(PrevKeysRetireTimer),
     %% Close dedicated send socket for server connections (SO_REUSEPORT socket)
     case SendSocket of
         undefined -> ok;
@@ -2573,6 +2575,35 @@ handle_common_event(
     end;
 handle_common_event(info, {timeout, _StaleRef, early_keys_discard_timeout}, _StateName, State) ->
     %% Stale disposal timer (ref doesn't match)
+    {keep_state, State};
+%% RFC 9001 Section 6.5: the three-PTO window for the previous key
+%% generation closed (or claims to - the deadline is re-checked). The
+%% old read keys and everything derived for them go; recv_first_pn
+%% describes the current generation and stays until the next update.
+handle_common_event(
+    info,
+    {timeout, Ref, prev_keys_retire_timeout},
+    StateName,
+    #state{prev_keys_retire_timer = Ref} = State
+) when
+    Ref =/= undefined andalso is_integer(State#state.prev_keys_retire_deadline)
+->
+    Now = erlang:monotonic_time(millisecond),
+    Deadline = State#state.prev_keys_retire_deadline,
+    case Now >= Deadline of
+        true ->
+            {keep_state, retire_prev_keys(State)};
+        false ->
+            %% Delivered early: re-arm for the remainder, deadline
+            %% unchanged.
+            _ = cancel_timer(Ref),
+            Delay = max(0, Deadline - Now),
+            {keep_state, State#state{
+                prev_keys_retire_timer = start_timer(Delay, prev_keys_retire_timeout)
+            }}
+    end;
+handle_common_event(info, {timeout, _StaleRef, prev_keys_retire_timeout}, _StateName, State) ->
+    %% Stale retirement timer (ref doesn't match, or no deadline armed)
     {keep_state, State};
 %% RFC 9000 Section 10.1: a handshake still running at its deadline is closed, silently if idle.
 handle_common_event({timeout, handshake_deadline}, expired, StateName, State) when
@@ -6321,10 +6352,15 @@ decrypt_app_packet(Header, EncryptedPayload, CurrentKeys, State) ->
 %% The peer-direction keys for the fused path: only when no key update
 %% is in flight, so a same-phase packet cannot carry phase-transition
 %% side effects (select_decrypt_keys/2 handles those on the slow path).
+%% A held previous generation also takes the slow path: its retirement
+%% clock (RFC 9001 Section 6.5) starts at the first authenticated
+%% packet under the new keys, which the generic path's opened_with/3
+%% owns.
 fused_decrypt_keys(CurrentKeys, #state{key_state = undefined}) ->
     {ok, CurrentKeys};
 fused_decrypt_keys(_CurrentKeys, #state{
-    key_state = #key_update_state{update_state = idle, current_keys = {CK, SK}},
+    key_state =
+        #key_update_state{update_state = idle, current_keys = {CK, SK}, prev_keys = undefined},
     cfg = #conn_cfg{
         role = Role
     }
@@ -6417,6 +6453,34 @@ decrypt_app_packet_slow(Header, EncryptedPayload, CurrentKeys, State) ->
 
 %% RFC 9001 Section 6.4: a packet numbered above one opened with newer
 %% keys must not open with older ones.
+%%
+%% The first clause is also the retirement trigger (Section 6.5): a
+%% packet opened with the current keys while a previous generation is
+%% still held is the first authenticated packet under those keys, so
+%% the three-PTO clock for the old read keys starts here - after AEAD
+%% succeeded, never from key selection alone. The deadline never
+%% moves once armed; the fire handler re-arms an early delivery.
+opened_with(
+    Keys,
+    PN,
+    #state{
+        key_state =
+            #key_update_state{
+                current_keys = Keys,
+                recv_first_pn = undefined,
+                prev_keys = PrevKeys
+            } = KS,
+        prev_keys_retire_timer = undefined,
+        loss_state = LossState
+    } = State
+) when PrevKeys =/= undefined ->
+    Now = erlang:monotonic_time(millisecond),
+    Delay = 3 * quic_loss:get_pto(LossState, app),
+    {ok, State#state{
+        key_state = KS#key_update_state{recv_first_pn = PN},
+        prev_keys_retire_deadline = Now + Delay,
+        prev_keys_retire_timer = start_timer(Delay, prev_keys_retire_timeout)
+    }};
 opened_with(
     Keys,
     PN,
@@ -15191,8 +15255,9 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
     %% Update key state. Locally initiated: this transition is not
     %% driven by unauthenticated input (the key_update API call or the
     %% AEAD confidentiality limit), so the replaced generation's
-    %% contexts drop immediately rather than through a deferred commit.
-    NewKeyState = replace_prev_keys(
+    %% contexts drop and any pending retirement of it is cancelled
+    %% immediately rather than through a deferred commit.
+    NewKeyState = candidate_replace_prev_keys(
         CurrentKeys,
         KeyState#key_update_state{
             current_phase = NewPhase,
@@ -15206,10 +15271,11 @@ initiate_key_update(#state{key_state = KeyState} = State) ->
         }
     ),
 
-    State#state{
+    State1 = State#state{
         app_keys = {NewClientKeys, NewServerKeys},
-        key_state = NewKeyState
-    }.
+        key_state = element(1, NewKeyState)
+    },
+    commit_key_selection(element(2, NewKeyState), State1).
 
 %% @doc Handle receiving a packet with a different key phase.
 %% This is called when we receive a packet with a key phase that differs
@@ -15356,23 +15422,60 @@ candidate_replace_prev_keys(NewPrev, KeyState) ->
 %% The second argument is the candidate state, returned unchanged so
 %% the decode path can keep going through it; replace_prev_keys/2
 %% passes ok and discards the result.
+%%
+%% The pending retirement timer of the replaced generation goes with
+%% it: its deadline described keys that are leaving, and firing it
+%% after a replacement would retire the new generation's previous
+%% keys too early. The fresh deadline is armed by the first
+%% authenticated packet under the new current keys (opened_with/3).
 commit_key_selection(none, State) ->
     State;
 commit_key_selection({retire_prev, OldPrev}, State) ->
     %% Only the replaced value's AEAD contexts go; the HP context is
     %% shared with the live keys (RFC 9001 Sections 5.4 and 6.1) and
-    %% stays. The early-delivery cancellation of a pending retirement
-    %% timer belongs to the same transition and is added with it.
+    %% stays.
     quic_aead_ctx:discard_aead(OldPrev),
-    State.
+    cancel_prev_keys_retirement(State).
 
-%% Trusted local transitions only: replace prev_keys and clean up the
-%% replaced generation in one step. Never reached from the decode path,
-%% where the same cleanup waits for authentication.
-replace_prev_keys(NewPrev, KeyState) ->
-    {NewKeyState, Retire} = candidate_replace_prev_keys(NewPrev, KeyState),
-    commit_key_selection(Retire, ok),
-    NewKeyState.
+%% Trusted local transitions: the same two stages the decode path
+%% uses, run back to back. initiate_key_update/1 is the only caller;
+%% nothing here is reachable from unauthenticated input.
+
+%% Cancel a pending old-read-key retirement and clear its fields. The
+%% deadline described keys that are being replaced; the next deadline
+%% is armed by the first authenticated packet under the new current
+%% keys (RFC 9001 Section 6.5).
+cancel_prev_keys_retirement(#state{prev_keys_retire_timer = undefined} = State) ->
+    State;
+cancel_prev_keys_retirement(
+    #state{
+        prev_keys_retire_timer = Timer, prev_keys_retire_deadline = _Deadline
+    } = State
+) ->
+    _ = cancel_timer(Timer),
+    State#state{prev_keys_retire_timer = undefined, prev_keys_retire_deadline = undefined}.
+
+%% RFC 9001 Section 6.5: after three PTOs the old read keys and their
+%% corresponding secrets are discarded. What that is here: the
+%% #crypto_keys{} pair in prev_keys - key, IV and the HP key record,
+%% whose contexts the retirement drops while the HP key value itself
+%% lives on in the current keys - and nothing else. The application
+%% traffic secrets are the current generation's (they derive the next
+%% update) and stay; recv_first_pn describes the current generation
+%% and stays until the next update resets it.
+retire_prev_keys(#state{key_state = #key_update_state{prev_keys = undefined}} = State) ->
+    cancel_prev_keys_retirement(State);
+retire_prev_keys(
+    #state{
+        key_state = #key_update_state{prev_keys = OldPrev} = KS
+    } = State
+) ->
+    quic_aead_ctx:discard_aead(OldPrev),
+    State#state{
+        key_state = KS#key_update_state{prev_keys = undefined},
+        prev_keys_retire_timer = undefined,
+        prev_keys_retire_deadline = undefined
+    }.
 
 %% @doc Get the current key phase for sending.
 get_current_key_phase(#state{key_state = undefined}) -> 0;
