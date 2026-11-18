@@ -8,6 +8,10 @@ All notable changes to this project will be documented in this file.
 - With the optional crypto NIF loaded, a server kept its 0-RTT keys
   for the life of the connection instead of dropping them three probe
   timeouts after the first 1-RTT packet (RFC 9001 Section 4.9.3).
+- After a Retry a client sent a new ClientHello, with a new random and
+  key share, instead of the one from its first Initial (RFC 9000
+  Section 17.2.5.3). A server may drop such an Initial or close the
+  connection.
 
 ## [3.1.3] - 2026-11-18
 

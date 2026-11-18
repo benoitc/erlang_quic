@@ -2891,7 +2891,10 @@ send_client_hello(State) ->
                 end
         }
     },
-    NewState = send_initial_crypto(ClientHello, 0, with_remembered_params(SessionTicket, State0)),
+    send_client_hello_flight(ClientHello, with_remembered_params(SessionTicket, State0)).
+
+send_client_hello_flight(ClientHello, State) ->
+    NewState = send_initial_crypto(ClientHello, 0, State),
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
@@ -6170,20 +6173,21 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID, State1#state.version),
     State2 = State1#state{hs = (State1#state.hs)#hs{initial_keys = {ClientKeys, ServerKeys}}},
 
-    %% Reset crypto state for a fresh Initial
+    %% The Initial flight starts over at offset 0 with the same
+    %% ClientHello (RFC 9000 Section 17.2.5.3), which is all the
+    %% transcript holds before a server Initial.
+    ClientHello = (State2#state.hs)#hs.tls_transcript,
     State3 = State2#state{
         hs = (State2#state.hs)#hs{
-            crypto_offset = #{initial => 0, handshake => 0, app => 0},
-            tls_transcript = <<>>
+            crypto_offset = #{initial => 0, handshake => 0, app => 0}
         }
     },
 
     %% Reset packet number space for Initial
     {State4, EarlyData} = reset_initial_pn_space(State3),
 
-    %% Resend the ClientHello using send_client_hello
-    %% (the retry_token field is now set, so send_initial_packet will use it)
-    State5 = replay_early_data(EarlyData, send_client_hello(State4)),
+    %% The retry_token field is now set, so send_initial_packet will use it
+    State5 = replay_early_data(EarlyData, send_client_hello_flight(ClientHello, State4)),
 
     %% Return state with retry info, no frames to process
     {ok, retry_handled, [], <<>>, State5}.

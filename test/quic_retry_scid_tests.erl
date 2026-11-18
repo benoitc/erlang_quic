@@ -15,16 +15,42 @@
 -define(SCID, <<"own-cid0">>).
 
 retry_echoing_our_dcid_discarded_test() ->
-    S0 = client(),
+    S0 = quic_connection:send_client_hello(client()),
     S = quic_connection:handle_packet_loop(retry(?ODCID), S0),
     ?assertEqual(?ODCID, S#state.dcid),
     ?assertNot((S#state.hs)#hs.retry_received).
 
 retry_with_a_new_scid_accepted_test() ->
-    S0 = client(),
+    S0 = quic_connection:send_client_hello(client()),
     S = quic_connection:handle_packet_loop(retry(<<"retry-sc">>), S0),
     ?assertEqual(<<"retry-sc">>, S#state.dcid),
     ?assert((S#state.hs)#hs.retry_received).
+
+%% "A client MUST use the same cryptographic handshake message it
+%% included in this packet" (RFC 9000 Section 17.2.5.3): the Initial
+%% sent after a Retry carries the ClientHello of the first one, and the
+%% key share and random behind it are kept.
+retry_keeps_the_client_hello_test() ->
+    S0 = quic_connection:send_client_hello(client()),
+    #hs{tls_transcript = ClientHello, tls_private_key = PrivKey, tls_ch1_random = Random} =
+        S0#state.hs,
+    ?assertEqual(ClientHello, initial_crypto(S0)),
+    S = quic_connection:handle_packet_loop(retry(<<"retry-sc">>), S0),
+    ?assert((S#state.hs)#hs.retry_received),
+    ?assertEqual(ClientHello, initial_crypto(S)),
+    ?assertMatch(
+        #hs{tls_transcript = ClientHello, tls_private_key = PrivKey, tls_ch1_random = Random},
+        S#state.hs
+    ).
+
+%% The CRYPTO data of the Initial packets in flight, in offset order.
+initial_crypto(#state{loss_state = LossState}) ->
+    Chunks = lists:keysort(1, [
+        {Offset, Data}
+     || #sent_packet{frames = Frames} <- maps:values(quic_loss:sent_packets(initial, LossState)),
+        {crypto, Offset, Data} <- Frames
+    ]),
+    iolist_to_binary([Data || {_, Data} <- Chunks]).
 
 client() ->
     #state{cfg = Cfg, hs = HS} =
