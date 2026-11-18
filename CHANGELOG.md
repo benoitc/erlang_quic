@@ -32,6 +32,9 @@ All notable changes to this project will be documented in this file.
 - A `content-length` the application put on a 2xx response to CONNECT
   was sent. A server must not send one there, so it is now left out,
   as it already is on 1xx and 204 responses (RFC 9110 Section 8.6).
+- A server accepted a session ticket for seven days, whatever lifetime
+  it had advertised for it (24 hours). It now stops accepting the
+  ticket when that lifetime ends.
 
 ## [3.1.3] - 2026-11-18
 
