@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A malformed HTTP/3 datagram — no Quarter Stream ID, a truncated
+  one, or one larger than any legal stream id — dropped the datagram
+  and kept the connection up. It now closes with H3_DATAGRAM_ERROR,
+  as RFC 9297 Section 2.1 requires. A datagram for a valid but
+  unknown stream is still dropped silently, which the same section
+  allows.
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed

@@ -124,6 +124,9 @@
 -define(H3_MESSAGE_ERROR, 16#10e).
 -define(H3_CONNECT_ERROR, 16#10f).
 -define(H3_VERSION_FALLBACK, 16#110).
+%% RFC 9297 Section 2.1: a malformed HTTP/3 datagram is an H3 connection
+%% error of this type.
+-define(H3_DATAGRAM_ERROR, 16#33).
 
 %%====================================================================
 %% Transport Parameters (RFC 9000 Section 18.2)
