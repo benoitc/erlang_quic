@@ -109,7 +109,6 @@
 -ifdef(TEST).
 -export([
     state_record_size/0,
-    outbound_response_headers/3,
     handle_stream_data/4,
     handle_stream_closed/2,
     handle_stream_closed/3,
