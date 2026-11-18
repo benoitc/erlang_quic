@@ -367,6 +367,37 @@ head_push_with_content_length_and_no_body_completes_test() ->
     %% received_pushes is at position 39
     ?assertEqual(#{}, element(39, State1)).
 
+%% RFC 9114 Section 4.1.2: a pushed response that ends on its HEADERS
+%% with a Content-Length above zero is malformed, as one that ends
+%% short after DATA is.
+push_ending_on_headers_short_of_content_length_test() ->
+    _ = push_events(),
+    Push = <<1, 5, (push_response_frame(200, [{<<"content-length">>, <<"10">>}]))/binary>>,
+    ?assertMatch(
+        {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+        quic_h3_connection:handle_stream_data(3, Push, true, promised_state(<<"GET">>))
+    ),
+    ?assertEqual([], [E || {push_complete, _} = E <- push_events()]).
+
+%% Nothing is missing when the length is zero, or is not a body length
+%% (RFC 9110 Section 8.6).
+push_ending_on_headers_with_nothing_missing_test_() ->
+    lists:map(
+        fun({Method, Status, Length}) ->
+            fun() ->
+                _ = push_events(),
+                Push = <<
+                    1, 5, (push_response_frame(Status, [{<<"content-length">>, Length}]))/binary
+                >>,
+                {ok, _} = quic_h3_connection:handle_stream_data(
+                    3, Push, true, promised_state(Method)
+                ),
+                ?assertEqual({push_complete, 5}, lists:last(push_events()))
+            end
+        end,
+        [{<<"GET">>, 200, <<"0">>}, {<<"HEAD">>, 200, <<"10">>}, {<<"GET">>, 304, <<"10">>}]
+    ).
+
 promised_state(Method) ->
     make_test_state(#{
         role => client,
