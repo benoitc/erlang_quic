@@ -35,6 +35,13 @@ All notable changes to this project will be documented in this file.
 - A server accepted a session ticket for seven days, whatever lifetime
   it had advertised for it (24 hours). It now stops accepting the
   ticket when that lifetime ends.
+- On a host where the kernel accepts the UDP GSO socket option but
+  refuses the segmented sends (Linux answers EIO when the outgoing
+  device cannot checksum for GSO, as with tx checksum offload off),
+  every batch of two or more packets was dropped with a
+  `gso_run_send_error` warning and the connection ran on
+  retransmissions. The batch now goes out packet by packet and the
+  socket stops using GSO.
 
 ## [3.1.3] - 2026-11-18
 
