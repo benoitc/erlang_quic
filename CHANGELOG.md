@@ -17,6 +17,10 @@ All notable changes to this project will be documented in this file.
   flow-control limit, so the client could send more than the server
   allowed and have the connection closed with FLOW_CONTROL_ERROR
   (RFC 9000 Section 4.1).
+- A client that offered 0-RTT and received a TLS HelloRetryRequest kept
+  sending 0-RTT data until EncryptedExtensions arrived, although the
+  server had already rejected it. The client now treats the
+  HelloRetryRequest as the rejection (RFC 9001 Section 4.6.2).
 
 ## [3.1.3] - 2026-11-18
 
