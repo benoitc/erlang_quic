@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- After a Retry a client sent a new ClientHello, with a new random and
+  key share, instead of the one from its first Initial (RFC 9000
+  Section 17.2.5.3). A server may drop such an Initial or close the
+  connection.
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed
