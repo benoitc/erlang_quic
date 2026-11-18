@@ -9332,9 +9332,16 @@ handle_hello_retry_request(
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,
 
-            Off = (State#state.hs)#hs.initial_tx_off,
-            State1 = State#state{
-                hs = (State#state.hs)#hs{
+            %% RFC 9001 Section 4.6.2: a server that sends a
+            %% HelloRetryRequest always rejects 0-RTT.
+            Rejected =
+                case (State#state.hs)#hs.early_keys of
+                    undefined -> State;
+                    _ -> reject_zero_rtt(State)
+                end,
+            Off = (Rejected#state.hs)#hs.initial_tx_off,
+            State1 = Rejected#state{
+                hs = (Rejected#state.hs)#hs{
                     hrr_sent = true,
                     hrr_group = SelGroup,
                     hrr_cipher = Cipher,
@@ -12019,9 +12026,13 @@ finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
     State#state{
         data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
     };
-finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
-    %% The server rejected 0-RTT: the early keys have no further use,
-    %% and nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2).
+finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State) ->
+    reject_zero_rtt(State).
+
+%% The server rejected 0-RTT: the early keys have no further use, and
+%% nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2). A no-op
+%% when none was offered or the rejection was already handled.
+reject_zero_rtt(State0) ->
     State = discard_early_keys(discard_zero_rtt_packets(State0)),
     case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;

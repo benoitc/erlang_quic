@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A client that offered 0-RTT and received a TLS HelloRetryRequest kept
+  sending 0-RTT data until EncryptedExtensions arrived, although the
+  server had already rejected it. The client now treats the
+  HelloRetryRequest as the rejection (RFC 9001 Section 4.6.2).
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed
