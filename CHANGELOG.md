@@ -21,6 +21,10 @@ All notable changes to this project will be documented in this file.
   sending 0-RTT data until EncryptedExtensions arrived, although the
   server had already rejected it. The client now treats the
   HelloRetryRequest as the rejection (RFC 9001 Section 4.6.2).
+- A MAX_STREAM_DATA frame that arrived before the first data of a
+  stream the peer opened was dropped, and the credit with it, so a
+  later write on that stream could stall. The frame now opens the
+  stream, as the other stream frames do (RFC 9000 Section 3.2).
 
 ## [3.1.3] - 2026-11-18
 
