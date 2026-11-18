@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- `pmtu_search_complete` is logged at info level when a PMTU search
+  ends at a new value, and at debug level when it ends where it began.
+  Every connection searches again each `pmtu_raise_interval` (10
+  minutes) for as long as the path is below `pmtu_max_mtu`, which on
+  an ordinary Ethernet path is always, and logged the same line each
+  time.
+
 ### Fixed
 - With the optional crypto NIF loaded, a server kept its 0-RTT keys
   for the life of the connection instead of dropping them three probe

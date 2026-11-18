@@ -943,7 +943,11 @@
     black_hole_count = 0 :: non_neg_integer(),
 
     %% Threshold for black hole detection (consecutive losses)
-    black_hole_threshold = 6 :: pos_integer()
+    black_hole_threshold = 6 :: pos_integer(),
+
+    %% The MTU of the last search logged as complete, so a periodic
+    %% search that ends where it started is not reported again
+    logged_mtu :: pos_integer() | undefined
 }).
 
 %% PMTU Discovery configuration options
