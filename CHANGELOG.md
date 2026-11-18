@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.1.3] - 2026-11-18
 
 ### Fixed
 - A malformed HTTP/3 datagram — no Quarter Stream ID, a truncated
