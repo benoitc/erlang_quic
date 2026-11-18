@@ -114,6 +114,20 @@ unit_arms_once_at_3pto_test() ->
     ?assertEqual(S1#state.early_keys_discard_timer, S2#state.early_keys_discard_timer),
     ?assertEqual(S1#state.early_keys_discard_deadline, S2#state.early_keys_discard_deadline).
 
+%% The batched receive path arms the same window: nothing for a run
+%% that opened no packet, the deadline on the first run that did, and
+%% the same deadline after later runs.
+unit_batched_receive_arms_once_test() ->
+    S0 = server_with_early_keys(),
+    S1 = quic_connection:opened_run([], S0),
+    ?assertEqual(undefined, S1#state.early_keys_discard_deadline),
+    S2 = quic_connection:opened_run([{0, 16#40, [ping]}], S1),
+    ?assert(is_reference(S2#state.early_keys_discard_timer)),
+    ?assert(is_integer(S2#state.early_keys_discard_deadline)),
+    S3 = quic_connection:opened_run([{1, 16#40, [ping]}, {2, 16#40, [ping]}], S2),
+    ?assertEqual(S2#state.early_keys_discard_timer, S3#state.early_keys_discard_timer),
+    ?assertEqual(S2#state.early_keys_discard_deadline, S3#state.early_keys_discard_deadline).
+
 %% Other packet types and roles arm nothing.
 unit_arms_only_for_server_app_test() ->
     S0 = server_with_early_keys(),
