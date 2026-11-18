@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- On a host where the kernel accepts the UDP GSO socket option but
+  refuses the segmented sends (Linux answers EIO when the outgoing
+  device cannot checksum for GSO, as with tx checksum offload off),
+  every batch of two or more packets was dropped with a
+  `gso_run_send_error` warning and the connection ran on
+  retransmissions. The batch now goes out packet by packet and the
+  socket stops using GSO.
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed
