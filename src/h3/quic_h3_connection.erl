@@ -139,6 +139,8 @@
     pre_claim_bidi_stream/3,
     assign_uni_stream/3,
     validate_peer_h3_datagram_with/1,
+    deliver_h3_datagram/2,
+    decode_h3_datagram/1,
     handle_peer_reset/4,
     maybe_close_if_drained/1
 ]).
@@ -1223,8 +1225,10 @@ live_event(
     {quic, QuicConn, {datagram, Data}},
     #state{quic_conn = QuicConn} = State
 ) ->
-    deliver_h3_datagram(Data, State),
-    {keep_state, State};
+    case deliver_h3_datagram(Data, State) of
+        {action, Action} -> Action;
+        {ok, State1} -> {keep_state, State1}
+    end;
 live_event({call, From}, {send_h3_datagram, StreamId, Data}, State) ->
     {keep_state, State, [{reply, From, h3_send_datagram(StreamId, Data, State)}]};
 live_event({call, From}, h3_datagrams_enabled, State) ->
@@ -5663,21 +5667,48 @@ peer_supports_datagrams(_) -> false.
 %% RFC 9297 §2.1 inbound datagram. Peel the quarter-stream-id varint
 %% and deliver the payload tagged with the full stream id to the owner.
 %% Datagrams for unknown streams are dropped silently per §5.
+%%
+%% A datagram that does not decode, or whose quarter stream id is above
+%% 2^60-1 — a client-initiated bidirectional stream id divided by four
+%% is the largest legal value — is malformed, and §2.1 makes that an
+%% H3 connection error of type H3_DATAGRAM_ERROR, not a silent drop.
 deliver_h3_datagram(Data, #state{owner = Owner} = State) ->
     case decode_h3_datagram(Data) of
         {ok, StreamId, Payload} ->
             case live_stream(StreamId, State#state.streams) of
-                {ok, _} -> Owner ! {quic_h3, self(), {datagram, StreamId, Payload}};
-                error -> ok
+                {ok, _} ->
+                    Owner ! {quic_h3, self(), {datagram, StreamId, Payload}},
+                    {ok, State};
+                error ->
+                    {ok, State}
             end;
         error ->
-            ok
+            %% RFC 9297 §2.1: a malformed HTTP/3 datagram is a
+            %% connection error. handle_connection_error/2 returns the
+            %% gen_statem action that notifies the owner, closes the
+            %% QUIC connection and moves to closing, the way every
+            %% other H3 connection error is raised here.
+            {action,
+                handle_connection_error(
+                    {connection_error, ?H3_DATAGRAM_ERROR, <<"malformed HTTP/3 datagram">>},
+                    State
+                )}
     end.
+
+%% RFC 9297 §2.1: the Quarter Stream ID field is a varint, and a value
+%% above 2^60-1 cannot name a stream (the largest stream id is 2^62-4,
+%% a client-initiated bidirectional one, and the field carries it
+%% divided by four). Anything larger is maliciously large.
+-define(H3_MAX_QUARTER_STREAM_ID, (1 bsl 60) - 1).
 
 decode_h3_datagram(Bin) ->
     try
-        {QSID, Rest} = quic_varint:decode(Bin),
-        {ok, QSID bsl 2, Rest}
+        case quic_varint:decode(Bin) of
+            {QSID, Rest} when QSID =< ?H3_MAX_QUARTER_STREAM_ID ->
+                {ok, QSID bsl 2, Rest};
+            _ ->
+                error
+        end
     catch
         _:_ -> error
     end.
