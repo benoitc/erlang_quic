@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server accepted a session ticket for seven days, whatever lifetime
+  it had advertised for it (24 hours). It now stops accepting the
+  ticket when that lifetime ends.
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed

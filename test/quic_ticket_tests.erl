@@ -55,6 +55,28 @@ lookup_aged(Age, Lifetime) ->
     ?assertEqual(Found, map_size(quic_ticket:clear_expired(Store)) =:= 1),
     Found.
 
+%% A server takes a ticket it issued for the lifetime it advertised in
+%% NewSessionTicket and no longer, on lookup and on single use.
+issued_ticket_ends_with_its_lifetime_test() ->
+    #session_ticket{ticket = Id, lifetime = Lifetime} =
+        Ticket = quic_ticket:create_ticket(<<"example.com">>, <<0:256>>, 0, aes_128_gcm, <<"h3">>),
+    Tab = ets:new(issued, [set, public]),
+    Stored = fun(AgeSeconds) ->
+        ets:insert(Tab, {Id, Ticket, erlang:monotonic_time(millisecond) - AgeSeconds * 1000})
+    end,
+    try
+        Stored(Lifetime - 60),
+        ?assertEqual({ok, Ticket}, quic_ticket:lookup_issued(Tab, Id)),
+        ?assertEqual({ok, Ticket}, quic_ticket:take_issued(Tab, Id)),
+        Stored(Lifetime + 60),
+        ?assertEqual(error, quic_ticket:lookup_issued(Tab, Id)),
+        Stored(Lifetime + 60),
+        ?assertEqual(error, quic_ticket:take_issued(Tab, Id)),
+        ?assertEqual([], ets:tab2list(Tab))
+    after
+        ets:delete(Tab)
+    end.
+
 ticket_store_clear_test() ->
     Store = quic_ticket:new_store(),
     Ticket = create_test_ticket(<<"example.com">>),
