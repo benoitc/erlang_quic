@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
   key share, instead of the one from its first Initial (RFC 9000
   Section 17.2.5.3). A server may drop such an Initial or close the
   connection.
+- 0-RTT data a client wrote between the server accepting it and the
+  end of the handshake was not counted against the connection's
+  flow-control limit, so the client could send more than the server
+  allowed and have the connection closed with FLOW_CONTROL_ERROR
+  (RFC 9000 Section 4.1).
 
 ## [3.1.3] - 2026-11-18
 
