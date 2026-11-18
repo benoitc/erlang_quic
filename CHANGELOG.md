@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- With the optional crypto NIF loaded, a server kept its 0-RTT keys
+  for the life of the connection instead of dropping them three probe
+  timeouts after the first 1-RTT packet (RFC 9001 Section 4.9.3).
+
 ## [3.1.3] - 2026-11-18
 
 ### Fixed

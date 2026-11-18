@@ -5021,7 +5021,7 @@ handle_short_run(Packets, Keys, State) ->
         )
     of
         {ok, Results} ->
-            State1 = fold_opened(Results, State),
+            State1 = opened_run(Results, State),
             case lists:nthtail(length(Results), Run) of
                 [] ->
                     do_handle_packets_batch(Tail, State1);
@@ -5036,6 +5036,11 @@ handle_short_run(Packets, Keys, State) ->
             [Packet | Rest] = Packets,
             do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end.
+
+opened_run([], State) ->
+    State;
+opened_run(Results, State) ->
+    server_schedule_0rtt_discard(app, fold_opened(Results, State)).
 
 take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
     take_short_run(Rest, [P | Acc]);

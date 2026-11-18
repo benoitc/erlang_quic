@@ -31,7 +31,7 @@ early_keys(Server) ->
 %% explicit 1-RTT packet (the trigger): the keys survive the handshake,
 %% the window arms on the 1-RTT packet, and the keys are gone after
 %% three PTOs. Fails on main, where the keys live for the connection.
-server_discards_early_keys_after_first_1rtt_test() ->
+server_discards_early_keys_after_first_1rtt_test_() ->
     {timeout, 60, fun server_discards_early_keys_after_first_1rtt/0}.
 
 server_discards_early_keys_after_first_1rtt() ->
@@ -113,6 +113,20 @@ unit_arms_once_at_3pto_test() ->
     S2 = quic_connection:server_schedule_0rtt_discard(app, S1),
     ?assertEqual(S1#state.early_keys_discard_timer, S2#state.early_keys_discard_timer),
     ?assertEqual(S1#state.early_keys_discard_deadline, S2#state.early_keys_discard_deadline).
+
+%% The batched receive path arms the same window: nothing for a run
+%% that opened no packet, the deadline on the first run that did, and
+%% the same deadline after later runs.
+unit_batched_receive_arms_once_test() ->
+    S0 = server_with_early_keys(),
+    S1 = quic_connection:opened_run([], S0),
+    ?assertEqual(undefined, S1#state.early_keys_discard_deadline),
+    S2 = quic_connection:opened_run([{0, 16#40, [ping]}], S1),
+    ?assert(is_reference(S2#state.early_keys_discard_timer)),
+    ?assert(is_integer(S2#state.early_keys_discard_deadline)),
+    S3 = quic_connection:opened_run([{1, 16#40, [ping]}, {2, 16#40, [ping]}], S2),
+    ?assertEqual(S2#state.early_keys_discard_timer, S3#state.early_keys_discard_timer),
+    ?assertEqual(S2#state.early_keys_discard_deadline, S3#state.early_keys_discard_deadline).
 
 %% Other packet types and roles arm nothing.
 unit_arms_only_for_server_app_test() ->
