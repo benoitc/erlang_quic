@@ -6966,7 +6966,12 @@ process_frame(Level, {max_data, _}, State) when Level =/= app ->
     );
 %% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
 %% RFC 9000 Section 19.10: MAX_STREAM_DATA is only allowed in 1-RTT packets
-process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
+%% Receipt opens the stream (Section 3.2).
+process_frame(
+    app,
+    {max_stream_data, StreamId, MaxData},
+    #state{owner = Owner, streams = Streams} = State
+) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_max_data = Current} = Stream} ->
             ?LOG_DEBUG(
@@ -6994,15 +6999,27 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     State
             end;
         error ->
-            ?LOG_DEBUG(
-                #{
-                    what => received_max_stream_data_unknown_stream,
-                    stream_id => StreamId,
-                    new_limit => MaxData
-                },
-                ?QUIC_LOG_META
-            ),
-            State
+            case is_reclaimed_frame(StreamId, State) of
+                true ->
+                    %% Late MAX_STREAM_DATA for an already-reclaimed stream; ignore.
+                    State;
+                false ->
+                    case exceeds_stream_limit(StreamId, State) of
+                        true ->
+                            stream_limit_close(State);
+                        false ->
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            #stream_state{send_max_data = Initial} =
+                                NewStream = new_peer_stream(StreamId, State),
+                            State#state{
+                                streams = maps:put(
+                                    StreamId,
+                                    NewStream#stream_state{send_max_data = max(Initial, MaxData)},
+                                    Streams
+                                )
+                            }
+                    end
+            end
     end;
 process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets

@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A MAX_STREAM_DATA frame that arrived before the first data of a
+  stream the peer opened was dropped, and the credit with it, so a
+  later write on that stream could stall. The frame now opens the
+  stream, as the other stream frames do (RFC 9000 Section 3.2).
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed
