@@ -31,7 +31,7 @@ early_keys(Server) ->
 %% explicit 1-RTT packet (the trigger): the keys survive the handshake,
 %% the window arms on the 1-RTT packet, and the keys are gone after
 %% three PTOs. Fails on main, where the keys live for the connection.
-server_discards_early_keys_after_first_1rtt_test() ->
+server_discards_early_keys_after_first_1rtt_test_() ->
     {timeout, 60, fun server_discards_early_keys_after_first_1rtt/0}.
 
 server_discards_early_keys_after_first_1rtt() ->
