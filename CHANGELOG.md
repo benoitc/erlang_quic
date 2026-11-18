@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A pushed response that ended on its HEADERS frame was reported
+  complete even when its `content-length` promised content. It is now
+  refused as malformed, like one that ends short after DATA (RFC 9114
+  Section 4.1.2).
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed

@@ -2639,9 +2639,18 @@ validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Receiv
             {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
     end.
 
-deliver_push_response_finalize(StreamId, PushId, _Status, _Headers, true, Owner, _Received, State) ->
-    Owner ! {quic_h3, self(), {push_complete, PushId}},
-    cleanup_push_stream(PushId, StreamId, State);
+deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, Received, State) ->
+    Stream = (push_stream_with_state(StreamId, Received, PushId, complete))#h3_stream{
+        status = Status,
+        content_length = extract_content_length(Headers)
+    },
+    case content_complete(Stream) of
+        true ->
+            Owner ! {quic_h3, self(), {push_complete, PushId}},
+            cleanup_push_stream(PushId, StreamId, State);
+        false ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"push content-length violated">>}}
+    end;
 deliver_push_response_finalize(
     StreamId, PushId, Status, _Headers, false, _Owner, Received, State
 ) when
