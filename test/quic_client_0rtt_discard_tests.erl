@@ -70,6 +70,32 @@ send_after_discard_is_queued_not_sent_as_0rtt_test() ->
     S2 = quic_connection:discard_early_keys(S1),
     ?assertEqual(undefined, (S2#state.hs)#hs.early_keys).
 
+%% 0-RTT data written after EncryptedExtensions accepted it still counts
+%% against the connection limit (RFC 9000 Section 4.1): a write that
+%% fits goes out, one past the limit waits, and both sides of
+%% EncryptedExtensions are in data_sent once the 1-RTT keys are in.
+early_data_after_acceptance_is_counted_test() ->
+    S0 = (quic_connection_test_support:zero_rtt_client([0]))#state{max_data_remote = 100},
+    {keep_state, S1, _} = quic_connection:zero_rtt_sends(
+        [{async, 0, binary:copy(<<1>>, 60), false}], S0
+    ),
+    S2 = quic_connection:finalize_zero_rtt_state(S1#state{
+        hs = (S1#state.hs)#hs{early_data_accepted = true}
+    }),
+    PN = quic_connection_test_support:next_app_pn(S2),
+    {keep_state, S3, _} = quic_connection:zero_rtt_sends(
+        [{async, 0, binary:copy(<<2>>, 30), false}], S2
+    ),
+    ?assertEqual(PN + 1, quic_connection_test_support:next_app_pn(S3)),
+    {keep_state, S4, _} = quic_connection:zero_rtt_sends(
+        [{async, 0, binary:copy(<<3>>, 30), false}], S3
+    ),
+    ?assertEqual(PN + 1, quic_connection_test_support:next_app_pn(S4)),
+    ?assertMatch([{0, _, false}], S4#state.pending_data),
+    S5 = quic_connection:count_early_data(S4),
+    ?assertEqual(90, S5#state.data_sent),
+    ?assertEqual(0, (S5#state.hs)#hs.early_data_sent).
+
 %%====================================================================
 %% E2E: a resumed connection with accepted 0-RTT
 %%====================================================================

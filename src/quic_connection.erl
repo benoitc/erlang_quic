@@ -3554,6 +3554,14 @@ discard_initial(State) ->
     end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
 
+%% Accepted 0-RTT data counts toward connection-level flow control
+%% (RFC 9000 Section 4.1). The 0-RTT send path counts it in
+%% `early_data_sent' only, so it moves to `data_sent' when the last of
+%% it has been written: at the 1-RTT key install. Zero when none was
+%% sent or the server rejected it.
+count_early_data(#state{data_sent = DataSent, hs = #hs{early_data_sent = Early} = Hs} = State) ->
+    State#state{data_sent = DataSent + Early, hs = Hs#hs{early_data_sent = 0}}.
+
 %% RFC 9001 Section 4.9.3: a client discards its 0-RTT keys as soon as
 %% it installs 1-RTT keys, as they have no use from that moment (0-RTT
 %% and 1-RTT share the application packet number space and nothing is
@@ -8432,7 +8440,7 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = discard_early_keys(State#state{
+                    State0 = count_early_data(State#state{
                         app_keys = {ClientAppKeys, ServerAppKeys},
                         key_state = KeyState,
                         hs = (State#state.hs)#hs{
@@ -8442,6 +8450,7 @@ process_tls_message(
                             master_secret = MasterSecret
                         }
                     }),
+                    State1 = discard_early_keys(State0),
 
                     %% Send client Certificate(+CertificateVerify)+Finished,
                     %% segmented so no datagram exceeds max_udp_payload_size.
@@ -12005,20 +12014,14 @@ reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = S
         }
     }.
 
-%% Branch on early_data_accepted at handshake completion. When 0-RTT was
+%% Branch on early_data_accepted at EncryptedExtensions. When 0-RTT was
 %% rejected, reset stream state for every stream that carried 0-RTT data
-%% (RFC 9001 §4.6.2). When accepted, the server received the 0-RTT data,
-%% so it counts toward connection-level flow control: fold the
-%% separately-tracked `early_data_sent' into `data_sent' (RFC 9000 §4.1).
-%% The 0-RTT send path only accumulates `early_data_sent' and never
-%% touches `data_sent', so without this fold the connection counter would
-%% under-count accepted early data and could later overshoot max_data.
+%% (RFC 9001 §4.6.2). When accepted, 0-RTT sending goes on until the
+%% 1-RTT keys are installed, and count_early_data/1 settles the
+%% connection-level count there.
 -spec finalize_zero_rtt_state(#state{}) -> #state{}.
 finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
-    #state{data_sent = DataSent, hs = #hs{early_data_sent = EarlyDataSent}} = State,
-    State#state{
-        data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
-    };
+    State;
 finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
     %% The server rejected 0-RTT: the early keys have no further use,
     %% and nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2).

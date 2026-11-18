@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- 0-RTT data a client wrote between the server accepting it and the
+  end of the handshake was not counted against the connection's
+  flow-control limit, so the client could send more than the server
+  allowed and have the connection closed with FLOW_CONTROL_ERROR
+  (RFC 9000 Section 4.1).
+
 ## [3.1.2] - 2026-11-17
 
 ### Fixed
