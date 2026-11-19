@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- On a resumed connection, `quic_h3:request/2,3` no longer sends every
+  request as 0-RTT. GET, HEAD, OPTIONS and TRACE still go out at once;
+  a request with any other method, such as POST, made before the
+  handshake completes now waits for it, because 0-RTT data can be
+  replayed (RFC 8470 Section 4). The call returns when the handshake
+  is done. Pass `early_data => true` in the request options to send
+  such a request as 0-RTT anyway.
 - `pmtu_search_complete` is logged at info level when a PMTU search
   ends at a new value, and at debug level when it ends where it began.
   Every connection searches again each `pmtu_raise_interval` (10

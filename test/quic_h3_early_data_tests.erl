@@ -68,6 +68,87 @@ early_data_request_sends_headers_test_() ->
         stop_h3(H3Conn, FakeQuicConn)
     end}.
 
+%% RFC 8470 Section 4: a method that is not safe, or not known, is not
+%% sent as early data. The request goes out once the handshake is done.
+unsafe_request_waits_for_the_handshake_test_() ->
+    [
+        {setup, fun setup/0, fun teardown/1, fun() -> held_until_connected(Method, Order) end}
+     || Method <- [<<"POST">>, <<"PUT">>, <<"DELETE">>, <<"PURGE">>],
+        Order <- [settings_first, handshake_first]
+    ].
+
+held_until_connected(Method, Order) ->
+    FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+    {ok, H3Conn} = start_client_h3(FakeQuicConn),
+    ok = quic_h3_connection:prime(H3Conn),
+    wait_state(H3Conn, early_data, 500),
+    Self = self(),
+    Caller = spawn_link(fun() ->
+        Self ! {self(), quic_h3_connection:request(H3Conn, request_headers(Method))}
+    end),
+    receive
+        {Caller, Early} -> ?assertEqual(held, Early)
+    after 100 -> ok
+    end,
+    ?assertEqual(0, meck:num_calls(quic, open_stream, '_')),
+    case Order of
+        settings_first ->
+            send_peer_settings(H3Conn, FakeQuicConn),
+            wait_settings_received(H3Conn, 500),
+            H3Conn ! {quic, FakeQuicConn, {connected, #{}}};
+        handshake_first ->
+            %% Through h3_connecting, where the request is still held.
+            H3Conn ! {quic, FakeQuicConn, {connected, #{}}},
+            wait_state(H3Conn, h3_connecting, 500),
+            send_peer_settings(H3Conn, FakeQuicConn)
+    end,
+    receive
+        {Caller, Reply} -> ?assertMatch({ok, _}, Reply)
+    after 1000 -> ?assert(false)
+    end,
+    ?assertEqual(connected, current_state(H3Conn)),
+    ?assertEqual(1, meck:num_calls(quic, open_stream, '_')),
+    stop_h3(H3Conn, FakeQuicConn).
+
+%% The caller can say a request is safe to send early.
+unsafe_request_with_early_data_option_is_sent_test_() ->
+    {setup, fun setup/0, fun teardown/1, fun() ->
+        FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+        {ok, H3Conn} = start_client_h3(FakeQuicConn),
+        ok = quic_h3_connection:prime(H3Conn),
+        wait_state(H3Conn, early_data, 500),
+        ?assertMatch(
+            {ok, _},
+            quic_h3_connection:request(H3Conn, request_headers(<<"POST">>), #{
+                early_data => true, end_stream => false
+            })
+        ),
+        ?assertEqual(early_data, current_state(H3Conn)),
+        stop_h3(H3Conn, FakeQuicConn)
+    end}.
+
+safe_requests_are_sent_early_test_() ->
+    [
+        {setup, fun setup/0, fun teardown/1, fun() ->
+            FakeQuicConn = spawn_link(fun fake_quic_loop/0),
+            {ok, H3Conn} = start_client_h3(FakeQuicConn),
+            ok = quic_h3_connection:prime(H3Conn),
+            wait_state(H3Conn, early_data, 500),
+            ?assertMatch({ok, _}, quic_h3_connection:request(H3Conn, request_headers(Method))),
+            ?assertEqual(early_data, current_state(H3Conn)),
+            stop_h3(H3Conn, FakeQuicConn)
+        end}
+     || Method <- [<<"GET">>, <<"HEAD">>, <<"OPTIONS">>]
+    ].
+
+request_headers(Method) ->
+    [
+        {<<":method">>, Method},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/">>}
+    ].
+
 convergence_both_flags_advances_to_connected_test_() ->
     {setup, fun setup/0, fun teardown/1, fun() ->
         FakeQuicConn = spawn_link(fun fake_quic_loop/0),
