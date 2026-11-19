@@ -938,7 +938,7 @@ The connection owner process receives messages in the form `{quic_h3, Conn, Even
 | `{push_response, PushId, Status, Headers}` | Push response headers (client) |
 | `{push_data, PushId, Data, Fin}` | Push response data (client) |
 | `{push_complete, PushId}` | Push stream completed (client) |
-| `{push_cancelled, PushId}` | Push was cancelled (client) |
+| `{push_cancelled, PushId}` | Push was cancelled, or given up because its response was malformed or too large (client) |
 
 #### Extension Stream Events
 

@@ -224,7 +224,13 @@
 
     %% Blocked streams waiting for encoder instructions (RFC 9204 Section 2.2.2)
     %% Maps StreamId -> {RequiredInsertCount, HeaderBlock, Fin}
-    blocked_streams = #{} :: #{stream_id() => {non_neg_integer(), binary(), boolean()}},
+    %% Required Insert Count, the field section (HEADERS unless tagged) and
+    %% the stream's FIN.
+    blocked_streams = #{} :: #{
+        stream_id() => {
+            non_neg_integer(), binary() | {push_promise, non_neg_integer(), binary()}, boolean()
+        }
+    },
 
     %% Peer settings enforcement (RFC 9114 Section 7.2.4.1)
     peer_max_field_section_size = ?H3_DEFAULT_MAX_FIELD_SECTION_SIZE :: non_neg_integer(),
@@ -2280,14 +2286,29 @@ partition_blocked_streams(InsertCount, Blocked) ->
 
 retry_blocked_streams_fold([], State) ->
     {ok, State};
-retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State) ->
+retry_blocked_streams_fold([{StreamId, Entry} | Rest], State) when (StreamId band 2) =/= 0 ->
+    %% A push stream; one cancelled since has no entry left to resume.
+    case find_push_by_stream_id(StreamId, State#state.received_pushes) of
+        {ok, PushId} ->
+            case retry_blocked_push(StreamId, PushId, Entry, State) of
+                {ok, State1} -> retry_blocked_streams_fold(Rest, State1);
+                {error, Reason} -> {error, Reason}
+            end;
+        error ->
+            retry_blocked_streams_fold(Rest, State)
+    end;
+retry_blocked_streams_fold([{StreamId, {_RIC, Section, Fin}} | Rest], State) ->
     %% Get stream record with proper defaults
     Stream = maps:get(StreamId, State#state.streams, new_request_stream(StreamId, State)),
     %% Fin is the stream's; it ends the field section only when nothing
-    %% was held behind it.
+    %% was held behind it, and never ends a PUSH_PROMISE.
     Held = maps:get(StreamId, State#state.stream_buffers, <<>>),
-    HeadersFin = Fin andalso Held =:= <<>>,
-    case handle_request_frame(StreamId, {headers, HeaderBlock}, HeadersFin, Stream, State) of
+    {Frame, HeadersFin} =
+        case Section of
+            {push_promise, _, _} -> {Section, false};
+            _ -> {{headers, Section}, Fin andalso Held =:= <<>>}
+        end,
+    case handle_request_frame(StreamId, Frame, HeadersFin, Stream, State) of
         {ok, Stream1, State1} when HeadersFin ->
             State2 = State1#state{streams = maps:put(StreamId, Stream1, State1#state.streams)},
             retry_blocked_streams_fold(Rest, State2);
@@ -2303,6 +2324,24 @@ retry_blocked_streams_fold([{StreamId, {_RIC, HeaderBlock, Fin}} | Rest], State)
             retry_blocked_streams_fold(Rest, store_stream(SId, Closed, State2));
         {error, Reason} ->
             %% Connection error - stop processing
+            {error, Reason}
+    end.
+
+%% The field section a push stream waited for, then what was held behind it.
+retry_blocked_push(StreamId, PushId, {_RIC, HeaderBlock, Fin}, State) ->
+    Held = maps:get(StreamId, State#state.stream_buffers, <<>>),
+    HeadersFin = Fin andalso Held =:= <<>>,
+    case handle_push_frame(StreamId, PushId, {headers, HeaderBlock}, HeadersFin, State) of
+        {ok, State1} when HeadersFin; not is_map_key(PushId, State1#state.received_pushes) ->
+            {ok, State1};
+        {ok, State1} ->
+            case handle_push_stream_data(StreamId, PushId, <<>>, Fin, State1) of
+                {ok, State2} -> {ok, State2};
+                {error, Reason, _State} -> {error, Reason}
+            end;
+        {blocked, State1} ->
+            {ok, State1};
+        {error, Reason} ->
             {error, Reason}
     end.
 
@@ -2453,7 +2492,15 @@ handle_push_stream_data(
 ) ->
     Buffer = maps:get(StreamId, Buffers, <<>>),
     Combined = <<Buffer/binary, Data/binary>>,
+    case is_map_key(StreamId, State#state.blocked_streams) of
+        true -> hold_push_behind_blocked(StreamId, PushId, Combined, Fin, State);
+        false -> read_push_stream(StreamId, PushId, Combined, Fin, State)
+    end.
+
+read_push_stream(StreamId, PushId, Combined, Fin, #state{stream_buffers = Buffers} = State) ->
     case process_push_frames(StreamId, PushId, Combined, Fin, State) of
+        {blocked, Rest, State1} ->
+            hold_push_behind_blocked(StreamId, PushId, Rest, Fin, State1);
         {ok, Rest, State1} ->
             Truncated = Fin andalso (Rest =/= <<>> orelse push_data_remaining(PushId, State1) > 0),
             case Truncated of
@@ -2467,16 +2514,42 @@ handle_push_stream_data(
                             <<>> -> maps:remove(StreamId, Buffers);
                             _ -> Buffers#{StreamId => Rest}
                         end,
-                    case
-                        finish_push(StreamId, PushId, Fin, State1#state{stream_buffers = Buffers1})
-                    of
-                        {ok, State2} -> {ok, State2};
-                        {error, Reason} -> {error, Reason, State}
-                    end
+                    finish_push(StreamId, PushId, Fin, State1#state{stream_buffers = Buffers1})
             end;
         {error, Reason} ->
             {error, Reason, State}
     end.
+
+%% RFC 9204 Section 2.1.2: what follows a blocked field section on a push
+%% stream is kept, with the stream's FIN, like on a request stream, and
+%% counts against max_buffered_body. Over it, the push is given up.
+hold_push_behind_blocked(StreamId, PushId, Held, Fin, State) ->
+    #state{blocked_streams = Blocked, stream_buffers = Buffers} = State,
+    Total = State#state.buffered_bytes + held_behind_blocked(StreamId, State) + byte_size(Held),
+    case Total > State#state.max_buffered_body of
+        true ->
+            fail_push(StreamId, PushId, ?H3_EXCESSIVE_LOAD, State);
+        false ->
+            #{StreamId := {RIC, HeaderBlock, _Fin}} = Blocked,
+            Buffers1 =
+                case Held of
+                    <<>> -> maps:remove(StreamId, Buffers);
+                    _ -> Buffers#{StreamId => Held}
+                end,
+            {ok, State#state{
+                blocked_streams = Blocked#{StreamId := {RIC, HeaderBlock, Fin}},
+                stream_buffers = Buffers1
+            }}
+    end.
+
+%% One push is given up: its stream is no longer read, the server is told
+%% and so is the owner. The connection and its other streams go on. A
+%% malformed pushed response ends this way, with H3_MESSAGE_ERROR (RFC
+%% 9114 Section 4.1.2).
+fail_push(StreamId, PushId, Code, #state{owner = Owner} = State) ->
+    _ = quic:stop_sending(State#state.quic_conn, StreamId, Code),
+    Owner ! {quic_h3, self(), {push_cancelled, PushId}},
+    cleanup_push_stream(PushId, StreamId, do_cancel_push(PushId, State)).
 
 %% RFC 9114 Section 4.1: a pushed response ends at its stream's FIN,
 %% whichever delivery brings it.
@@ -2522,8 +2595,15 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
 
 process_push_frame(StreamId, PushId, Frame, FrameFin, Rest, Fin, State) ->
     case handle_push_frame(StreamId, PushId, Frame, FrameFin, State) of
-        {ok, State1} -> process_push_frames(StreamId, PushId, Rest, Fin, State1);
-        {error, Reason} -> {error, Reason}
+        {ok, State1} when not is_map_key(PushId, State1#state.received_pushes) ->
+            %% The push is over, complete or given up: nothing more is read.
+            {ok, <<>>, State1};
+        {ok, State1} ->
+            process_push_frames(StreamId, PushId, Rest, Fin, State1);
+        {blocked, State1} ->
+            {blocked, Rest, State1};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% Bytes of the push stream's current DATA frame still to arrive.
@@ -2624,10 +2704,10 @@ handle_push_headers(
             {error,
                 {connection_error, ?H3_EXCESSIVE_LOAD,
                     <<"push field section exceeds SETTINGS_MAX_FIELD_SECTION_SIZE">>}};
-        {{blocked, _RIC}, _Decoder1} ->
-            {error,
-                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
-                    <<"blocked push stream headers">>}};
+        {{blocked, RIC}, Decoder1} ->
+            block_push_stream(StreamId, {RIC, HeaderBlock, Fin}, State#state{
+                qpack_decoder = Decoder1
+            });
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end.
@@ -2639,8 +2719,8 @@ validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Receiv
             deliver_push_response_finalize(
                 StreamId, PushId, Status, Headers, Fin, Owner, Received, State
             );
-        {error, Reason} ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+        {error, _Reason} ->
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State)
     end.
 
 deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, Received, State) ->
@@ -2653,7 +2733,7 @@ deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, R
             Owner ! {quic_h3, self(), {push_complete, PushId}},
             cleanup_push_stream(PushId, StreamId, State);
         false ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"push content-length violated">>}}
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State)
     end;
 deliver_push_response_finalize(
     StreamId, PushId, Status, _Headers, false, _Owner, Received, State
@@ -2701,7 +2781,7 @@ extract_content_length(Headers) ->
 apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
     case (Payload =/= <<>>) andalso carries_no_content(Stream) of
         true ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"DATA on a push with no content">>}};
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State);
         false ->
             apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State)
     end.
@@ -2723,7 +2803,7 @@ apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) 
                     {ok, State#state{received_pushes = Received0#{PushId => Stream1}}}
             end;
         {error, Code} ->
-            {error, {connection_error, Code, <<"push content-length violated">>}}
+            fail_push(StreamId, PushId, Code, State)
     end.
 
 %% RFC 9110 Section 8.6: on a no-content push the Content-Length is not a body length.
@@ -2750,9 +2830,7 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{error, field_section_too_large}, _Decoder1} ->
             %% Trailers over our limit cost only this push.
-            _ = quic:stop_sending(State#state.quic_conn, StreamId, ?H3_EXCESSIVE_LOAD),
-            Owner ! {quic_h3, self(), {push_cancelled, PushId}},
-            cleanup_push_stream(PushId, StreamId, do_cancel_push(PushId, State));
+            fail_push(StreamId, PushId, ?H3_EXCESSIVE_LOAD, State);
         {{ok, Trailers}, Decoder1} ->
             State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
             try
@@ -2778,18 +2856,18 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
                             }
                         );
                     {error, Code} ->
-                        {error,
-                            {connection_error, Code, <<"push body length mismatch at trailers">>}}
+                        fail_push(StreamId, PushId, Code, State1)
                 end
             catch
                 throw:{header_error, _} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed push trailers">>}};
+                    fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State1);
                 throw:{trailer_error, _} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"invalid push trailer">>}}
+                    fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State1)
             end;
-        {{blocked, _RIC}, _Decoder1} ->
-            {error,
-                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, <<"blocked push trailers">>}};
+        {{blocked, RIC}, Decoder1} ->
+            block_push_stream(StreamId, {RIC, HeaderBlock, Fin}, State#state{
+                qpack_decoder = Decoder1
+            });
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end.
@@ -3388,10 +3466,14 @@ decode_push_promise_headers(
             {error,
                 {connection_error, ?H3_EXCESSIVE_LOAD,
                     <<"PUSH_PROMISE field section exceeds limit">>}};
-        {{blocked, _RIC}, _Decoder1} ->
-            {error,
-                {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED,
-                    <<"blocked PUSH_PROMISE headers">>}};
+        {{blocked, RIC}, Decoder1} ->
+            %% The request stream waits; the promise is read again later.
+            block_stream(
+                StreamId,
+                {RIC, {push_promise, PushId, HeaderBlock}, false},
+                Stream,
+                State#state{qpack_decoder = Decoder1}
+            );
         {{error, Reason}, _Decoder1} ->
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end.
@@ -3523,6 +3605,13 @@ block_stream(StreamId, Entry, Stream, #state{blocked_streams = Blocked} = State)
                     <<"more blocked streams than SETTINGS_QPACK_BLOCKED_STREAMS">>}};
         false ->
             {ok, Stream, State#state{blocked_streams = Blocked#{StreamId => Entry}}}
+    end.
+
+%% The same for a push stream, HEADERS or trailers.
+block_push_stream(StreamId, Entry, State) ->
+    case block_stream(StreamId, Entry, undefined, State) of
+        {ok, undefined, State1} -> {blocked, State1};
+        {error, _} = Error -> Error
     end.
 
 %% Process successfully decoded headers
@@ -5470,7 +5559,7 @@ stop_push_stream(PushId, #state{received_pushes = Received, quic_conn = QuicConn
 ignore_push_stream(PushId, #state{received_pushes = Received} = State) ->
     case Received of
         #{PushId := #h3_stream{id = StreamId}} ->
-            State1 = abandon_sections(StreamId, State),
+            State1 = maybe_send_stream_cancel(StreamId, State),
             ignore_uni_stream(StreamId, State1#state{
                 stream_buffers = maps:remove(StreamId, State1#state.stream_buffers)
             });
