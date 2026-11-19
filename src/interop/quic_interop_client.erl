@@ -59,7 +59,6 @@
 %% Ticket file location (for resumption/0-RTT tests)
 %% NOT under /downloads: the runner diffs that directory against the
 %% requested files and fails the test on anything unexpected in it.
--define(TICKET_FILE, "/tmp/session_ticket.dat").
 
 main(_Args) ->
     %% Start required applications. The h3 path needs the quic app's
@@ -517,10 +516,6 @@ run_resumption_test(RequestsStr, DownloadsDir) ->
                     io:format("~n=== Phase 1: Initial connection to get ticket ===~n"),
                     case resumption_phase1(Host, Port, Path, DownloadsDir) of
                         {ok, Ticket} ->
-                            %% Save ticket to file
-                            save_ticket(Ticket),
-                            io:format("Ticket saved~n"),
-
                             %% Phase 2: Resumption with ticket
                             io:format("~n=== Phase 2: Resumption with ticket ===~n"),
                             case resumption_phase2(Host, Port, Path2, DownloadsDir, Ticket) of
@@ -651,28 +646,11 @@ resumption_phase2(Host, Port, Path, DownloadsDir, Ticket) ->
             error
     end.
 
-%% Save ticket to file for debugging/inspection
-save_ticket(Ticket) ->
-    file:write_file(?TICKET_FILE, term_to_binary(Ticket)).
-
-%% Load ticket from file
-load_ticket() ->
-    case file:read_file(?TICKET_FILE) of
-        {ok, Data} ->
-            try binary_to_term(Data) of
-                Ticket -> {ok, Ticket}
-            catch
-                _:_ -> error
-            end;
-        {error, _} ->
-            error
-    end.
-
 %%====================================================================
 %% 0-RTT Test
 %%====================================================================
 
-%% 0-RTT test requires a stored ticket from a previous connection
+%% 0-RTT test: a first connection fetches the ticket the second one uses
 run_zerortt_test(RequestsStr, DownloadsDir) ->
     Requests = string:tokens(RequestsStr, " "),
     case Requests of
@@ -688,18 +666,8 @@ run_zerortt_test(RequestsStr, DownloadsDir) ->
                     %% there would also count the files against the wrong
                     %% handshake.
                     AllPaths = [P || U <- Requests, {ok, _, _, P} <- [parse_url(U)]],
-                    TicketResult =
-                        case load_ticket() of
-                            {ok, T} ->
-                                io:format("Using stored ticket for 0-RTT~n"),
-                                {ok, T};
-                            error ->
-                                io:format("No stored ticket, fetching one~n"),
-                                ticket_only_connection(Host, Port)
-                        end,
-                    case TicketResult of
+                    case ticket_only_connection(Host, Port) of
                         {ok, Ticket} ->
-                            save_ticket(Ticket),
                             case zerortt_download_all(Host, Port, AllPaths, DownloadsDir, Ticket) of
                                 ok ->
                                     io:format("0-RTT test successful~n"),
