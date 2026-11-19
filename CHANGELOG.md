@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- A header field can be sent as a QPACK never-indexed literal: give it
+  as `{Name, Value, never_indexed}` to `quic_h3:request/2,3`,
+  `send_response/4`, `respond/5`, `send_trailers/3`, `push/3` or
+  `send_push_response/4`. It is sent as a literal and stays out of the
+  compression tables (RFC 9204 Section 7.1.3). Use it for credentials.
+- `qpack_never_indexed` option for `quic_h3:connect/3`,
+  `start_server/3` and `accept/2`. With it, a field the peer sent as a
+  never-indexed literal is delivered as `{Name, Value, never_indexed}`,
+  so code that forwards fields can keep the mark on the next hop.
+  Without it fields arrive as `{Name, Value}`, as before.
+- `quic_qpack:new/1` takes `never_indexed => true` for a decoder that
+  returns the mark, and `quic_qpack:encode/1,2,3` accepts the
+  three-element form.
+
 ### Changed
 - On a resumed connection, `quic_h3:request/2,3` no longer sends every
   request as 0-RTT. GET, HEAD, OPTIONS and TRACE still go out at once;

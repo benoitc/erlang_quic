@@ -46,6 +46,7 @@ Establish an HTTP/3 connection to a server.
 | `settings` | map | - | HTTP/3 settings |
 | `quic_opts` | map | - | Additional QUIC options |
 | `notify_streams_available` | boolean | `false` | After a request refused with `{error, stream_limit}`, send `{streams_available, bidi}` once one would open again |
+| `qpack_never_indexed` | boolean | `false` | Deliver a field the server sent as a never-indexed literal as `{Name, Value, never_indexed}`; see [Never-indexed fields](#never-indexed-fields) |
 
 **Example:**
 
@@ -109,6 +110,51 @@ Block until the connection is established.
 ```
 
 Blocks until the connection is established and SETTINGS exchanged, or until the timeout expires.
+
+### Never-indexed fields
+
+Use this when a field value must stay out of QPACK's compression tables,
+such as a credential, or when you forward fields from one connection to
+another and must keep that property on the next hop (RFC 9204 Section
+7.1.3).
+
+To send a field that way, give it a third element. It works on any
+connection, in requests, responses, trailers and pushes:
+
+```erlang
+Headers = [
+    {<<":method">>, <<"GET">>},
+    {<<":scheme">>, <<"https">>},
+    {<<":path">>, <<"/">>},
+    {<<":authority">>, <<"example.com">>},
+    {<<"authorization">>, Token, never_indexed}
+],
+{ok, StreamId} = quic_h3:request(Conn, Headers).
+```
+
+To see which fields the peer sent that way, open the connection with
+`qpack_never_indexed => true`:
+
+```erlang
+{ok, Conn} = quic_h3:connect(Host, Port, #{qpack_never_indexed => true}),
+receive
+    {quic_h3, Conn, {response, StreamId, Status, RespHeaders}} ->
+        %% a marked field arrives as {Name, Value, never_indexed}
+        Forward = RespHeaders
+end.
+```
+
+Notes:
+
+- Without the option every field arrives as `{Name, Value}`, as before.
+- With it, a marked field is a three-element tuple in the `request`,
+  `response`, `trailers`, `push_response` and `push_trailers` events and
+  in the request handler's headers, so match on both shapes.
+  `lists:keyfind/3` finds either.
+- The headers of `push_promise` and `push_stream` events are always
+  `{Name, Value}`.
+- The server options `start_server/3` and `accept/2` take
+  `qpack_never_indexed` too.
 
 ### Shared API (Client and Server)
 
@@ -399,6 +445,7 @@ picks each connection's owner with an `alpn_handler`, and the hook calls
 | `defer_requests_until_settings` | boolean | No | Hold requests until the client's SETTINGS arrive. Default `false` |
 | `stream_reset_final_size` | boolean | No | Report a claimed stream's reset with its final size. Default `false` |
 | `notify_streams_available` | boolean | No | Send `{streams_available, Dir}` after an open refused with `stream_limit`. Default `false` |
+| `qpack_never_indexed` | boolean | No | Deliver never-indexed fields as `{Name, Value, never_indexed}`. Default `false` |
 
 **Steps:**
 

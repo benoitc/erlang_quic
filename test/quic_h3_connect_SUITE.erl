@@ -30,6 +30,7 @@
     extended_connect_tunnel_echo/1,
     connect_2xx_has_no_content_length/1,
     connect_refusal_keeps_content_length/1,
+    never_indexed_fields_keep_their_mark/1,
     head_response_empty_body/1,
     empty_body_response/1,
     headers_then_trailers_no_body/1
@@ -46,6 +47,7 @@ all() ->
         extended_connect_tunnel_echo,
         connect_2xx_has_no_content_length,
         connect_refusal_keeps_content_length,
+        never_indexed_fields_keep_their_mark,
         head_response_empty_body,
         empty_body_response,
         headers_then_trailers_no_body
@@ -54,7 +56,8 @@ all() ->
 init_per_suite(Config) ->
     {ok, Server} = quic_test_h3_server:start(#{
         handler => fun ?MODULE:handle/5,
-        settings => #{enable_connect_protocol => 1}
+        settings => #{enable_connect_protocol => 1},
+        qpack_never_indexed => true
     }),
     Host = "127.0.0.1",
     Port = maps:get(port, Server),
@@ -117,6 +120,28 @@ connect_2xx_has_no_content_length(Config) ->
 connect_refusal_keeps_content_length(Config) ->
     {403, Headers} = connect_response(Config, <<"/refused">>),
     ?assertEqual({<<"content-length">>, <<"0">>}, lists:keyfind(<<"content-length">>, 1, Headers)).
+
+%% RFC 9204 Section 7.1.3: a field sent as a never-indexed literal is
+%% reported with its mark at both ends when they ask for it.
+never_indexed_fields_keep_their_mark(Config) ->
+    Host = ?config(h3_host, Config),
+    Port = ?config(h3_port, Config),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false, sync => true, qpack_never_indexed => true
+    }),
+    {ok, StreamId} = quic_h3:request(Conn, [
+        {<<":method">>, <<"GET">>},
+        {<<":scheme">>, <<"https">>},
+        {<<":path">>, <<"/marked">>},
+        {<<":authority">>, list_to_binary(Host)},
+        {<<"authorization">>, <<"token">>, never_indexed}
+    ]),
+    {200, Headers, <<>>} = receive_response(Conn, StreamId, 10000, undefined, [], <<>>),
+    quic_h3:close(Conn),
+    ?assertEqual({<<"x-seen">>, <<"marked">>}, lists:keyfind(<<"x-seen">>, 1, Headers)),
+    ?assertEqual(
+        {<<"set-cookie">>, <<"s=1">>, never_indexed}, lists:keyfind(<<"set-cookie">>, 1, Headers)
+    ).
 
 %% HEAD response: headers, no body. The handler ends the stream with a
 %% fin-only send_data, which must flush the buffered HEADERS.
@@ -182,6 +207,16 @@ handle(Conn, StreamId, <<"HEAD">>, _Path, _Headers) ->
     %% No content-length on HEAD: we send zero body bytes and a content-length
     %% would trip the receiver's body-size check.
     ok = quic_h3:send_response(Conn, StreamId, 200, [{<<"content-type">>, <<"text/plain">>}]),
+    quic_h3:send_data(Conn, StreamId, <<>>, true);
+handle(Conn, StreamId, <<"GET">>, <<"/marked">>, Headers) ->
+    Seen =
+        case lists:keyfind(<<"authorization">>, 1, Headers) of
+            {_, <<"token">>, never_indexed} -> <<"marked">>;
+            _ -> <<"plain">>
+        end,
+    ok = quic_h3:send_response(Conn, StreamId, 200, [
+        {<<"x-seen">>, Seen}, {<<"set-cookie">>, <<"s=1">>, never_indexed}
+    ]),
     quic_h3:send_data(Conn, StreamId, <<>>, true);
 handle(Conn, StreamId, <<"GET">>, <<"/empty">>, _Headers) ->
     ok = quic_h3:send_response(Conn, StreamId, 200, []),

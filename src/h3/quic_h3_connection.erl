@@ -343,7 +343,7 @@
     %% complete before the peer's SETTINGS wait in deferred_requests,
     %% newest first, and are dispatched once SETTINGS are applied.
     defer_requests = false :: boolean(),
-    deferred_requests = [] :: [{stream_id(), binary(), binary(), [{binary(), binary()}]}],
+    deferred_requests = [] :: [{stream_id(), binary(), binary(), quic_qpack:headers()}],
     %% Same option: bytes of streams a stream_type_handler would see,
     %% held until SETTINGS and replayed in arrival order. held_streams
     %% names them, held_data is newest first, held_bytes bounds it by
@@ -615,7 +615,10 @@ init({client, QuicConn, _Host, _Port, Opts, Owner}) ->
         %% starts the table at zero capacity, and only the peer's Set Dynamic
         %% Table Capacity opens it, up to that ceiling.
         qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
-        qpack_decoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
+        qpack_decoder = quic_qpack:new(#{
+            max_allowed_capacity => MaxTableCapacity,
+            never_indexed => maps:get(qpack_never_indexed, Opts, false)
+        }),
         % Client uses even stream IDs (0, 4, 8, ...)
         next_stream_id = 0,
         local_max_field_section_size = LocalMaxFieldSize,
@@ -665,7 +668,10 @@ init({server, QuicConn, Opts, Owner}) ->
         %% starts the table at zero capacity, and only the peer's Set Dynamic
         %% Table Capacity opens it, up to that ceiling.
         qpack_encoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
-        qpack_decoder = quic_qpack:new(#{max_allowed_capacity => MaxTableCapacity}),
+        qpack_decoder = quic_qpack:new(#{
+            max_allowed_capacity => MaxTableCapacity,
+            never_indexed => maps:get(qpack_never_indexed, Opts, false)
+        }),
         % Server uses odd stream IDs (1, 5, 9, ...)
         next_stream_id = 1,
         local_max_field_section_size = LocalMaxFieldSize,
@@ -778,11 +784,11 @@ early_data_allowed(_Headers, #{early_data := true}) ->
     true;
 early_data_allowed(Headers, _Opts) ->
     case lists:keyfind(<<":method">>, 1, Headers) of
-        {_, Method} ->
-            lists:member(Method, [<<"GET">>, <<"HEAD">>, <<"OPTIONS">>, <<"TRACE">>]);
         false ->
             %% Malformed: let send_request refuse it now.
-            true
+            true;
+        Field ->
+            lists:member(element(2, Field), [<<"GET">>, <<"HEAD">>, <<"OPTIONS">>, <<"TRACE">>])
     end.
 
 early_request(From, Headers, Opts, State) ->
@@ -2737,10 +2743,11 @@ handle_push_headers(
             {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, Reason}}
     end.
 
-validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Received, State) ->
+validate_and_deliver_push_response(StreamId, PushId, Decoded, Fin, Owner, Received, State) ->
+    Headers = plain_fields(Decoded),
     case validate_push_response_headers(Headers) of
         {ok, Status} ->
-            Owner ! {quic_h3, self(), {push_response, PushId, Status, Headers}},
+            Owner ! {quic_h3, self(), {push_response, PushId, Status, Decoded}},
             deliver_push_response_finalize(
                 StreamId, PushId, Status, Headers, Fin, Owner, Received, State
             );
@@ -2856,7 +2863,8 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
         {{error, field_section_too_large}, _Decoder1} ->
             %% Trailers over our limit cost only this push.
             fail_push(StreamId, PushId, ?H3_EXCESSIVE_LOAD, State);
-        {{ok, Trailers}, Decoder1} ->
+        {{ok, Decoded}, Decoder1} ->
+            Trailers = plain_fields(Decoded),
             State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
             try
                 validate_field_names_and_values(Trailers),
@@ -2872,7 +2880,7 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
                     )
                 of
                     ok ->
-                        Owner ! {quic_h3, self(), {push_trailers, PushId, Trailers}},
+                        Owner ! {quic_h3, self(), {push_trailers, PushId, Decoded}},
                         Done = Stream#h3_stream{trailers = Trailers, frame_state = complete},
                         Pushes = State1#state.received_pushes,
                         finish_push(
@@ -3385,7 +3393,8 @@ handle_request_frame(
         {{error, field_section_too_large}, _Decoder1} ->
             %% Trailers over our limit cost only this request.
             {error, {stream_reset, StreamId, ?H3_EXCESSIVE_LOAD}};
-        {{ok, Trailers}, Decoder1} ->
+        {{ok, Decoded}, Decoder1} ->
+            Trailers = plain_fields(Decoded),
             %% RFC 9114 Section 4.1.2: validate trailers
             case content_complete(Stream) andalso validate_trailer_headers(Trailers, Stream) of
                 false ->
@@ -3396,7 +3405,7 @@ handle_request_frame(
                         qpack_decoder = Decoder1
                     }),
                     Stream1 = Stream#h3_stream{trailers = Trailers, frame_state = complete},
-                    Owner ! {quic_h3, self(), {trailers, StreamId, Trailers}},
+                    Owner ! {quic_h3, self(), {trailers, StreamId, Decoded}},
                     case Fin of
                         true ->
                             end_body_after_trailers(
@@ -3482,10 +3491,12 @@ decode_push_promise_headers(
     StreamId, PushId, HeaderBlock, Stream, Cancelled, Decoder, Owner, Promised, State
 ) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
-        {{ok, Headers}, Decoder1} ->
+        {{ok, Decoded}, Decoder1} ->
             State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
+            %% A promise is compared with its repeats and kept for the push
+            %% stream, so it is read without the mark.
             validate_and_apply_push_promise(
-                StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State1
+                StreamId, PushId, Stream, plain_fields(Decoded), Cancelled, Owner, Promised, State1
             );
         {{error, field_section_too_large}, _Decoder1} ->
             {error,
@@ -3599,6 +3610,31 @@ validate_push_promise_duplicate(PushId, Headers, Promised) ->
 decode_field_section(HeaderBlock, Decoder, #state{local_max_field_section_size = Max}) ->
     quic_qpack:decode(HeaderBlock, Decoder, Max).
 
+%% RFC 9204 Section 7.1.3: a field can carry the never-indexed mark, as
+%% `{Name, Value, never_indexed}'. It is for the QPACK encoder and for
+%% the owner of a connection opened with `qpack_never_indexed'; all the
+%% rest reads the fields without it.
+plain_fields(Fields) ->
+    [plain_field(Field) || Field <- Fields].
+
+plain_field({Name, Value, never_indexed}) -> {Name, Value};
+plain_field(Field) -> Field.
+
+%% Fields with the mark put back on those of Marked that carried it.
+mark_fields(Fields, Marked) ->
+    case [{Name, Value} || {Name, Value, never_indexed} <- Marked] of
+        [] ->
+            Fields;
+        Sensitive ->
+            [
+                case lists:member(Field, Sensitive) of
+                    true -> erlang:append_element(Field, never_indexed);
+                    false -> Field
+                end
+             || Field <- Fields
+            ]
+    end.
+
 %% Decode and process headers
 handle_headers_decode(StreamId, HeaderBlock, Fin, Stream, Decoder, Owner, Role, State) ->
     case decode_field_section(HeaderBlock, Decoder, State) of
@@ -3640,13 +3676,14 @@ block_push_stream(StreamId, Entry, State) ->
     end.
 
 %% Process successfully decoded headers
-process_decoded_headers(StreamId, Headers, Fin, Stream, Owner, Role, State1) ->
+process_decoded_headers(StreamId, Decoded, Fin, Stream, Owner, Role, State1) ->
+    Headers = plain_fields(Decoded),
     case headers_with_content(update_stream_with_headers(Headers, Stream, Role, State1), Fin) of
         {ok, Stream1} ->
             %% Apply RFC 9218 priority to underlying QUIC stream
             apply_stream_priority(StreamId, Stream1, State1),
             Stream2 = finalize_stream_state(Stream1, Fin, Role),
-            State2 = notify_headers_received(StreamId, Headers, Stream2, Owner, Role, State1),
+            State2 = notify_headers_received(StreamId, Decoded, Stream2, Owner, Role, State1),
             end_body_with_headers(StreamId, Fin, Stream2, State2);
         {error, {invalid_field, _Field, _Value}} ->
             %% Malformed header field - stream reset (RFC 9114 Section 4.1.2)
@@ -4389,7 +4426,7 @@ is_critical_stream(_, _) -> false.
 %%====================================================================
 
 send_request(
-    Headers,
+    Marked,
     Opts,
     #state{
         quic_conn = QuicConn,
@@ -4397,6 +4434,7 @@ send_request(
         next_stream_id = NextId
     } = State
 ) ->
+    Headers = plain_fields(Marked),
     %% RFC 9114 §4.2.2: enforce peer's max field section size.
     case validate_outbound_headers(Headers, State) of
         {error, Reason} ->
@@ -4409,7 +4447,9 @@ send_request(
                 {error, Reason} ->
                     {error, Reason};
                 ok ->
-                    send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State)
+                    send_request_validated(
+                        {Headers, Marked}, Opts, QuicConn, Encoder, NextId, State
+                    )
             end
     end.
 
@@ -4425,7 +4465,7 @@ validate_outbound_request_headers(Headers, State) ->
         throw:{header_error, Reason} -> {error, Reason}
     end.
 
-send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State) ->
+send_request_validated({Headers, Marked}, Opts, QuicConn, Encoder, NextId, State) ->
     %% end_stream defaults to true for requests without body (GET, HEAD, etc.)
     EndStream = maps:get(end_stream, Opts, true),
     Flow = maps:get(flow_control, Opts, auto),
@@ -4442,7 +4482,9 @@ send_request_validated(Headers, Opts, QuicConn, Encoder, NextId, State) ->
                         ok
                 end,
             %% Use encode/3 with StreamId for section ack tracking
-            {Encoded, Encoder1} = quic_qpack:encode(Headers, StreamId, Encoder),
+            {Encoded, Encoder1} = quic_qpack:encode(
+                mark_fields(Headers, Marked), StreamId, Encoder
+            ),
             %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
             %% so peer has dynamic table entries before receiving references
             State1 = State#state{qpack_encoder = Encoder1},
@@ -4556,12 +4598,13 @@ do_send_response(_StreamId, 101, _Headers, _State) ->
 do_send_response(
     StreamId,
     Status,
-    Headers,
+    Marked,
     #state{
         qpack_encoder = Encoder,
         streams = Streams
     } = State
 ) ->
+    Headers = plain_fields(Marked),
     AllHeaders = with_status(
         Status, outbound_response_headers(Status, request_method(StreamId, Streams), Headers)
     ),
@@ -4573,7 +4616,9 @@ do_send_response(
             case live_stream(StreamId, Streams) of
                 {ok, Stream} ->
                     %% Use encode/3 with StreamId for section ack tracking
-                    {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+                    {Encoded, Encoder1} = quic_qpack:encode(
+                        mark_fields(AllHeaders, Marked), StreamId, Encoder
+                    ),
                     %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
                     State1 = State#state{qpack_encoder = Encoder1},
                     case send_encoder_instructions(State1) of
@@ -4683,12 +4728,13 @@ do_send_trailers(StreamId, Trailers, State) ->
 
 encode_and_send_trailers(
     StreamId,
-    Trailers,
+    Marked,
     #state{
         qpack_encoder = Encoder,
         streams = Streams
     } = State
 ) ->
+    Trailers = plain_fields(Marked),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(Trailers, State) of
         {error, Reason} ->
@@ -4700,7 +4746,9 @@ encode_and_send_trailers(
                     {error, connect_tunnel};
                 {ok, Stream} ->
                     %% Use encode/3 with StreamId for section ack tracking
-                    {Encoded, Encoder1} = quic_qpack:encode(Trailers, StreamId, Encoder),
+                    {Encoded, Encoder1} = quic_qpack:encode(
+                        mark_fields(Trailers, Marked), StreamId, Encoder
+                    ),
                     %% RFC 9204: Send encoder instructions BEFORE the HEADERS frame
                     State1 = State#state{qpack_encoder = Encoder1},
                     send_trailers_frame(
@@ -5303,7 +5351,8 @@ release_buffered(StreamId, #state{stream_data_buffers = Buffers, buffered_bytes 
 %% 2. Send PUSH_PROMISE on request stream
 %% 3. Open push stream (unidirectional)
 %% 4. Return push ID for subsequent data sending
-do_push(RequestStreamId, Headers, #state{streams = Streams} = State) ->
+do_push(RequestStreamId, Marked, #state{streams = Streams} = State) ->
+    Headers = plain_fields(Marked),
     %% RFC 9114 §4.6: server MUST NOT push for a non-cacheable method.
     case cacheable_promised_method(Headers) of
         {error, Reason} ->
@@ -5315,7 +5364,7 @@ do_push(RequestStreamId, Headers, #state{streams = Streams} = State) ->
                         error ->
                             {error, unknown_request_stream};
                         {ok, _} ->
-                            do_push_internal(RequestStreamId, Headers, PushId, State1)
+                            do_push_internal(RequestStreamId, {Headers, Marked}, PushId, State1)
                     end;
                 {error, Reason} ->
                     {error, Reason}
@@ -5342,7 +5391,7 @@ allocate_push_id(#state{next_push_id = Next} = State) ->
 
 do_push_internal(
     RequestStreamId,
-    Headers,
+    {Headers, Marked},
     PushId,
     #state{
         quic_conn = QuicConn,
@@ -5356,7 +5405,9 @@ do_push_internal(
             {error, Reason};
         ok ->
             %% Encode headers for PUSH_PROMISE
-            {Encoded, Encoder1} = quic_qpack:encode(Headers, RequestStreamId, Encoder),
+            {Encoded, Encoder1} = quic_qpack:encode(
+                mark_fields(Headers, Marked), RequestStreamId, Encoder
+            ),
             State1 = State#state{qpack_encoder = Encoder1},
             case send_encoder_instructions(State1) of
                 {ok, State2} ->
@@ -5418,13 +5469,14 @@ do_send_push_response(_PushId, 101, _Headers, _State) ->
 do_send_push_response(
     PushId,
     Status,
-    Headers,
+    Marked,
     #state{
         push_streams = PushStreams,
         quic_conn = QuicConn,
         qpack_encoder = Encoder
     } = State
 ) ->
+    Headers = plain_fields(Marked),
     %% A push answers a promised request, which is never a CONNECT.
     AllHeaders = with_status(Status, outbound_response_headers(Status, undefined, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
@@ -5434,7 +5486,9 @@ do_send_push_response(
         ok ->
             case maps:find(PushId, PushStreams) of
                 {ok, {StreamId, Stream}} ->
-                    {Encoded, Encoder1} = quic_qpack:encode(AllHeaders, StreamId, Encoder),
+                    {Encoded, Encoder1} = quic_qpack:encode(
+                        mark_fields(AllHeaders, Marked), StreamId, Encoder
+                    ),
                     State1 = State#state{qpack_encoder = Encoder1},
                     case send_encoder_instructions(State1) of
                         {ok, State2} ->
