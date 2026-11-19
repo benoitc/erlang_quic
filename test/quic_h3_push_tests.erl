@@ -333,7 +333,8 @@ frames_after_push_trailers_are_frame_unexpected_test() ->
     _ = push_events().
 
 %% RFC 9110 Sections 6.4.1 and 9.3.2: a pushed response to HEAD, or a
-%% pushed 204 or 304, has no content; DATA carrying any is malformed.
+%% pushed 204 or 304, has no content; DATA carrying any is malformed, and
+%% that costs the push, not the connection (RFC 9114 Section 4.1.2).
 data_on_a_no_content_push_is_malformed_test() ->
     lists:foreach(
         fun({Method, Status}) ->
@@ -345,10 +346,12 @@ data_on_a_no_content_push_is_malformed_test() ->
                 (quic_h3_frame:encode_data(<<"abc">>))/binary
             >>,
             ?assertMatch(
-                {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+                {ok, _},
                 quic_h3_connection:handle_stream_data(3, Push, true, promised_state(Method))
             ),
-            ?assertEqual([], [E || {push_data, _, _, _} = E <- push_events()])
+            Events = push_events(),
+            ?assertEqual([], [E || {push_data, _, _, _} = E <- Events]),
+            ?assertEqual({push_cancelled, 5}, lists:last(Events))
         end,
         [{<<"HEAD">>, 200}, {<<"GET">>, 204}, {<<"GET">>, 304}]
     ).
@@ -374,10 +377,12 @@ push_ending_on_headers_short_of_content_length_test() ->
     _ = push_events(),
     Push = <<1, 5, (push_response_frame(200, [{<<"content-length">>, <<"10">>}]))/binary>>,
     ?assertMatch(
-        {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+        {ok, _},
         quic_h3_connection:handle_stream_data(3, Push, true, promised_state(<<"GET">>))
     ),
-    ?assertEqual([], [E || {push_complete, _} = E <- push_events()]).
+    Events = push_events(),
+    ?assertEqual([], [E || {push_complete, _} = E <- Events]),
+    ?assertEqual({push_cancelled, 5}, lists:last(Events)).
 
 %% Nothing is missing when the length is zero, or is not a body length
 %% (RFC 9110 Section 8.6).
@@ -401,9 +406,22 @@ push_ending_on_headers_with_nothing_missing_test_() ->
 promised_state(Method) ->
     make_test_state(#{
         role => client,
+        quic_conn => accepting_conn(),
+        local_control_stream => 2,
         local_max_push_id => 10,
         promised_pushes => #{5 => {0, [{<<":method">>, Method}, {<<":path">>, <<"/p">>}]}}
     }).
+
+%% Stands in for the QUIC connection: every call is answered with ok.
+accepting_conn() ->
+    spawn_link(fun accept_calls/0).
+
+accept_calls() ->
+    receive
+        {'$gen_call', From, _Call} ->
+            gen:reply(From, ok),
+            accept_calls()
+    end.
 
 push_response_frame(Status, Fields) ->
     quic_h3_frame:encode_headers(
@@ -460,10 +478,12 @@ push_response_101_is_malformed_test() ->
     _ = push_events(),
     Push = <<1, 5, (push_response_frame(101, []))/binary>>,
     ?assertMatch(
-        {error, {connection_error, ?H3_MESSAGE_ERROR, _}, _},
+        {ok, _},
         quic_h3_connection:handle_stream_data(3, Push, false, promised_state(<<"GET">>))
     ),
-    ?assertEqual([], [E || {push_response, _, _, _} = E <- push_events()]).
+    Events = push_events(),
+    ?assertEqual([], [E || {push_response, _, _, _} = E <- Events]),
+    ?assertEqual({push_cancelled, 5}, lists:last(Events)).
 
 push_response_valid_test() ->
     Headers = [{<<":status">>, <<"200">>}, {<<"content-type">>, <<"text/html">>}],

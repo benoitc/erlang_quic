@@ -64,6 +64,11 @@ All notable changes to this project will be documented in this file.
   on a request stream already did, within
   `SETTINGS_QPACK_BLOCKED_STREAMS` and `max_buffered_body` (RFC 9204
   Section 2.1.2).
+- A malformed pushed response, such as one whose content does not
+  match its `content-length`, closed the whole connection. It is a
+  stream error (RFC 9114 Section 4.1.2): the client now gives up that
+  push with H3_MESSAGE_ERROR, sends CANCEL_PUSH and reports
+  `push_cancelled` to the owner, and the other requests go on.
 
 ## [3.1.3] - 2026-11-18
 

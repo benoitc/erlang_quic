@@ -5482,6 +5482,33 @@ content_behind_blocked_push_headers_is_bounded_test() ->
     {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State1),
     ?assertEqual([], owner_events()).
 
+%% RFC 9114 Section 4.1.2: a malformed pushed response is a stream error.
+%% The push is given up with H3_MESSAGE_ERROR and the request it came
+%% with still gets its response.
+a_malformed_push_costs_only_the_push_test() ->
+    Request = #h3_stream{id = 0, type = request, state = half_closed_local, method = <<"GET">>},
+    State0 = push_blocking_state(#{local_control_stream => 2, streams => #{0 => Request}}),
+    Quic = element(2, State0),
+    Short = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, <<"200">>}, {<<"content-length">>, <<"10">>}])
+    ),
+    Push = <<1, 5, Short/binary, (quic_h3_frame:encode_data(<<"abc">>))/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(11, Push, true, State0),
+    ?assertMatch(
+        [
+            {push_stream, 5, 0, _},
+            {push_response, 5, 200, _},
+            {push_cancelled, 5}
+        ],
+        owner_events()
+    ),
+    Calls = fake_quic_calls(Quic),
+    ?assert(lists:member({stop_sending, 11, ?H3_MESSAGE_ERROR}, Calls)),
+    ?assert(lists:member({send_data, 2, quic_h3_frame:encode_cancel_push(5), false}, Calls)),
+    Response = quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Response, true, State1),
+    ?assertMatch([{response, 0, 200, _} | _], owner_events()).
+
 %% A push the server withdraws while blocked is not resumed.
 a_cancelled_push_is_no_longer_blocked_test() ->
     State0 = push_blocking_state(#{peer_control_stream => 3}),

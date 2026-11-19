@@ -2514,12 +2514,7 @@ read_push_stream(StreamId, PushId, Combined, Fin, #state{stream_buffers = Buffer
                             <<>> -> maps:remove(StreamId, Buffers);
                             _ -> Buffers#{StreamId => Rest}
                         end,
-                    case
-                        finish_push(StreamId, PushId, Fin, State1#state{stream_buffers = Buffers1})
-                    of
-                        {ok, State2} -> {ok, State2};
-                        {error, Reason} -> {error, Reason, State}
-                    end
+                    finish_push(StreamId, PushId, Fin, State1#state{stream_buffers = Buffers1})
             end;
         {error, Reason} ->
             {error, Reason, State}
@@ -2548,7 +2543,9 @@ hold_push_behind_blocked(StreamId, PushId, Held, Fin, State) ->
     end.
 
 %% One push is given up: its stream is no longer read, the server is told
-%% and so is the owner. The connection and its other streams go on.
+%% and so is the owner. The connection and its other streams go on. A
+%% malformed pushed response ends this way, with H3_MESSAGE_ERROR (RFC
+%% 9114 Section 4.1.2).
 fail_push(StreamId, PushId, Code, #state{owner = Owner} = State) ->
     _ = quic:stop_sending(State#state.quic_conn, StreamId, Code),
     Owner ! {quic_h3, self(), {push_cancelled, PushId}},
@@ -2598,9 +2595,15 @@ process_push_frames(StreamId, PushId, Data, Fin, State) ->
 
 process_push_frame(StreamId, PushId, Frame, FrameFin, Rest, Fin, State) ->
     case handle_push_frame(StreamId, PushId, Frame, FrameFin, State) of
-        {ok, State1} -> process_push_frames(StreamId, PushId, Rest, Fin, State1);
-        {blocked, State1} -> {blocked, Rest, State1};
-        {error, Reason} -> {error, Reason}
+        {ok, State1} when not is_map_key(PushId, State1#state.received_pushes) ->
+            %% The push is over, complete or given up: nothing more is read.
+            {ok, <<>>, State1};
+        {ok, State1} ->
+            process_push_frames(StreamId, PushId, Rest, Fin, State1);
+        {blocked, State1} ->
+            {blocked, Rest, State1};
+        {error, Reason} ->
+            {error, Reason}
     end.
 
 %% Bytes of the push stream's current DATA frame still to arrive.
@@ -2716,8 +2719,8 @@ validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Receiv
             deliver_push_response_finalize(
                 StreamId, PushId, Status, Headers, Fin, Owner, Received, State
             );
-        {error, Reason} ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
+        {error, _Reason} ->
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State)
     end.
 
 deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, Received, State) ->
@@ -2730,7 +2733,7 @@ deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, R
             Owner ! {quic_h3, self(), {push_complete, PushId}},
             cleanup_push_stream(PushId, StreamId, State);
         false ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"push content-length violated">>}}
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State)
     end;
 deliver_push_response_finalize(
     StreamId, PushId, Status, _Headers, false, _Owner, Received, State
@@ -2778,7 +2781,7 @@ extract_content_length(Headers) ->
 apply_push_data(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) ->
     case (Payload =/= <<>>) andalso carries_no_content(Stream) of
         true ->
-            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"DATA on a push with no content">>}};
+            fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State);
         false ->
             apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State)
     end.
@@ -2800,7 +2803,7 @@ apply_push_body(StreamId, PushId, Payload, Fin, Stream, Owner, Received, State) 
                     {ok, State#state{received_pushes = Received0#{PushId => Stream1}}}
             end;
         {error, Code} ->
-            {error, {connection_error, Code, <<"push content-length violated">>}}
+            fail_push(StreamId, PushId, Code, State)
     end.
 
 %% RFC 9110 Section 8.6: on a no-content push the Content-Length is not a body length.
@@ -2853,14 +2856,13 @@ handle_push_trailers(StreamId, PushId, HeaderBlock, Fin, Decoder, Owner, Stream,
                             }
                         );
                     {error, Code} ->
-                        {error,
-                            {connection_error, Code, <<"push body length mismatch at trailers">>}}
+                        fail_push(StreamId, PushId, Code, State1)
                 end
             catch
                 throw:{header_error, _} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed push trailers">>}};
+                    fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State1);
                 throw:{trailer_error, _} ->
-                    {error, {connection_error, ?H3_MESSAGE_ERROR, <<"invalid push trailer">>}}
+                    fail_push(StreamId, PushId, ?H3_MESSAGE_ERROR, State1)
             end;
         {{blocked, RIC}, Decoder1} ->
             block_push_stream(StreamId, {RIC, HeaderBlock, Fin}, State#state{
