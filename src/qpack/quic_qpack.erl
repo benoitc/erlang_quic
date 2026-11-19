@@ -79,7 +79,12 @@
 %% Types
 %%====================================================================
 
--type header() :: {Name :: binary(), Value :: binary()}.
+%% A field line. The three-element form is a never-indexed literal (RFC
+%% 9204 Section 7.1.3): the encoder sends it as a literal with the N bit
+%% and keeps it out of the dynamic table, and a decoder created with
+%% `never_indexed => true' returns it for a field line received that way.
+-type field() :: {Name :: binary(), Value :: binary()}.
+-type header() :: field() | {Name :: binary(), Value :: binary(), never_indexed}.
 -type headers() :: [header()].
 
 -export_type([state/0, header/0, headers/0]).
@@ -95,10 +100,10 @@
     %% Dynamic table configuration
     use_dynamic = false :: boolean(),
     %% Dynamic table - maps for O(1) lookup
-    dyn_field_index = #{} :: #{header() => pos_integer()},
+    dyn_field_index = #{} :: #{field() => pos_integer()},
     dyn_name_index = #{} :: #{binary() => pos_integer()},
     %% Dynamic table entries: [{AbsoluteIndex, {Name, Value}, Size}]
-    dyn_entries = [] :: [{pos_integer(), header(), non_neg_integer()}],
+    dyn_entries = [] :: [{pos_integer(), field(), non_neg_integer()}],
     dyn_size = 0 :: non_neg_integer(),
     dyn_max_size = 0 :: non_neg_integer(),
     %% RFC 9204 §3.2.1: the encoder MUST NOT set the dynamic table capacity
@@ -118,7 +123,9 @@
     %% For an encoder state: the decoder's SETTINGS_QPACK_MAX_TABLE_CAPACITY,
     %% which the Required Insert Count is encoded against. Until it is set,
     %% max_allowed_capacity stands in for it.
-    peer_max_capacity :: non_neg_integer() | undefined
+    peer_max_capacity :: non_neg_integer() | undefined,
+    %% For a decoder state: return never-indexed literals as 3-tuples.
+    keep_never_indexed = false :: boolean()
 }).
 
 -opaque state() :: #qpack{}.
@@ -157,6 +164,9 @@ new() ->
 %%       negotiated via set_dynamic_capacity/2, so 0-RTT early-data requests
 %%       remain static-only until the peer's real SETTINGS arrive
 %%       (RFC 9114 §7.2.4.2).
+%%   never_indexed - A decoder returns a literal received with the N bit
+%%       as `{Name, Value, never_indexed}' (default: false, the mark is
+%%       dropped). RFC 9204 Section 7.1.3.
 -spec new(#{atom() => term()}) -> state().
 new(Opts) ->
     MaxDynSize = maps:get(max_dynamic_size, Opts, 0),
@@ -164,7 +174,8 @@ new(Opts) ->
     #qpack{
         use_dynamic = MaxDynSize > 0,
         dyn_max_size = MaxDynSize,
-        max_allowed_capacity = MaxAllowed
+        max_allowed_capacity = MaxAllowed,
+        keep_never_indexed = maps:get(never_indexed, Opts, false)
     }.
 
 %% @doc Encode headers using QPACK with state.
@@ -668,6 +679,8 @@ encode_headers_tracking([Header | Rest], BaseIC, State, Acc, MaxRef) ->
 %% This function also inserts entries into the dynamic table when appropriate
 -spec encode_header_tracking(header(), non_neg_integer(), non_neg_integer(), state()) ->
     {binary(), state(), integer() | none}.
+encode_header_tracking({Name, Value, never_indexed}, _BaseIC, _InUse, State) ->
+    {encode_never_indexed(Name, Value), State, none};
 encode_header_tracking({Name, Value}, BaseIC, InUse, #qpack{use_dynamic = true} = State) ->
     case find_dynamic_match(Name, Value, State) of
         {exact, AbsIndex} ->
@@ -837,17 +850,35 @@ encode_literal_with_dynamic_name_ref(RelIndex, Value) ->
     ValueEnc = encode_string(Value),
     <<NameRef/binary, ValueEnc/binary>>.
 
+%% RFC 9204 Sections 4.5.4 and 7.1.3: a never-indexed field line is
+%% always a literal with the N bit, never an index into either table and
+%% never inserted. Its name may still be a static table reference.
+-spec encode_never_indexed(binary(), binary()) -> binary().
+encode_never_indexed(Name, Value) ->
+    case maps:find(Name, ?STATIC_NAME_MAP) of
+        {ok, Index} ->
+            %% 0111xxxx (N=1, T=1 for static)
+            NameRef = encode_prefixed_int(Index, 4, 2#0111),
+            <<NameRef/binary, (encode_string(Value))/binary>>;
+        error ->
+            encode_literal(Name, Value, 2#0011)
+    end.
+
 %% Literal with literal name - 0010xxxx (N=0, H=0 for no huffman on name)
 -spec encode_literal(binary(), binary()) -> binary().
 encode_literal(Name, Value) ->
+    encode_literal(Name, Value, 2#0010).
+
+%% 001N then H=0 and the name length.
+encode_literal(Name, Value, Pattern) ->
     NameLen = byte_size(Name),
     ValueEnc = encode_string(Value),
     case NameLen < 7 of
         true ->
-            FirstByte = 2#00100000 bor NameLen,
+            FirstByte = (Pattern bsl 4) bor NameLen,
             <<FirstByte, Name/binary, ValueEnc/binary>>;
         false ->
-            FirstByte = 2#00100111,
+            FirstByte = (Pattern bsl 4) bor 2#0111,
             LenCont = encode_multi_byte_int(NameLen - 7),
             <<FirstByte, LenCont/binary, Name/binary, ValueEnc/binary>>
     end.
@@ -919,11 +950,18 @@ budget(infinity) -> (1 bsl 59) - 1;
 budget(Max) -> Max.
 
 %% The budget left once Field is counted: name, value and 32 bytes.
+left({Name, Value, never_indexed}, Left) ->
+    left({Name, Value}, Left);
 left({Name, Value}, Left) ->
     case Left - byte_size(Name) - byte_size(Value) - 32 of
         Left1 when Left1 >= 0 -> Left1;
         _ -> throw(field_section_too_large)
     end.
+
+%% A literal field line as the caller gets it: with its N bit when the
+%% decoder was asked to keep it.
+literal(1, Name, Value, #qpack{keep_never_indexed = true}) -> {Name, Value, never_indexed};
+literal(_N, Name, Value, _State) -> {Name, Value}.
 
 %% Decode headers with Required Insert Count (RIC) and Base from prefix
 -spec decode_headers(
@@ -950,7 +988,7 @@ decode_headers(<<2#10:2, _:6, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
-decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
+decode_headers(<<2#01:2, N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Literal Field Line with Name Reference - 01NTxxxx
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#0F,
@@ -964,18 +1002,15 @@ decode_headers(<<2#01:2, _N:1, T:1, _:4, _/binary>> = Data, RIC, Base, State, Ac
         1 ->
             %% Static table reference
             {Name, _} = get_static_entry(Index),
-            (Index),
-            decode_headers(
-                Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
-            );
+            Field = literal(N, Name, Value, State),
+            decode_headers(Rest2, RIC, Base, State, [Field | Acc], left(Field, Left));
         0 ->
             %% Dynamic table reference (pre-base)
             AbsIndex = Base - Index - 1,
             case get_dynamic_entry_by_absolute(AbsIndex, State) of
                 {Name, _} ->
-                    decode_headers(
-                        Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
-                    );
+                    Field = literal(N, Name, Value, State),
+                    decode_headers(Rest2, RIC, Base, State, [Field | Acc], left(Field, Left));
                 undefined ->
                     throw({invalid_dynamic_index, AbsIndex})
             end
@@ -993,9 +1028,8 @@ decode_headers(<<2#0010:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
 decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, State, Acc, Left) ->
     %% Literal with literal name, N=1 (never indexed) - 0011Hxxx.
     %% RFC 9204 §4.5.6: this representation MUST NOT be added to the
-    %% dynamic table by any party. Our decoder never auto-inserts literals,
-    %% so the bit is preserved by simply emitting the field as-is. A
-    %% future proxy use-case will need to surface this bit to callers.
+    %% dynamic table by any party. Our decoder never auto-inserts
+    %% literals; the mark goes to a caller that asked for it.
     {NameLen, Rest1} =
         case NameLenPrefix < 7 of
             true -> {NameLenPrefix, Rest0};
@@ -1003,7 +1037,8 @@ decode_headers(<<2#0011:4, H:1, NameLenPrefix:3, Rest0/binary>>, RIC, Base, Stat
         end,
     {Name, Rest2} = decode_string_with_huffman(H, NameLen, Rest1),
     {Value, Rest3} = decode_string(Rest2),
-    decode_headers(Rest3, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left));
+    Field = literal(1, Name, Value, State),
+    decode_headers(Rest3, RIC, Base, State, [Field | Acc], left(Field, Left));
 decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Indexed Header Field with Post-Base Index - 0001xxxx
     <<FirstByte, Rest0/binary>> = Data,
@@ -1023,7 +1058,7 @@ decode_headers(<<2#0001:4, _:4, _/binary>> = Data, RIC, Base, State, Acc, Left) 
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
-decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
+decode_headers(<<2#0000:4, N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc, Left) ->
     %% Literal with post-base name reference - 0000Nxxx
     <<FirstByte, Rest0/binary>> = Data,
     IndexBits = FirstByte band 16#07,
@@ -1037,9 +1072,8 @@ decode_headers(<<2#0000:4, _N:1, _:3, _/binary>> = Data, RIC, Base, State, Acc, 
     AbsIndex = Base + PostBaseIndex,
     case get_dynamic_entry_by_absolute(AbsIndex, State) of
         {Name, _} ->
-            decode_headers(
-                Rest2, RIC, Base, State, [{Name, Value} | Acc], left({Name, Value}, Left)
-            );
+            Field = literal(N, Name, Value, State),
+            decode_headers(Rest2, RIC, Base, State, [Field | Acc], left(Field, Left));
         undefined ->
             throw({invalid_dynamic_index, AbsIndex})
     end;
