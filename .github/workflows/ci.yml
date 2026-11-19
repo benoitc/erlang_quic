@@ -65,6 +65,15 @@ jobs:
       - name: Run unit tests
         run: rebar3 eunit
 
+      # Only a kernel before 6.11 refuses the send, which the 22.04
+      # runner has.
+      - name: Run the GSO test on a device without checksum offload
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          command -v ethtool >/dev/null || sudo apt-get install -y ethtool
+          rebar3 as test compile
+          sudo env "PATH=$PATH" scripts/test_gso_no_csum.sh
+
       - name: Run property tests
         run: rebar3 proper
 
