@@ -35,6 +35,12 @@ All notable changes to this project will be documented in this file.
   time.
 
 ### Fixed
+- A write on a stream that still had data waiting in the send queue
+  could be sent ahead of that data when it was small enough to fit the
+  congestion window, a FIN sent on its own most of all. The peer got
+  the stream out of order, and the sender kept the stream open until
+  the queued data was acknowledged. A stream's writes now leave in the
+  order they were made.
 - With the optional crypto NIF loaded, a server kept its 0-RTT keys
   for the life of the connection instead of dropping them three probe
   timeouts after the first 1-RTT packet (RFC 9001 Section 4.9.3).

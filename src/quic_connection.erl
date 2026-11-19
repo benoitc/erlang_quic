@@ -11704,7 +11704,29 @@ admit_send(check, DataSize, #state{send_queue_bytes = QueueBytes}) ->
     ),
     false.
 
-send_admitted_data(
+%% A write goes behind what its stream still has waiting. Sent at once
+%% because the window has room for it, a small write, a bare FIN most of
+%% all, would overtake the stream's queued data: the peer then holds it out
+%% of order, and an early-acked FIN leaves the stream waiting for its
+%% reclaim through the whole transfer.
+send_admitted_data(StreamId, StreamState, Data, DataSize, Fin, State) ->
+    case behind_own_data(StreamId, StreamState, State) of
+        true ->
+            Offset = StreamState#stream_state.send_offset,
+            queue_blocked_send(StreamId, Offset, Data, Fin, DataSize, State);
+        false ->
+            send_admitted_now(StreamId, StreamState, Data, DataSize, Fin, State)
+    end.
+
+%% The stream has accepted bytes it has not sent yet, and they are waiting.
+behind_own_data(
+    StreamId,
+    #stream_state{send_offset = Offset, send_highest = Highest},
+    #state{send_queue_count = Queued, send_parked = Parked}
+) ->
+    (Highest < Offset) andalso ((Queued > 0) orelse is_map_key(StreamId, Parked)).
+
+send_admitted_now(
     StreamId,
     StreamState,
     Data,
