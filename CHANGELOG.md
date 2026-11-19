@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.2.0] - 2026-11-19
 
 ### Added
 - A header field can be sent as a QPACK never-indexed literal: give it

@@ -404,6 +404,37 @@ RFC 9001 Section 6 defines key update mechanism:
 next_app_secret = HKDF-Expand-Label(current_app_secret, "quic ku", "", hash_len)
 ```
 
+### Key lifecycle
+
+You need this when you touch anything that installs, selects or drops keys.
+Each set of keys is dropped as soon as the protocol has no more use for it.
+
+| Keys | Dropped when | Reference |
+|---|---|---|
+| Initial | The client sends its first Handshake packet; the server receives its first one | RFC 9001 Section 4.9.1 |
+| Handshake | The handshake is confirmed | RFC 9001 Section 4.9.2 |
+| 0-RTT, client | 1-RTT keys are installed, or 0-RTT is rejected (EncryptedExtensions without `early_data`, or a HelloRetryRequest) | RFC 9001 Sections 4.9.3 and 4.6.2 |
+| 0-RTT, server | Three probe timeouts after the first 1-RTT packet arrives, on both receive paths | RFC 9001 Section 4.9.3 |
+| Previous generation of a key update | Three probe timeouts after the first packet under the new keys authenticates | RFC 9001 Section 6.5 |
+
+A key update goes through three steps:
+
+1. `initiate_key_update/1` derives the next keys and keeps the current ones
+   as `prev_keys`. It runs from `quic_connection:key_update/1` or when the
+   AEAD confidentiality limit is reached.
+2. The first packet that authenticates under the new keys confirms the
+   update and arms the retirement timer (`opened_with/3`).
+3. `retire_prev_keys/1` drops the previous keys three probe timeouts later.
+
+While `prev_keys` is held, `key_update/1` returns
+`{error, key_update_too_soon}`: the peer may still hold its old read keys and
+would drop the packets (Section 6.5). The update forced by the confidentiality
+limit does not wait, because that limit is mandatory (Section 6.6).
+Where to look: the "Key Update" banner in `src/quic_connection.erl`. Tests:
+`quic_key_update_*_tests`, `quic_prev_keys_retire_tests`,
+`quic_key_discard_tests`, `quic_client_0rtt_discard_tests`,
+`quic_server_0rtt_discard_tests`.
+
 ## Connection ID Management
 
 ### Local CID Pool
@@ -453,8 +484,15 @@ When resuming with a stored ticket:
 1. Client derives `early_keys` from PSK
 2. Client sends 0-RTT packets (type 0x01) immediately
 3. Server validates PSK and derives matching keys
-4. Server processes early data or rejects with `early_data_rejected`
+4. Server processes early data or rejects it; the client's owner then gets
+   `early_data_rejected` with the streams to retry
 5. Client falls back to 1-RTT if early data rejected
+
+A HelloRetryRequest counts as the rejection, at once (RFC 9001 Section
+4.6.2). A Retry does not: the client sends the same ClientHello again and its
+0-RTT data again, under packet numbers that keep counting (RFC 9000 Section
+17.2.5.3). 0-RTT data written after the server accepted it still counts
+against the connection's flow-control limit.
 
 **Limitations:**
 - 0-RTT data is not forward-secret

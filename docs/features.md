@@ -24,6 +24,8 @@
 - [x] Stream prioritization (RFC 9218) with 8 urgency levels
 - [x] Incremental delivery flag support
 - [x] RESET_STREAM_AT extension (draft-ietf-quic-reliable-stream-reset-11)
+- [x] A stream's writes are sent in the order they were made: a write waits behind the data its stream still has in the send queue, so a FIN sent on its own does not overtake it
+- [x] A peer-initiated stream is opened by whichever frame names it first, MAX_STREAM_DATA included (RFC 9000 Section 3.2)
 
 ### Flow Control
 - [x] Connection-level flow control (MAX_DATA)
@@ -159,12 +161,16 @@ than from its own timer.
 - [x] Initial secrets derivation
 - [x] Handshake secrets
 - [x] Application secrets
-- [x] Key updates (RFC 9001 Section 6)
+- [x] Key updates (RFC 9001 Section 6). A new update waits three probe timeouts after the previous one is confirmed (Section 6.5); the update forced by the AEAD confidentiality limit does not wait (Section 6.6)
+- [x] Keys are dropped when their use ends: Initial and Handshake keys, 0-RTT keys, and the previous generation of a key update (RFC 9001 Sections 4.9 and 6.5)
 
 ### Session Resumption
 - [x] Session tickets (NewSessionTicket)
 - [x] PSK-based resumption
 - [x] 0-RTT early data
+- [x] A server accepts a ticket for the lifetime it advertised (24 hours), not longer
+- [x] A HelloRetryRequest is the rejection of 0-RTT: the owner gets `early_data_rejected` when it arrives (RFC 9001 Section 4.6.2)
+- [x] After a Retry the client sends the same ClientHello again (RFC 9000 Section 17.2.5.3)
 
 ### External PSK (RFC 9846 §4.3.11)
 - [x] `psk_dhe_ke` mode (forward-secret)
@@ -244,6 +250,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
 - `quic:has_early_keys/1` - Whether 0-RTT (early data) keys are held right now (false once 1-RTT keys are installed, RFC 9001 §4.9.3)
 - `quic:early_data_accepted/1` - Whether the server accepted 0-RTT early data
+- `quic_connection:key_update/1` - Start a key update. Returns `{error, handshake_not_confirmed}` before the handshake is confirmed, `{error, key_update_in_progress}` until the peer has confirmed the previous update, and `{error, key_update_too_soon}` for three probe timeouts after that
 
 ### Datagrams (RFC 9221)
 - `quic:send_datagram/2` - Send unreliable datagram
@@ -265,6 +272,16 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
   `?H3_CAPSULE_LEGACY_DATAGRAM` (`0xff37a0`)
 - A pure codec with no callers inside this library: extension libraries
   drive it. Same wire format as `h1_capsule` and `h2_capsule`.
+
+### HTTP/3 Requests, Fields and Push
+- `quic_h3:request/3` option `early_data` - On a resumed connection a request made before the handshake completes is sent as 0-RTT only when its method is GET, HEAD, OPTIONS or TRACE. Any other method waits for the handshake, and the call returns then (RFC 8470 Section 4). `early_data => true` sends it as 0-RTT anyway (default: false)
+- Header form `{Name, Value, never_indexed}` - Accepted wherever headers are sent (`request/2,3`, `send_response/4`, `respond/5`, `send_trailers/3`, `push/3`, `send_push_response/4`). The field goes out as a QPACK never-indexed literal and stays out of the compression tables (RFC 9204 Section 7.1.3)
+- `qpack_never_indexed` option on `quic_h3:connect/3`, `start_server/3` and `accept/2` - A field the peer sent as a never-indexed literal is delivered in the three-element form, to the owner and to the request handler (default: false, fields arrive as `{Name, Value}`)
+- `quic_qpack:new/1` option `never_indexed` - The same for a bare QPACK decoder; `quic_qpack:encode/1,2,3` accepts the three-element form
+- A pushed response, its trailers or a PUSH_PROMISE that arrives before the QPACK instructions it refers to waits for them, within `SETTINGS_QPACK_BLOCKED_STREAMS` and `max_buffered_body` (RFC 9204 Section 2.1.2)
+- A malformed pushed response costs only that push: the client stops reading its stream with `H3_MESSAGE_ERROR`, sends CANCEL_PUSH and the owner gets `{quic_h3, Conn, {push_cancelled, PushId}}` (RFC 9114 Section 4.1.2)
+- A `content-length` on a 1xx or 204 response, or on a 2xx response to CONNECT, is removed before sending (RFC 9110 Section 8.6)
+- A malformed HTTP datagram closes the connection with `H3_DATAGRAM_ERROR` (RFC 9297 Section 2.1)
 
 ### HTTP/3 Extension Streams
 - `quic_h3:open_bidi_stream/1,2` - Open a client-initiated bidi stream;
@@ -367,7 +384,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `max_udp_payload_size` - Largest UDP payload this endpoint is willing to receive, advertised as the RFC 9000 §18.2 transport parameter (minimum 1200; default: what a 1500-byte path carries for the address family, 1472 over IPv4 and 1452 over IPv6)
 - `recbuf` - UDP receive buffer size in bytes (default: 7MB)
 - `sndbuf` - UDP send buffer size in bytes (default: 7MB)
-- `server_send_batching` - Per-connection send batching on the server (default: true). On Linux + `socket_backend => socket` with UDP_SEGMENT, outgoing packets are coalesced into GSO super-datagrams via `sendmsg` cmsg; neutral on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`
+- `server_send_batching` - Per-connection send batching on the server (default: true). On Linux + `socket_backend => socket` with UDP_SEGMENT, outgoing packets are coalesced into GSO super-datagrams via `sendmsg` cmsg; neutral on macOS / gen_udp. Set to `false` to fall back to direct `gen_udp:send/4`. When the kernel accepts the option but refuses the segmented sends (EIO on a device without transmit checksum offload, on Linux before 6.11), the batch goes out packet by packet, the socket stops using GSO and one `gso_disabled` warning is logged
 - `hibernate_after` - Hibernate an idle connection process after this many milliseconds, running a fullsweep so handshake garbage is not pinned to a heap that never collects (default: 5000; `infinity` opts out)
 - `fullsweep_after` - `fullsweep_after` spawn option of the connection process (default: the VM default). `0` keeps a mostly idle connection's heap close to its live data between hibernations, at the cost of more collector work during bulk transfers
 - `versions` - QUIC versions this connection also accepts, for RFC 9368 compatible version negotiation (default: the negotiated `version` alone)

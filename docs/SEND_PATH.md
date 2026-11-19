@@ -29,6 +29,12 @@ admitted write then goes through connection and stream flow control, and is
 fragmented when larger than one packet can carry. It is sent now, or queued
 because the congestion window or the peer's window has no room.
 
+A write is also queued when its stream still has data waiting, whatever room
+the window has: `behind_own_data/3` compares the stream's `send_offset` (bytes
+accepted) with its `send_highest` (bytes sent). A stream's writes therefore
+leave in the order they were made. Without this a small write, a FIN sent on
+its own most of all, went out ahead of the stream's queued data.
+
 **`queue_stream_data/5`** parks a write that cannot go now. It never refuses:
 part of the write may already be on the wire by then. Entries live in a
 bucket-per-urgency priority queue (RFC 9218, urgency 0 to 7), so insertion is
@@ -40,6 +46,15 @@ total, decides emptiness, because a FIN-only entry carries no bytes.
 releases, or on a burst continuation. It works through
 `process_send_queue_entry/1` under the burst budget and the congestion
 controller's approval.
+
+**When the send side of a stream is done.** A stream's send side ends when the
+peer has acknowledged its FIN and all of its data (RFC 9000 Section 3.1, "Data
+Recvd"). `settle_fin_ack/2` runs when a FIN is acknowledged. If data of the
+stream is still in flight or queued, the stream waits in `pending_fin_reclaim`;
+a local RESET_STREAM_AT waits the same way in `pending_send_reset_at`.
+`complete_parked/3` looks again at a waiting stream only when an ACK covers
+some of its data, and `handle_pto_timeout` checks all of them. A stream that
+finishes or is reset leaves both maps in `mark_send_done_and_reclaim/2`.
 
 **`send_stream_chunk_run/8`** is the bulk path. Once the first full-size chunk
 is approved, as many further chunks as congestion control, pacing and the burst
@@ -75,6 +90,12 @@ the next event on the connection, so handlers that queue must flush.
 - **The queue is not FIFO.** It is eight buckets by urgency, and a requeued
   remainder goes to the front of its bucket rather than the back, so a partly
   sent chunk is not overtaken.
+- **A write can be queued while the window has room.** That is the ordering
+  rule above, not a stall: the entry is behind data that already waits for the
+  same drain.
+- **Checking a waiting stream is not free.** `send_pending/3` scans the
+  in-flight packets, then the send queue. Keep it off any path that runs for
+  every waiting stream on every ACK; that was issue #595.
 - **Counters are the contract.** `quic_regression_SUITE` gates on
   `packets_sent` and `retransmits`, never on a rate. If a change here moves
   packet counts, that gate is what notices.
