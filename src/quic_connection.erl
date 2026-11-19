@@ -7713,8 +7713,8 @@ app_ack_tail(AckedPackets, LostPackets0, LateAcked, State0) ->
     %% cwnd may have reopened: held handshake packets, then held control
     %% frames, then the send queue, retransmit_stream entries included.
     State7 = send_held(drain_pending_hs(State4b)),
-    %% Complete any local reset-at reclaim whose reliable bytes are now acked.
-    State8 = complete_fin_reclaims(complete_send_reset_at(State7)),
+    %% Finish the parked streams this ACK carried data of.
+    State8 = complete_parked(AckedPackets, LateAcked, State7),
     %% The PTO is re-armed once per receive pass, not once per ACK frame:
     %% inside a pass flush_event/2 runs at its end.
     case State8 of
@@ -12060,7 +12060,9 @@ reset_zero_rtt_streams([], State) ->
     State;
 reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = State0) ->
     NewStreams = lists:foldl(fun maps:remove/2, Streams, RejectedIds),
-    State = lists:foldl(fun purge_stream_send_queue/2, State0, RejectedIds),
+    State = lists:foldl(
+        fun(Id, S) -> drop_parked(Id, purge_stream_send_queue(Id, S)) end, State0, RejectedIds
+    ),
     ?LOG_INFO(
         #{
             what => zero_rtt_rejected,
@@ -13182,7 +13184,7 @@ do_close_stream(StreamId, ErrorCode, #state{streams = Streams} = State) ->
                 send_reset_error = Code
             },
             %% Purge any queued STREAM frames so nothing is sent after the reset.
-            State1 = drop_send_reset_at(StreamId, purge_stream_send_queue(StreamId, NewState)),
+            State1 = drop_parked(StreamId, purge_stream_send_queue(StreamId, NewState)),
             State2 = State1#state{
                 streams = maps:put(StreamId, UpdatedStream, State1#state.streams)
             },
@@ -13199,8 +13201,12 @@ reset_frame(
 ) ->
     {reset_stream, StreamId, Code, Final}.
 
-drop_send_reset_at(StreamId, #state{pending_send_reset_at = P} = State) ->
-    State#state{pending_send_reset_at = maps:remove(StreamId, P)}.
+%% The stream is no longer waiting for its FIN or RESET_STREAM_AT reclaim.
+drop_parked(StreamId, #state{pending_send_reset_at = R, pending_fin_reclaim = F} = State) ->
+    State#state{
+        pending_send_reset_at = maps:remove(StreamId, R),
+        pending_fin_reclaim = maps:remove(StreamId, F)
+    }.
 
 %% Request peer to stop sending on a stream (RFC 9000 Section 19.5)
 do_stop_sending(StreamId, ErrorCode, #state{streams = Streams} = State) ->
@@ -13337,10 +13343,7 @@ execute_reset_stream_at(
 %% the reclaim when the last reliable bytes are acked.
 settle_send_reset_at(StreamId, State) ->
     RS = (maps:get(StreamId, State#state.streams))#stream_state.send_reset_at,
-    Pending =
-        stream_has_queued_below(StreamId, RS, State) orelse
-            quic_loss:stream_has_unacked_below(State#state.loss_state, StreamId, RS),
-    case Pending of
+    case send_pending(StreamId, RS, State) of
         false ->
             mark_send_done_and_reclaim(StreamId, State);
         true ->
@@ -13351,8 +13354,10 @@ settle_send_reset_at(StreamId, State) ->
     end.
 
 %% Mark the send side terminal and try to reclaim. recv_done (for bidi) still
-%% gates the actual removal inside maybe_reclaim_stream/2.
-mark_send_done_and_reclaim(StreamId, State) ->
+%% gates the actual removal inside maybe_reclaim_stream/2. A stream that is
+%% done is no longer parked.
+mark_send_done_and_reclaim(StreamId, State0) ->
+    State = drop_parked(StreamId, State0),
     case maps:find(StreamId, State#state.streams) of
         {ok, S} ->
             State1 = State#state{
@@ -13467,6 +13472,12 @@ reset_final_size(
         lists:seq(1, 8)
     ),
     max(Unsent, Highest).
+
+%% True while data of StreamId below Limit is still owed: in flight, or
+%% queued. The in-flight list is the short one, so it is asked first.
+send_pending(StreamId, Limit, State) ->
+    quic_loss:stream_has_unacked_below(State#state.loss_state, StreamId, Limit) orelse
+        stream_has_queued_below(StreamId, Limit, State).
 
 %% True if the send queue holds STREAM/retransmit data for StreamId starting
 %% before ReliableSize (reliable bytes still owed).
@@ -13704,7 +13715,7 @@ do_close_stream_deadline(StreamId, ErrorCode, #state{streams = Streams} = State)
                 deadline = undefined,
                 deadline_timer = undefined
             },
-            State1 = drop_send_reset_at(StreamId, purge_stream_send_queue(StreamId, NewState)),
+            State1 = drop_parked(StreamId, purge_stream_send_queue(StreamId, NewState)),
             State2 = State1#state{
                 streams = maps:put(StreamId, NewStreamState, State1#state.streams)
             },
@@ -14380,32 +14391,50 @@ fully_acked(Frames, Index) ->
     Repair = quic_loss:retransmittable_frames(Frames),
     (Repair =/= []) andalso (drop_acked(Repair, Index) =:= []).
 
+%% A stream parked for its FIN or RESET_STREAM_AT reclaim is finished by the
+%% ACK that covers the last of its data, so an ACK looks again only at the
+%% parked streams it carries data of. One that has none of its data acked
+%% keeps its answer, however deep the send queue is.
+complete_parked(
+    _Acked, _LateAcked, #state{pending_fin_reclaim = F, pending_send_reset_at = R} = State
+) when
+    map_size(F) =:= 0, map_size(R) =:= 0
+->
+    State;
+complete_parked(
+    Acked, LateAcked, #state{pending_fin_reclaim = F, pending_send_reset_at = R} = State
+) ->
+    Parked = fun(Sid) -> is_map_key(Sid, F) orelse is_map_key(Sid, R) end,
+    Touched = lists:usort(
+        [
+            Sid
+         || #sent_packet{frames = Fs} <- Acked, {stream, Sid, _, _, _} <- Fs, Parked(Sid)
+        ] ++ [Sid || Fs <- LateAcked, {stream, Sid, _, _, _} <- Fs, Parked(Sid)]
+    ),
+    complete_fin_reclaims(Touched, complete_send_reset_at(Touched, State)).
+
 %% Drain pending local reset-at streams whose data below ReliableSize is now
 %% fully acked (no longer queued or in flight), completing the reclaim.
-complete_send_reset_at(#state{pending_send_reset_at = P} = State) when map_size(P) =:= 0 ->
-    State;
 complete_send_reset_at(#state{pending_send_reset_at = P} = State) ->
-    maps:fold(
-        fun(StreamId, RS, Acc) ->
-            Pending =
-                stream_has_queued_below(StreamId, RS, Acc) orelse
-                    quic_loss:stream_has_unacked_below(Acc#state.loss_state, StreamId, RS),
-            case Pending of
-                true ->
-                    Acc;
-                false ->
-                    mark_send_done_and_reclaim(
-                        StreamId,
-                        Acc#state{
-                            pending_send_reset_at =
-                                maps:remove(StreamId, Acc#state.pending_send_reset_at)
-                        }
-                    )
+    complete_send_reset_at(maps:keys(P), State).
+
+complete_send_reset_at(StreamIds, State) ->
+    lists:foldl(
+        fun(StreamId, Acc) ->
+            case Acc#state.pending_send_reset_at of
+                #{StreamId := RS} -> finish_unless_pending(StreamId, RS, Acc);
+                _ -> Acc
             end
         end,
         State,
-        P
+        StreamIds
     ).
+
+finish_unless_pending(StreamId, Limit, State) ->
+    case send_pending(StreamId, Limit, State) of
+        true -> State;
+        false -> mark_send_done_and_reclaim(StreamId, State)
+    end.
 
 %% Handle PTO timeout - send probe packet
 %% The drain-path counterpart of do_send_data's inline FIN bookkeeping.
@@ -14432,12 +14461,7 @@ settle_fin_ack(StreamId, State) ->
         {ok, #stream_state{send_done = true}} ->
             State;
         {ok, #stream_state{send_offset = Final}} ->
-            Pending =
-                stream_has_queued_below(StreamId, Final, State) orelse
-                    quic_loss:stream_has_unacked_below(
-                        State#state.loss_state, StreamId, Final
-                    ),
-            case Pending of
+            case send_pending(StreamId, Final, State) of
                 false ->
                     mark_send_done_and_reclaim(StreamId, State);
                 true ->
@@ -14451,31 +14475,19 @@ settle_fin_ack(StreamId, State) ->
     end.
 
 %% Finish parked FIN reclaims whose remaining bytes are now acked.
-complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) when map_size(P) =:= 0 ->
-    State;
 complete_fin_reclaims(#state{pending_fin_reclaim = P} = State) ->
-    maps:fold(
-        fun(StreamId, Final, Acc) ->
-            Pending =
-                stream_has_queued_below(StreamId, Final, Acc) orelse
-                    quic_loss:stream_has_unacked_below(
-                        Acc#state.loss_state, StreamId, Final
-                    ),
-            case Pending of
-                true ->
-                    Acc;
-                false ->
-                    mark_send_done_and_reclaim(
-                        StreamId,
-                        Acc#state{
-                            pending_fin_reclaim =
-                                maps:remove(StreamId, Acc#state.pending_fin_reclaim)
-                        }
-                    )
+    complete_fin_reclaims(maps:keys(P), State).
+
+complete_fin_reclaims(StreamIds, State) ->
+    lists:foldl(
+        fun(StreamId, Acc) ->
+            case Acc#state.pending_fin_reclaim of
+                #{StreamId := Final} -> finish_unless_pending(StreamId, Final, Acc);
+                _ -> Acc
             end
         end,
         State,
-        P
+        StreamIds
     ).
 
 %% The deadline was a time threshold, not a probe: those packets are
@@ -14537,7 +14549,9 @@ handle_pto_timeout(#state{loss_state = LossState, pto_space = Space} = State) ->
         State1a#state{hs = (State1a#state.hs)#hs{hs_probe = true}}
     ),
     State2 = Probing#state{hs = (Probing#state.hs)#hs{hs_probe = false}},
-    State2b = complete_send_reset_at(State2),
+    %% Every parked stream, not only those an ACK names: a probe timeout
+    %% is rare, and this finishes one no ACK will name again.
+    State2b = complete_fin_reclaims(complete_send_reset_at(State2)),
 
     %% Flush immediately - probe packets and timers must not be batched
     State3 = flush_event(State2b, event),
