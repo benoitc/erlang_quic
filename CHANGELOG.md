@@ -57,6 +57,13 @@ All notable changes to this project will be documented in this file.
   passed (RFC 9001 Section 6.5). The update forced by the AEAD
   confidentiality limit does not wait, as that limit is mandatory
   (Section 6.6).
+- An HTTP/3 client closed the whole connection with
+  H3_QPACK_DECOMPRESSION_FAILED when a pushed response, its trailers
+  or a PUSH_PROMISE arrived before the QPACK encoder instructions it
+  refers to. They now wait for the instructions, as response HEADERS
+  on a request stream already did, within
+  `SETTINGS_QPACK_BLOCKED_STREAMS` and `max_buffered_body` (RFC 9204
+  Section 2.1.2).
 
 ## [3.1.3] - 2026-11-18
 

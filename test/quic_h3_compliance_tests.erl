@@ -5387,3 +5387,139 @@ recorded_casts(Recorder) ->
         {casts, Recorder, Casts} -> Casts
     after 1000 -> timeout
     end.
+
+%%====================================================================
+%% Blocked field sections on push streams and PUSH_PROMISE (RFC 9204 §2.1.2)
+%%====================================================================
+
+%% Pushed response HEADERS wait for the encoder stream like a request's.
+blocked_push_headers_wait_test() ->
+    State0 = push_blocking_state(#{}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        11, <<1, 5, (blocked_response(1))/binary>>, true, State0
+    ),
+    ?assertMatch([{push_stream, 5, 0, _}], owner_events()),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State1),
+    ?assertMatch(
+        [
+            {push_response, 5, 200, [{<<":status">>, <<"200">>}, {<<"x-a">>, <<"v">>}]},
+            {
+                push_complete, 5
+            }
+        ],
+        owner_events()
+    ).
+
+%% What follows them is kept, with the FIN, whichever delivery brings it.
+content_behind_blocked_push_headers_waits_test() ->
+    State0 = push_blocking_state(#{}),
+    First = <<1, 5, (blocked_response(1))/binary, (quic_h3_frame:encode_data(<<"abc">>))/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(11, First, false, State0),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        11, quic_h3_frame:encode_data(<<"de">>), true, State1
+    ),
+    ?assertMatch([{push_stream, 5, 0, _}], owner_events()),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State2),
+    ?assertMatch(
+        [
+            {push_response, 5, 200, _},
+            {push_data, 5, <<"abc">>, false},
+            {push_data, 5, <<"de">>, true},
+            {push_complete, 5}
+        ],
+        owner_events()
+    ).
+
+blocked_push_trailers_wait_test() ->
+    State0 = push_blocking_state(#{}),
+    Response = quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])),
+    Trailers = quic_h3_frame:encode_headers(<<2, 0, 16#80>>),
+    Push =
+        <<1, 5, Response/binary, (quic_h3_frame:encode_data(<<"abc">>))/binary, Trailers/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(11, Push, true, State0),
+    ?assertMatch(
+        [{push_stream, 5, 0, _}, {push_response, 5, 200, _}, {push_data, 5, <<"abc">>, false}],
+        owner_events()
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State1),
+    ?assertEqual(
+        [{push_trailers, 5, [{<<"x-a">>, <<"v">>}]}, {push_complete, 5}], owner_events()
+    ).
+
+%% A blocked PUSH_PROMISE holds its request stream, response included.
+blocked_push_promise_waits_test() ->
+    Request = #h3_stream{id = 0, type = request, state = half_closed_local, method = <<"GET">>},
+    State0 = push_blocking_state(#{promised_pushes => #{}, streams => #{0 => Request}}),
+    Promise = quic_h3_frame:encode_push_promise(5, blocked_section(1)),
+    Response = quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        0, <<Promise/binary, Response/binary>>, true, State0
+    ),
+    ?assertEqual([], owner_events()),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State1),
+    ?assertMatch(
+        [{push_promise, 5, 0, _}, {response, 0, 200, _} | _], owner_events()
+    ).
+
+%% One more blocked stream than SETTINGS_QPACK_BLOCKED_STREAMS allows is
+%% still a connection error.
+blocked_push_over_the_limit_closes_test() ->
+    State0 = push_blocking_state(#{local_max_blocked_streams => 0}),
+    ?assertMatch(
+        {error, {connection_error, ?H3_QPACK_DECOMPRESSION_FAILED, _}, _},
+        quic_h3_connection:handle_stream_data(
+            11, <<1, 5, (blocked_response(1))/binary>>, true, State0
+        )
+    ).
+
+%% What is kept behind a blocked push counts against max_buffered_body;
+%% over it only that push is given up.
+content_behind_blocked_push_headers_is_bounded_test() ->
+    State0 = push_blocking_state(#{max_buffered_body => 4, local_control_stream => 2}),
+    Push = <<1, 5, (blocked_response(1))/binary, (quic_h3_frame:encode_data(<<"abcdef">>))/binary>>,
+    {ok, State1} = quic_h3_connection:handle_stream_data(11, Push, false, State0),
+    ?assertMatch([{push_stream, 5, 0, _}, {push_cancelled, 5}], owner_events()),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State1),
+    ?assertEqual([], owner_events()).
+
+%% A push the server withdraws while blocked is not resumed.
+a_cancelled_push_is_no_longer_blocked_test() ->
+    State0 = push_blocking_state(#{peer_control_stream => 3}),
+    {ok, State1} = quic_h3_connection:handle_stream_data(
+        11, <<1, 5, (blocked_response(1))/binary>>, true, State0
+    ),
+    {ok, State2} = quic_h3_connection:handle_stream_data(
+        3, quic_h3_frame:encode_cancel_push(5), false, State1
+    ),
+    ?assertMatch([{push_stream, 5, 0, _}, {push_cancelled, 5}], owner_events()),
+    {ok, _} = quic_h3_connection:handle_stream_data(7, insert_literal(<<"x-a">>), false, State2),
+    ?assertEqual([], owner_events()).
+
+%% A client whose decoder has a dynamic table, the server's encoder stream
+%% on stream 7 and push 5 promised on request 0.
+push_blocking_state(Overrides) ->
+    flush_mailbox(),
+    make_test_state(
+        maps:merge(
+            #{
+                role => client,
+                quic_conn => fake_quic_conn(),
+                local_decoder_stream => 10,
+                peer_encoder_stream => 7,
+                settings_received => true,
+                local_max_push_id => 10,
+                local_max_blocked_streams => 2,
+                promised_pushes => #{5 => {0, [{<<":method">>, <<"GET">>}]}},
+                qpack_decoder => quic_qpack:new(#{max_dynamic_size => 4096})
+            },
+            Overrides
+        )
+    ).
+
+%% A 200 whose second field line is the newest of RIC dynamic entries.
+blocked_response(RIC) ->
+    quic_h3_frame:encode_headers(<<(RIC + 1), 0, 16#D9, 16#80>>).
+
+%% The field section of blocked_request/1, without its frame.
+blocked_section(RIC) ->
+    <<(RIC + 1), 0, 16#D1, 16#D7, 16#C1, 16#50, 1, $a, 16#80>>.
