@@ -148,6 +148,7 @@ Last checked: 2026-11-17.
 | RFC 9204 QPACK | field compression, encoder and decoder streams | `quic_qpack` |
 | RFC 9110 HTTP semantics | fields, status, Content-Length, trailers | `quic_h3_connection` |
 | RFC 9297 HTTP datagrams and capsules | `h3_datagram_enabled`, capsules | `quic_h3_connection`, `quic_h3_capsule` |
+| RFC 8470 early data in HTTP | which requests a client sends as 0-RTT | `quic_h3_connection` |
 | RFC 9218 extensible priorities | PRIORITY_UPDATE, `priority` field | `quic_h3_connection` |
 | RFC 9220 extended CONNECT over HTTP/3 | `enable_connect_protocol`, `:protocol` | `quic_h3_connection` |
 | draft-ietf-webtrans-http3-17 | the primitives WebTransport needs: SETTINGS_WT_ENABLED, WT_STREAM, claimed streams | `quic_h3_connection` |

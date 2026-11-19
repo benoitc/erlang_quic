@@ -508,6 +508,11 @@ request(Conn, Headers) ->
 %%   <li>`flow_control' - `auto' (default) or `manual'. With `manual' the
 %%       response body waits for {@link consume/3}: the server can send at
 %%       most one stream window past what the caller consumed.</li>
+%%   <li>`early_data' - On a resumed connection, a request made before
+%%       the handshake completes is sent as 0-RTT when its method is
+%%       GET, HEAD, OPTIONS or TRACE. Any other method waits for the
+%%       handshake, since 0-RTT data can be replayed (RFC 8470 Section
+%%       4). `true' sends it as 0-RTT anyway (default `false').</li>
 %% </ul>
 %% @end
 -spec request(conn(), headers(), map()) -> {ok, stream_id()} | {error, term()}.

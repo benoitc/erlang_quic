@@ -772,12 +772,39 @@ bootstrapping({call, From}, Call, State) when ?STREAM_CALL(Call) ->
 bootstrapping(_EventType, _Event, _State) ->
     keep_state_and_data.
 
+%% RFC 9110 Section 9.2.1 names the safe methods. Any other, or one we
+%% do not know, is sent as 0-RTT only when the caller says so.
+early_data_allowed(_Headers, #{early_data := true}) ->
+    true;
+early_data_allowed(Headers, _Opts) ->
+    case lists:keyfind(<<":method">>, 1, Headers) of
+        {_, Method} ->
+            lists:member(Method, [<<"GET">>, <<"HEAD">>, <<"OPTIONS">>, <<"TRACE">>]);
+        false ->
+            %% Malformed: let send_request refuse it now.
+            true
+    end.
+
+early_request(From, Headers, Opts, State) ->
+    case send_request(Headers, Opts, State) of
+        {ok, StreamId, State1} ->
+            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
+        {error, stream_limit} ->
+            {keep_state, want_streams(request, State), [{reply, From, {error, stream_limit}}]};
+        {error, Reason} ->
+            {keep_state_and_data, [{reply, From, {error, Reason}}]};
+        {error, Reason, State1} ->
+            {keep_state, State1, [{reply, From, {error, Reason}}]}
+    end.
+
 %%====================================================================
 %% State: early_data
 %% Open critical H3 streams and send SETTINGS as 0-RTT data. Accept
 %% request calls and forward HEADERS as 0-RTT. Converge to connected
 %% when both QUIC has handshaked AND peer SETTINGS has arrived.
 %% RFC 9114 §6.2.1 (SETTINGS-first), §7.2.4.2 (0-RTT initialization).
+%% RFC 8470 Section 4: a request that is not safe to replay waits for
+%% the handshake unless the caller asked for early data.
 %%====================================================================
 
 early_data(enter, _OldState, State) ->
@@ -791,15 +818,9 @@ early_data(enter, _OldState, State) ->
             {stop, {error, Reason}}
     end;
 early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
-    case send_request(Headers, Opts, State) of
-        {ok, StreamId, State1} ->
-            {keep_state, State1, [{reply, From, {ok, StreamId}}]};
-        {error, stream_limit} ->
-            {keep_state, want_streams(request, State), [{reply, From, {error, stream_limit}}]};
-        {error, Reason} ->
-            {keep_state_and_data, [{reply, From, {error, Reason}}]};
-        {error, Reason, State1} ->
-            {keep_state, State1, [{reply, From, {error, Reason}}]}
+    case early_data_allowed(Headers, Opts) of
+        true -> early_request(From, Headers, Opts, State);
+        false -> {keep_state_and_data, [postpone]}
     end;
 early_data({call, From}, {request, _Headers, _Opts}, #state{role = server}) ->
     {keep_state_and_data, [{reply, From, {error, server_cannot_request}}]};
@@ -1036,6 +1057,10 @@ h3_connecting(
     #state{quic_conn = QuicConn} = State
 ) ->
     {keep_state, handle_peer_stop_sending(StreamId, ErrorCode, State)};
+h3_connecting({call, _From}, {request, _Headers, _Opts}, #state{has_early_keys = true}) ->
+    %% Came from early_data with the handshake done and the peer's
+    %% SETTINGS still to come: a request held there stays held.
+    {keep_state_and_data, [postpone]};
 h3_connecting({call, From}, {request, _Headers, _Opts}, _State) ->
     %% Can't send requests until connected
     {keep_state_and_data, [{reply, From, {error, not_connected}}]};

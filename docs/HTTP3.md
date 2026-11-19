@@ -91,6 +91,14 @@ Headers = [
 |--------|------|---------|-------------|
 | `end_stream` | boolean | `true` | Close the request side after the headers |
 | `flow_control` | `auto \| manual` | `auto` | `manual` holds the response body until you call `consume/3`; see [Receive backpressure](#receive-backpressure) |
+| `early_data` | boolean | `false` | `true` sends the request as 0-RTT whatever its method; see below |
+
+On a resumed connection a request made before the handshake completes
+goes out as 0-RTT data, which an attacker can replay. GET, HEAD, OPTIONS
+and TRACE are sent that way. Any other method waits: `request/3` returns
+once the handshake has completed and the request is sent then (RFC 8470
+Section 4). Pass `early_data => true` only for a request the server can
+safely receive twice.
 
 #### wait_connected/2
 
