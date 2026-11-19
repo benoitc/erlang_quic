@@ -281,8 +281,10 @@ lookup_issued(Tab, Identity) ->
 take_issued(Tab, Identity) ->
     unexpired(Identity, ets:take(Tab, Identity), Tab).
 
-unexpired(Identity, [{_, Ticket, StoredAt}], Tab) ->
-    case erlang:monotonic_time(millisecond) - StoredAt > ?TICKET_TTL_MS of
+%% A ticket is good for the lifetime the client was told, and no longer
+%% than the table keeps one.
+unexpired(Identity, [{_, #session_ticket{lifetime = Lifetime} = Ticket, StoredAt}], Tab) ->
+    case erlang:monotonic_time(millisecond) - StoredAt > min(Lifetime * 1000, ?TICKET_TTL_MS) of
         true ->
             ets:delete(Tab, Identity),
             error;

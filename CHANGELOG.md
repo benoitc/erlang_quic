@@ -2,6 +2,55 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- `pmtu_search_complete` is logged at info level when a PMTU search
+  ends at a new value, and at debug level when it ends where it began.
+  Every connection searches again each `pmtu_raise_interval` (10
+  minutes) for as long as the path is below `pmtu_max_mtu`, which on
+  an ordinary Ethernet path is always, and logged the same line each
+  time.
+
+### Fixed
+- With the optional crypto NIF loaded, a server kept its 0-RTT keys
+  for the life of the connection instead of dropping them three probe
+  timeouts after the first 1-RTT packet (RFC 9001 Section 4.9.3).
+- After a Retry a client sent a new ClientHello, with a new random and
+  key share, instead of the one from its first Initial (RFC 9000
+  Section 17.2.5.3). A server may drop such an Initial or close the
+  connection.
+- 0-RTT data a client wrote between the server accepting it and the
+  end of the handshake was not counted against the connection's
+  flow-control limit, so the client could send more than the server
+  allowed and have the connection closed with FLOW_CONTROL_ERROR
+  (RFC 9000 Section 4.1).
+- A client that offered 0-RTT and received a TLS HelloRetryRequest kept
+  sending 0-RTT data until EncryptedExtensions arrived, although the
+  server had already rejected it. The client now treats the
+  HelloRetryRequest as the rejection (RFC 9001 Section 4.6.2).
+- A MAX_STREAM_DATA frame that arrived before the first data of a
+  stream the peer opened was dropped, and the credit with it, so a
+  later write on that stream could stall. The frame now opens the
+  stream, as the other stream frames do (RFC 9000 Section 3.2).
+- A pushed response that ended on its HEADERS frame was reported
+  complete even when its `content-length` promised content. It is now
+  refused as malformed, like one that ends short after DATA (RFC 9114
+  Section 4.1.2).
+- A `content-length` the application put on a 2xx response to CONNECT
+  was sent. A server must not send one there, so it is now left out,
+  as it already is on 1xx and 204 responses (RFC 9110 Section 8.6).
+- A server accepted a session ticket for seven days, whatever lifetime
+  it had advertised for it (24 hours). It now stops accepting the
+  ticket when that lifetime ends.
+- On a host where the kernel accepts the UDP GSO socket option but
+  refuses the segmented sends (Linux answers EIO when the outgoing
+  device cannot checksum for GSO, as with tx checksum offload off),
+  every batch of two or more packets was dropped with a
+  `gso_run_send_error` warning and the connection ran on
+  retransmissions. The batch now goes out packet by packet and the
+  socket stops using GSO.
+
 ## [3.1.3] - 2026-11-18
 
 ### Fixed

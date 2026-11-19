@@ -391,14 +391,8 @@ on_probe_acked(
     },
 
     case search_done(State1) of
-        true ->
-            ?LOG_INFO(
-                #{what => pmtu_search_complete, final_mtu => ProbeSize},
-                ?QUIC_LOG_META
-            ),
-            State1#pmtu_state{state = search_complete};
-        false ->
-            State1
+        true -> search_complete(ProbeSize, State1);
+        false -> State1
     end;
 on_probe_acked(PacketNumber, Gen, #pmtu_state{generation = CurrentGen} = PMTUState) when
     Gen =/= CurrentGen
@@ -460,14 +454,8 @@ on_probe_lost(
     },
 
     case search_done(State1) of
-        true ->
-            ?LOG_INFO(
-                #{what => pmtu_search_complete, final_mtu => Min},
-                ?QUIC_LOG_META
-            ),
-            State1#pmtu_state{state = search_complete, current_mtu = Min};
-        false ->
-            State1
+        true -> search_complete(Min, State1#pmtu_state{current_mtu = Min});
+        false -> State1
     end;
 on_probe_lost(PacketNumber, Gen, #pmtu_state{generation = CurrentGen} = PMTUState) when
     Gen =/= CurrentGen
@@ -682,6 +670,18 @@ set_raise_timer(TimerRef, State) ->
 %%====================================================================
 %% Internal Functions
 %%====================================================================
+
+%% @private A search ended at MTU. The raise timer starts one every
+%% pmtu_raise_interval for as long as the path stays below max_mtu, and
+%% on a path that has not changed each ends where it began: that is
+%% logged at debug level, a new value at info level.
+-spec search_complete(pos_integer(), #pmtu_state{}) -> #pmtu_state{}.
+search_complete(MTU, #pmtu_state{logged_mtu = MTU} = State) ->
+    ?LOG_DEBUG(#{what => pmtu_search_complete, final_mtu => MTU}, ?QUIC_LOG_META),
+    State#pmtu_state{state = search_complete};
+search_complete(MTU, State) ->
+    ?LOG_INFO(#{what => pmtu_search_complete, final_mtu => MTU}, ?QUIC_LOG_META),
+    State#pmtu_state{state = search_complete, logged_mtu = MTU}.
 
 %% @private Get effective max from loss array (first defined value).
 %% The loss array is sorted ascending, so the first defined value is the smallest loss.

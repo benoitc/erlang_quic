@@ -28,6 +28,8 @@
 %% Test cases
 -export([
     extended_connect_tunnel_echo/1,
+    connect_2xx_has_no_content_length/1,
+    connect_refusal_keeps_content_length/1,
     head_response_empty_body/1,
     empty_body_response/1,
     headers_then_trailers_no_body/1
@@ -42,6 +44,8 @@ suite() ->
 all() ->
     [
         extended_connect_tunnel_echo,
+        connect_2xx_has_no_content_length,
+        connect_refusal_keeps_content_length,
         head_response_empty_body,
         empty_body_response,
         headers_then_trailers_no_body
@@ -102,6 +106,18 @@ extended_connect_tunnel_echo(Config) ->
 
     quic_h3:close(Conn).
 
+%% RFC 9110 Section 8.6: no Content-Length in a 2xx response to CONNECT,
+%% also when the application supplied one.
+connect_2xx_has_no_content_length(Config) ->
+    {200, Headers} = connect_response(Config, <<"/with-length">>),
+    ?assertEqual(false, lists:keymember(<<"content-length">>, 1, Headers)),
+    ?assertEqual({<<"server">>, <<"t">>}, lists:keyfind(<<"server">>, 1, Headers)).
+
+%% A CONNECT that is refused is an ordinary response and keeps its length.
+connect_refusal_keeps_content_length(Config) ->
+    {403, Headers} = connect_response(Config, <<"/refused">>),
+    ?assertEqual({<<"content-length">>, <<"0">>}, lists:keyfind(<<"content-length">>, 1, Headers)).
+
 %% HEAD response: headers, no body. The handler ends the stream with a
 %% fin-only send_data, which must flush the buffered HEADERS.
 head_response_empty_body(Config) ->
@@ -141,6 +157,13 @@ headers_then_trailers_no_body(Config) ->
 %% Server request handler
 %%====================================================================
 
+handle(Conn, StreamId, <<"CONNECT">>, <<"/with-length">>, _Headers) ->
+    quic_h3:send_response(Conn, StreamId, 200, [
+        {<<"content-length">>, <<"5">>}, {<<"server">>, <<"t">>}
+    ]);
+handle(Conn, StreamId, <<"CONNECT">>, <<"/refused">>, _Headers) ->
+    ok = quic_h3:send_response(Conn, StreamId, 403, [{<<"content-length">>, <<"0">>}]),
+    quic_h3:send_data(Conn, StreamId, <<>>, true);
 handle(Conn, StreamId, <<"CONNECT">>, _Path, _Headers) ->
     %% Register for tunnel DATA, handling both set_stream_handler shapes.
     Buffered =
@@ -203,6 +226,35 @@ do_request(Config, Headers0) ->
     Headers = Headers0 ++ [{<<":authority">>, list_to_binary(Host)}],
     {ok, StreamId} = quic_h3:request(Conn, Headers),
     Result = receive_response(Conn, StreamId, 10000, undefined, [], <<>>),
+    quic_h3:close(Conn),
+    Result.
+
+connect_response(Config, Path) ->
+    Host = ?config(h3_host, Config),
+    Port = ?config(h3_port, Config),
+    {ok, Conn} = quic_h3:connect(Host, Port, #{
+        verify => false,
+        sync => true,
+        settings => #{enable_connect_protocol => 1}
+    }),
+    {ok, StreamId} = quic_h3:request(
+        Conn,
+        [
+            {<<":method">>, <<"CONNECT">>},
+            {<<":protocol">>, <<"webtransport">>},
+            {<<":scheme">>, <<"https">>},
+            {<<":authority">>, list_to_binary(Host)},
+            {<<":path">>, Path}
+        ],
+        #{end_stream => false}
+    ),
+    Result =
+        receive
+            {quic_h3, Conn, {response, StreamId, Status, Headers}} -> {Status, Headers};
+            {quic_h3, Conn, {headers, StreamId, Status, Headers}} -> {Status, Headers}
+        after 10000 ->
+            ct:fail({connect_response_timeout, StreamId})
+        end,
     quic_h3:close(Conn),
     Result.
 

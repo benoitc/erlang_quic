@@ -2891,7 +2891,10 @@ send_client_hello(State) ->
                 end
         }
     },
-    NewState = send_initial_crypto(ClientHello, 0, with_remembered_params(SessionTicket, State0)),
+    send_client_hello_flight(ClientHello, with_remembered_params(SessionTicket, State0)).
+
+send_client_hello_flight(ClientHello, State) ->
+    NewState = send_initial_crypto(ClientHello, 0, State),
 
     %% Event-driven flush: flush batch and timers after sending ClientHello
     %% Critical for handshake - must send immediately
@@ -3553,6 +3556,14 @@ discard_initial(State) ->
         undefined -> ok
     end,
     State1#state{hs = (State1#state.hs)#hs{initial_keys = undefined, initial_keys_alt = undefined}}.
+
+%% Accepted 0-RTT data counts toward connection-level flow control
+%% (RFC 9000 Section 4.1). The 0-RTT send path counts it in
+%% `early_data_sent' only, so it moves to `data_sent' when the last of
+%% it has been written: at the 1-RTT key install. Zero when none was
+%% sent or the server rejected it.
+count_early_data(#state{data_sent = DataSent, hs = #hs{early_data_sent = Early} = Hs} = State) ->
+    State#state{data_sent = DataSent + Early, hs = Hs#hs{early_data_sent = 0}}.
 
 %% RFC 9001 Section 4.9.3: a client discards its 0-RTT keys as soon as
 %% it installs 1-RTT keys, as they have no use from that moment (0-RTT
@@ -5021,7 +5032,7 @@ handle_short_run(Packets, Keys, State) ->
         )
     of
         {ok, Results} ->
-            State1 = fold_opened(Results, State),
+            State1 = opened_run(Results, State),
             case lists:nthtail(length(Results), Run) of
                 [] ->
                     do_handle_packets_batch(Tail, State1);
@@ -5036,6 +5047,11 @@ handle_short_run(Packets, Keys, State) ->
             [Packet | Rest] = Packets,
             do_handle_packets_batch(Rest, handle_packet_loop(Packet, State))
     end.
+
+opened_run([], State) ->
+    State;
+opened_run(Results, State) ->
+    server_schedule_0rtt_discard(app, fold_opened(Results, State)).
 
 take_short_run([<<0:1, 1:1, _:6, _/binary>> = P | Rest], Acc) ->
     take_short_run(Rest, [P | Acc]);
@@ -6165,20 +6181,21 @@ handle_valid_retry(RetryToken, ServerSCID, State) ->
     {ClientKeys, ServerKeys} = derive_initial_keys(ServerSCID, State1#state.version),
     State2 = State1#state{hs = (State1#state.hs)#hs{initial_keys = {ClientKeys, ServerKeys}}},
 
-    %% Reset crypto state for a fresh Initial
+    %% The Initial flight starts over at offset 0 with the same
+    %% ClientHello (RFC 9000 Section 17.2.5.3), which is all the
+    %% transcript holds before a server Initial.
+    ClientHello = (State2#state.hs)#hs.tls_transcript,
     State3 = State2#state{
         hs = (State2#state.hs)#hs{
-            crypto_offset = #{initial => 0, handshake => 0, app => 0},
-            tls_transcript = <<>>
+            crypto_offset = #{initial => 0, handshake => 0, app => 0}
         }
     },
 
     %% Reset packet number space for Initial
     {State4, EarlyData} = reset_initial_pn_space(State3),
 
-    %% Resend the ClientHello using send_client_hello
-    %% (the retry_token field is now set, so send_initial_packet will use it)
-    State5 = replay_early_data(EarlyData, send_client_hello(State4)),
+    %% The retry_token field is now set, so send_initial_packet will use it
+    State5 = replay_early_data(EarlyData, send_client_hello_flight(ClientHello, State4)),
 
     %% Return state with retry info, no frames to process
     {ok, retry_handled, [], <<>>, State5}.
@@ -6966,7 +6983,12 @@ process_frame(Level, {max_data, _}, State) when Level =/= app ->
     );
 %% MAX_STREAM_DATA: Peer is increasing stream-level flow control limit
 %% RFC 9000 Section 19.10: MAX_STREAM_DATA is only allowed in 1-RTT packets
-process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Streams} = State) ->
+%% Receipt opens the stream (Section 3.2).
+process_frame(
+    app,
+    {max_stream_data, StreamId, MaxData},
+    #state{owner = Owner, streams = Streams} = State
+) ->
     case maps:find(StreamId, Streams) of
         {ok, #stream_state{send_max_data = Current} = Stream} ->
             ?LOG_DEBUG(
@@ -6994,15 +7016,27 @@ process_frame(app, {max_stream_data, StreamId, MaxData}, #state{streams = Stream
                     State
             end;
         error ->
-            ?LOG_DEBUG(
-                #{
-                    what => received_max_stream_data_unknown_stream,
-                    stream_id => StreamId,
-                    new_limit => MaxData
-                },
-                ?QUIC_LOG_META
-            ),
-            State
+            case is_reclaimed_frame(StreamId, State) of
+                true ->
+                    %% Late MAX_STREAM_DATA for an already-reclaimed stream; ignore.
+                    State;
+                false ->
+                    case exceeds_stream_limit(StreamId, State) of
+                        true ->
+                            stream_limit_close(State);
+                        false ->
+                            Owner ! {quic, self(), {stream_opened, StreamId}},
+                            #stream_state{send_max_data = Initial} =
+                                NewStream = new_peer_stream(StreamId, State),
+                            State#state{
+                                streams = maps:put(
+                                    StreamId,
+                                    NewStream#stream_state{send_max_data = max(Initial, MaxData)},
+                                    Streams
+                                )
+                            }
+                    end
+            end
     end;
 process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets
@@ -8432,7 +8466,7 @@ process_tls_message(
                     %% Combine Certificate(+CertificateVerify) and Finished into one payload
                     HandshakePayload = <<CertPayload/binary, ClientFinishedMsg/binary>>,
 
-                    State1 = discard_early_keys(State#state{
+                    State0 = count_early_data(State#state{
                         app_keys = {ClientAppKeys, ServerAppKeys},
                         key_state = KeyState,
                         hs = (State#state.hs)#hs{
@@ -8442,6 +8476,7 @@ process_tls_message(
                             master_secret = MasterSecret
                         }
                     }),
+                    State1 = discard_early_keys(State0),
 
                     %% Send client Certificate(+CertificateVerify)+Finished,
                     %% segmented so no datagram exceeds max_udp_payload_size.
@@ -9332,9 +9367,16 @@ handle_hello_retry_request(
             {CH2, PrivKey, _Random} = quic_tls:build_client_hello(Ch2Opts),
             Transcript = <<BaseTranscript/binary, CH2/binary>>,
 
-            Off = (State#state.hs)#hs.initial_tx_off,
-            State1 = State#state{
-                hs = (State#state.hs)#hs{
+            %% RFC 9001 Section 4.6.2: a server that sends a
+            %% HelloRetryRequest always rejects 0-RTT.
+            Rejected =
+                case (State#state.hs)#hs.early_keys of
+                    undefined -> State;
+                    _ -> reject_zero_rtt(State)
+                end,
+            Off = (Rejected#state.hs)#hs.initial_tx_off,
+            State1 = Rejected#state{
+                hs = (Rejected#state.hs)#hs{
                     hrr_sent = true,
                     hrr_group = SelGroup,
                     hrr_cipher = Cipher,
@@ -12005,23 +12047,21 @@ reset_zero_rtt_streams(RejectedIds, #state{streams = Streams, owner = Owner} = S
         }
     }.
 
-%% Branch on early_data_accepted at handshake completion. When 0-RTT was
+%% Branch on early_data_accepted at EncryptedExtensions. When 0-RTT was
 %% rejected, reset stream state for every stream that carried 0-RTT data
-%% (RFC 9001 §4.6.2). When accepted, the server received the 0-RTT data,
-%% so it counts toward connection-level flow control: fold the
-%% separately-tracked `early_data_sent' into `data_sent' (RFC 9000 §4.1).
-%% The 0-RTT send path only accumulates `early_data_sent' and never
-%% touches `data_sent', so without this fold the connection counter would
-%% under-count accepted early data and could later overshoot max_data.
+%% (RFC 9001 §4.6.2). When accepted, 0-RTT sending goes on until the
+%% 1-RTT keys are installed, and count_early_data/1 settles the
+%% connection-level count there.
 -spec finalize_zero_rtt_state(#state{}) -> #state{}.
 finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = true}} = State) ->
-    #state{data_sent = DataSent, hs = #hs{early_data_sent = EarlyDataSent}} = State,
-    State#state{
-        data_sent = DataSent + EarlyDataSent, hs = (State#state.hs)#hs{early_data_sent = 0}
-    };
-finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State0) ->
-    %% The server rejected 0-RTT: the early keys have no further use,
-    %% and nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2).
+    State;
+finalize_zero_rtt_state(#state{hs = #hs{early_data_accepted = false}} = State) ->
+    reject_zero_rtt(State).
+
+%% The server rejected 0-RTT: the early keys have no further use, and
+%% nothing more may go out as 0-RTT (RFC 9001 Section 4.6.2). A no-op
+%% when none was offered or the rejection was already handled.
+reject_zero_rtt(State0) ->
     State = discard_early_keys(discard_zero_rtt_packets(State0)),
     case sets:to_list((State#state.hs)#hs.zero_rtt_stream_ids) of
         [] -> State;

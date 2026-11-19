@@ -1130,10 +1130,19 @@ flush_gso_runs(
     case send_runs(Socket, Dest, Runs) of
         ok ->
             {ok, record_run_flush(State, Runs)};
+        {gso_refused, Reason} ->
+            {ok, gso_refused(Reason, record_flush(State))};
         {error, Reason} ->
             ?LOG_WARNING(#{what => gso_run_send_error, reason => Reason}),
             {error, Reason, clear_batch(State)}
     end.
+
+%% The kernel took the socket option but refuses the segmented sends,
+%% as it does with EIO when the route's device cannot checksum for GSO.
+%% The batch went out packet by packet; later ones skip the attempt.
+gso_refused(Reason, State) ->
+    ?LOG_WARNING(#{what => gso_disabled, reason => Reason}),
+    State#socket_state{gso_supported = false}.
 
 %% Group an oldest-first packet list into {gso, SegmentSize, Packets}
 %% runs (>= 2 packets, all SegmentSize except possibly a shorter last)
@@ -1179,41 +1188,53 @@ chunk_list(Packets, Size) ->
     {Head, Tail} = lists:split(Size, Packets),
     [Head | chunk_list(Tail, Size)].
 
-send_runs(_Socket, _Dest, []) ->
-    ok;
-send_runs(Socket, Dest, [{single, Packet} | Rest]) ->
+%% `ok' when every run went out as given, `{gso_refused, Reason}' when
+%% the kernel refused a segmented send and its packets went out one by
+%% one instead.
+send_runs(Socket, Dest, Runs) ->
+    send_runs(Socket, Dest, Runs, ok).
+
+send_runs(_Socket, _Dest, [], Result) ->
+    Result;
+send_runs(Socket, Dest, [{single, Packet} | Rest], Result) ->
     Msg = #{addr => Dest, iov => [normalize_packet(Packet)]},
     case socket:sendmsg(Socket, Msg) of
-        ok -> send_runs(Socket, Dest, Rest);
-        {ok, _RestData} -> send_runs(Socket, Dest, Rest);
-        {error, emsgsize} -> send_runs(Socket, Dest, Rest);
+        ok -> send_runs(Socket, Dest, Rest, Result);
+        {ok, _RestData} -> send_runs(Socket, Dest, Rest, Result);
+        {error, emsgsize} -> send_runs(Socket, Dest, Rest, Result);
         {error, _} = Error -> Error
     end;
-send_runs(Socket, Dest, [{gso, SegmentSize, Packets} | Rest]) ->
+send_runs(Socket, Dest, [{gso, _SegmentSize, Packets} | Rest], {gso_refused, _} = Result) ->
+    send_segments_then_runs(Socket, Dest, [normalize_packet(P) || P <- Packets], Rest, Result);
+send_runs(Socket, Dest, [{gso, SegmentSize, Packets} | Rest], ok) ->
     PacketIov = [normalize_packet(P) || P <- Packets],
-    Msg = #{
-        addr => Dest,
-        iov => PacketIov,
-        ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
-    },
-    case socket:sendmsg(Socket, Msg) of
+    case sendmsg_segmented(Socket, Dest, SegmentSize, PacketIov) of
         ok ->
-            send_runs(Socket, Dest, Rest);
+            send_runs(Socket, Dest, Rest, ok);
         {ok, RestData} ->
             %% Kernel refused part of the segmented write: send the
             %% remainder segment-by-segment, then continue with the
             %% remaining runs (mirrors flush_gso_partial).
             Data = iolist_to_binary(RestData),
-            send_segments_then_runs(Socket, Dest, split_into_segments(Data, SegmentSize), Rest);
+            send_segments_then_runs(
+                Socket, Dest, split_into_segments(Data, SegmentSize), Rest, ok
+            );
         {error, emsgsize} ->
-            send_segments_then_runs(Socket, Dest, PacketIov, Rest);
-        {error, _} = Error ->
-            Error
+            send_segments_then_runs(Socket, Dest, PacketIov, Rest, ok);
+        {error, Reason} ->
+            send_segments_then_runs(Socket, Dest, PacketIov, Rest, {gso_refused, Reason})
     end.
 
-send_segments_then_runs(Socket, Dest, Segments, Runs) ->
+sendmsg_segmented(Socket, Dest, SegmentSize, Iov) ->
+    socket:sendmsg(Socket, #{
+        addr => Dest,
+        iov => Iov,
+        ctrl => [#{level => udp, type => ?UDP_SEGMENT, data => <<SegmentSize:16/native>>}]
+    }).
+
+send_segments_then_runs(Socket, Dest, Segments, Runs, Result) ->
     case send_run_segments(Socket, Dest, Segments) of
-        ok -> send_runs(Socket, Dest, Runs);
+        ok -> send_runs(Socket, Dest, Runs, Result);
         {error, _} = Error -> Error
     end.
 

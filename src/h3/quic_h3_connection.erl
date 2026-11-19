@@ -2643,9 +2643,18 @@ validate_and_deliver_push_response(StreamId, PushId, Headers, Fin, Owner, Receiv
             {error, {connection_error, ?H3_MESSAGE_ERROR, Reason}}
     end.
 
-deliver_push_response_finalize(StreamId, PushId, _Status, _Headers, true, Owner, _Received, State) ->
-    Owner ! {quic_h3, self(), {push_complete, PushId}},
-    cleanup_push_stream(PushId, StreamId, State);
+deliver_push_response_finalize(StreamId, PushId, Status, Headers, true, Owner, Received, State) ->
+    Stream = (push_stream_with_state(StreamId, Received, PushId, complete))#h3_stream{
+        status = Status,
+        content_length = extract_content_length(Headers)
+    },
+    case content_complete(Stream) of
+        true ->
+            Owner ! {quic_h3, self(), {push_complete, PushId}},
+            cleanup_push_stream(PushId, StreamId, State);
+        false ->
+            {error, {connection_error, ?H3_MESSAGE_ERROR, <<"push content-length violated">>}}
+    end;
 deliver_push_response_finalize(
     StreamId, PushId, Status, _Headers, false, _Owner, Received, State
 ) when
@@ -3049,11 +3058,23 @@ with_status(Status, Headers) ->
         | [KV || {Name, _} = KV <- Headers, Name =/= <<":status">>]
     ].
 
-%% RFC 9110 Section 8.6: no Content-Length in a 1xx or 204; 304 and HEAD keep theirs.
-outbound_response_headers(Status, Headers) when Status < 200; Status =:= 204 ->
-    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>];
-outbound_response_headers(_Status, Headers) ->
+%% RFC 9110 Section 8.6: no Content-Length in a 1xx or 204, nor in a 2xx
+%% to CONNECT; 304 and HEAD keep theirs.
+outbound_response_headers(Status, _Method, Headers) when Status < 200; Status =:= 204 ->
+    without_content_length(Headers);
+outbound_response_headers(Status, <<"CONNECT">>, Headers) when Status < 300 ->
+    without_content_length(Headers);
+outbound_response_headers(_Status, _Method, Headers) ->
     Headers.
+
+without_content_length(Headers) ->
+    [H || {Name, _} = H <- Headers, Name =/= <<"content-length">>].
+
+request_method(StreamId, Streams) ->
+    case Streams of
+        #{StreamId := #h3_stream{method = Method}} -> Method;
+        _ -> undefined
+    end.
 
 %% A response that never carries content, so a Content-Length on it
 %% describes what a GET would have returned rather than what is on the
@@ -4427,7 +4448,9 @@ do_send_response(
         streams = Streams
     } = State
 ) ->
-    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
+    AllHeaders = with_status(
+        Status, outbound_response_headers(Status, request_method(StreamId, Streams), Headers)
+    ),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
@@ -5288,7 +5311,8 @@ do_send_push_response(
         qpack_encoder = Encoder
     } = State
 ) ->
-    AllHeaders = with_status(Status, outbound_response_headers(Status, Headers)),
+    %% A push answers a promised request, which is never a CONNECT.
+    AllHeaders = with_status(Status, outbound_response_headers(Status, undefined, Headers)),
     %% RFC 9114 Section 4.2.2: Validate outbound headers against peer's limit
     case validate_outbound_headers(AllHeaders, State) of
         {error, Reason} ->
