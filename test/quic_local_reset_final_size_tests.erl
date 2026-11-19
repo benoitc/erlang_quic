@@ -75,8 +75,9 @@ write_sent_ahead_of_queued_data_test() ->
     ?assertEqual([1004], final_sizes(quic_connection:do_close_stream(?STREAM, 0, S))).
 
 %% 400 bytes sent, then 600 held back by a full congestion window, then
-%% Data and Fin written once the window has room: they go out at once, at
-%% offset 1000, ahead of the 600 still queued.
+%% Data and Fin sent at offset 1000, ahead of the 600 still queued. A
+%% write no longer overtakes its stream's queued data, so the frame is
+%% sent here directly, and the stream left as a write would leave it.
 sent_ahead(Data, Fin) ->
     S0 = quic_connection_test_support:state_with_send_stream(?STREAM, 400, false),
     Full = quic_cc:on_packet_sent(quic_cc:new(#{}), quic_cc:cwnd(quic_cc:new(#{}))),
@@ -84,9 +85,14 @@ sent_ahead(Data, Fin) ->
         ?STREAM, binary:copy(<<0>>, 600), false, S0#state{cc_state = Full}, force
     ),
     ?assertMatch([{400, 600}], queued_ranges(S1)),
-    {ok, S2} = quic_connection:do_send_data(
-        ?STREAM, Data, Fin, S1#state{cc_state = quic_cc:new(#{})}, force
+    End = 1000 + iolist_size(Data),
+    {S2a, _} = quic_connection:send_stream_data_fragmented_tracked(
+        ?STREAM, 1000, Data, Fin, S1#state{cc_state = quic_cc:new(#{})}
     ),
+    #state{streams = #{?STREAM := Stream} = Streams} = S2a,
+    S2 = quic_connection:count_sent(?STREAM, End, S2a#state{
+        streams = Streams#{?STREAM := Stream#stream_state{send_offset = End, send_fin = Fin}}
+    }),
     ?assertMatch([{400, 600}], queued_ranges(S2)),
     ?assert(lists:member({1000, iolist_size(Data), Fin}, sent_ranges(S2))),
     S2.

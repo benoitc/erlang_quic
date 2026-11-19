@@ -103,6 +103,54 @@ late_ack_keeps_other_copies_test() ->
     ?assertEqual({200, 2}, queue_counters(S4)).
 
 %%====================================================================
+%% Streams waiting for the rest of their data to be acknowledged
+%%====================================================================
+
+%% The FIN is acknowledged ahead of the stream's data: the stream waits.
+%% An acknowledgement that carries none of its data does not look at it
+%% again, whatever the send queue holds.
+an_ack_of_other_packets_leaves_a_waiting_stream_alone_test_() ->
+    {setup, fun() -> meck:new(quic_loss, [passthrough]) end, fun(_) -> meck:unload(quic_loss) end,
+        fun() ->
+            S1 = waiting_for_data(),
+            ?assertEqual(#{0 => 100}, S1#state.pending_fin_reclaim),
+            meck:reset(quic_loss),
+            S2 = ack(S1, [{2, 0}]),
+            ?assertEqual(0, meck:num_calls(quic_loss, stream_has_unacked_below, '_')),
+            ?assertEqual(#{0 => 100}, S2#state.pending_fin_reclaim),
+            ?assertNot(send_done(S2))
+        end}.
+
+%% The acknowledgement of its last data finishes it.
+the_ack_of_its_data_finishes_a_waiting_stream_test() ->
+    S2 = ack(waiting_for_data(), [{1, 0}]),
+    ?assertEqual(#{}, S2#state.pending_fin_reclaim),
+    ?assert(send_done(S2)).
+
+%% A stream reset while it waits is no longer waiting.
+a_reset_stream_is_no_longer_waiting_test() ->
+    {ok, S2} = quic_connection:do_close_stream(0, 7, waiting_for_data()),
+    ?assertEqual(#{}, S2#state.pending_fin_reclaim),
+    ?assertEqual(#{}, S2#state.pending_send_reset_at).
+
+%% The sweep a probe timeout runs finishes a stream no acknowledgement
+%% names any more; the per-ACK check leaves it.
+the_sweep_finishes_a_stream_no_ack_names_test() ->
+    S0 = with_fin_sent(100, in_flight(#{})),
+    S1 = S0#state{pending_fin_reclaim = #{0 => 100}},
+    S2 = ack(S1, [{2, 0}]),
+    ?assertEqual(#{0 => 100}, S2#state.pending_fin_reclaim),
+    S3 = quic_connection:complete_fin_reclaims(S2),
+    ?assertEqual(#{}, S3#state.pending_fin_reclaim),
+    ?assert(send_done(S3)).
+
+%% Stream 0's FIN-only packet (0) is acknowledged while its data (1) is
+%% still in flight.
+waiting_for_data() ->
+    Fin = {stream, 0, 100, <<>>, true},
+    ack(with_fin_sent(100, in_flight(#{0 => [Fin], 1 => [data(0, 0, 100)]})), [{0, 0}]).
+
+%%====================================================================
 %% Held control frames
 %%====================================================================
 
