@@ -179,5 +179,19 @@ section when it is written.
 
 ## Release gate status
 
-Item 1 is what this review recommends fixing before the release. The
-maintainer decides; everything else can follow it.
+The maintainer asked for the documentation to be complete before the
+release. Done on this branch, with no source change:
+
+- Item 1 of section 14: `docs/features.md`, `docs/SEND_PATH.md`,
+  `docs/h3_compliance.md`, the `AGENTS.md` dates, the MODULE_MAP number.
+- Item 2: the key lifecycle section in `docs/DESIGN.md`, with the 0-RTT
+  notes on HelloRetryRequest and Retry.
+- A "Reading quic_h3_connection" section in `docs/MODULE_MAP.md`.
+- `docs/QUIC_DIST.md` said tickets live seven days; it is 24 hours.
+- `quic_connection:key_update/1` is now in `docs/features.md` with its
+  errors, which answers question 4 unless the maintainer wants it
+  internal.
+
+Still open after this branch: the `docs/HTTP3.md` split, the shared
+HTTP/3 test state builder, the two compiler warnings, the
+`docs/QUIC_DIST.md` section map, and questions 1, 2, 3 and 5.

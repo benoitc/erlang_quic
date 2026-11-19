@@ -12,7 +12,7 @@ In this order, they give you the whole path of a connection without opening the 
 4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (401) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (17,825) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (17,911) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
@@ -77,7 +77,21 @@ The ones worth knowing:
 The two hot paths have their own walkthroughs: [SEND_PATH.md](SEND_PATH.md) and
 [RECV_PATH.md](RECV_PATH.md).
 
-`#state{}` lives in `src/quic_connection_state.hrl` and has 186 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
+## Reading quic_h3_connection
+
+`src/h3/quic_h3_connection.erl` (6,175 lines) is the second largest module and
+holds all of HTTP/3 for one connection, client and server. It also carries
+section banners:
+
+- API, then the gen_statem states: `bootstrapping`, `early_data`, `awaiting_quic`, `h3_connecting`, `connected`, and the two GOAWAY states.
+- Critical streams (control, QPACK encoder and decoder), then stream handling: request and response frames, field sections, blocked streams.
+- Push stream handling on the receiving side, then, further down, server push and client push on the sending and bookkeeping side.
+- Sending: requests, responses, trailers, DATA.
+- Per-stream handler registration and the bytes held for a handler.
+
+Its `#state{}` is defined in the module. Two test modules build it by position (`make_test_state/1` in `quic_h3_push_tests` and `quic_h3_compliance_tests`), so a new field must be added to both.
+
+`#state{}` of `quic_connection` lives in `src/quic_connection_state.hrl` and has 186 fields. When you change one, grep for the field name rather than reading the function you are in: most fields are touched in several regions.
 
 ## Where tests live
 

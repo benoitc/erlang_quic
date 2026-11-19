@@ -671,7 +671,7 @@ QUIC distribution automatically stores session tickets for fast reconnection:
 3. On reconnection, the client uses the ticket for 0-RTT handshake
 4. This significantly reduces connection latency
 
-Tickets expire after their lifetime (default 7 days) and are automatically cleaned up.
+Tickets expire after the lifetime the server advertised for them (24 hours by default) and are cleaned up automatically. The server stops accepting a ticket at the same moment.
 
 ## Troubleshooting
 

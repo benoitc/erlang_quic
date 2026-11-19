@@ -50,6 +50,9 @@ All tests live under `test/`; module names in the table are bare
 | §4.4 / RFC 9220 | Extended CONNECT missing `:scheme` → reject | `quic_h3_compliance_tests:extended_connect_missing_scheme_rejected_test` ✓ |
 | §4.4 / RFC 9220 | Extended CONNECT empty `:path` → reject | `quic_h3_compliance_tests:extended_connect_empty_path_rejected_test` ✓ |
 | §4.6 | PUSH: MAX_PUSH_ID MUST NOT decrease | `quic_h3_compliance_tests:max_push_id_decrease_error_test` ✓ |
+| §4.1.2 | A malformed pushed response is a stream error: the push is given up with `H3_MESSAGE_ERROR`, the connection and its requests go on | `quic_h3_compliance_tests:a_malformed_push_costs_only_the_push_test`, `quic_h3_push_tests:push_response_101_is_malformed_test`, `data_on_a_no_content_push_is_malformed_test` ✓ |
+| §4.1.2 | A push that ends on its HEADERS short of its Content-Length is malformed | `quic_h3_push_tests:push_ending_on_headers_short_of_content_length_test`, `push_ending_on_headers_with_nothing_missing_test_` ✓ |
+| §4.1.2 / RFC 9110 §8.6 | No Content-Length sent on a 1xx or 204, nor on a 2xx response to CONNECT; a refused CONNECT keeps its own | `quic_h3_connect_SUITE:connect_2xx_has_no_content_length`, `connect_refusal_keeps_content_length`, `quic_h3_compliance_tests:a_marked_field_is_still_filtered_test` ✓ |
 
 ### §5 Connection Management
 
@@ -112,7 +115,7 @@ All tests live under `test/`; module names in the table are bare
 | `H3_REQUEST_REJECTED` | ✓ | handler-driven reset |
 | `H3_REQUEST_CANCELLED` | ✓ | emitted by `quic_h3:cancel/2` and by the server-side CANCEL_PUSH handler (`src/h3/quic_h3_connection.erl`); code value asserted in `quic_h3_tests` |
 | `H3_REQUEST_INCOMPLETE` | ✓ | stream closed before FIN with a pending body |
-| `H3_MESSAGE_ERROR` | ✓ | pseudo-header ordering, missing/prohibited pseudo, forbidden fields |
+| `H3_MESSAGE_ERROR` | ✓ | pseudo-header ordering, missing/prohibited pseudo, forbidden fields; a malformed pushed response, on its push stream only |
 | `H3_CONNECT_ERROR` | `n/a` — CONNECT tunneling not shipped |
 | `H3_VERSION_FALLBACK` | `n/a` — alt-protocol negotiation not shipped |
 
@@ -143,6 +146,15 @@ depends on these primitives.
 | §2.1 | SETTINGS carrying `h3_datagram=0` round-trips | `quic_h3_datagram_tests:settings_decode_zero_is_disabled_test` ✓ |
 | §2.1 | `SETTINGS_H3_DATAGRAM=1` without QUIC datagram support → `H3_SETTINGS_ERROR` | `quic_h3_datagram_tests:peer_h3_datagram_without_quic_datagram_is_settings_error_test` ✓ |
 | §2.1 | Quarter-stream-id encoding (StreamId bsr 2) round-trips | `quic_h3_datagram_tests:qsid_roundtrip_test_`, `qsid_varint_sizes_test_` ✓ |
+| §2.1 | A datagram with no, a truncated or an impossible Quarter Stream ID → `H3_DATAGRAM_ERROR`; one for a valid but unknown stream is dropped | `quic_h3_datagram_error_tests` ✓ |
+
+## RFC 8470: Early Data in HTTP
+
+| Section | Requirement | Test |
+|---|---|---|
+| §4 | A client does not send an unsafe method, or one it does not know, as early data: the request waits for the handshake | `quic_h3_early_data_tests:unsafe_request_waits_for_the_handshake_test_` ✓ |
+| §4 | Safe methods (GET, HEAD, OPTIONS) are sent as early data | `quic_h3_early_data_tests:safe_requests_are_sent_early_test_` ✓ |
+| §4 | The caller can send any request as early data with `early_data => true` | `quic_h3_early_data_tests:unsafe_request_with_early_data_option_is_sent_test_` ✓ |
 
 ## RFC 9204 — QPACK
 
@@ -160,6 +172,11 @@ depends on these primitives.
 | §2.2.2.2 | Stream Cancellation for every stream given up before it is read, request or push | `quic_h3_compliance_tests:cancelling_a_request_being_read_sends_stream_cancellation_test`, `cancelling_an_open_push_sends_stream_cancellation_test` ✓ |
 | §2.1.1 | A field section stays referenced until Section Acknowledgment or Stream Cancellation; past 100 waiting streams the encoder uses literals | `quic_h3_compliance_tests:a_finished_stream_keeps_its_sections_until_acknowledged_test`, `quic_qpack_tests:unacknowledged_streams_are_bounded_test` ✓ |
 | §4.4.3 | Decoder-stream Insert Count Increment = 0 → `H3_QPACK_DECODER_STREAM_ERROR` | `quic_qpack_tests:insert_count_increment_zero_rejected_test` ✓ |
+| §2.1.2 | A blocked field section on a push stream (HEADERS or trailers) or in a PUSH_PROMISE waits for the encoder stream, with what follows it and the stream's FIN | `quic_h3_compliance_tests:blocked_push_headers_wait_test`, `content_behind_blocked_push_headers_waits_test`, `blocked_push_trailers_wait_test`, `blocked_push_promise_waits_test` ✓ |
+| §2.1.2 | One blocked stream more than `SETTINGS_QPACK_BLOCKED_STREAMS` → `H3_QPACK_DECOMPRESSION_FAILED`, push streams included; held bytes stay under `max_buffered_body` | `quic_h3_compliance_tests:blocked_push_over_the_limit_closes_test`, `content_behind_blocked_push_headers_is_bounded_test`, `a_cancelled_push_is_no_longer_blocked_test` ✓ |
+| §4.5.4, §4.5.6, §7.1.3 | A never-indexed field is sent as a literal with the N bit, never as an index and never inserted | `quic_qpack_tests:never_indexed_is_encoded_as_a_literal_with_n_test_`, `never_indexed_exact_static_match_stays_a_literal_test`, `never_indexed_stays_out_of_the_dynamic_table_test` ✓ |
+| §4.5.4, §4.5.5, §4.5.6 | The N bit of all three literal forms is decoded and given to a caller that asked for it | `quic_qpack_tests:never_indexed_decode_is_opt_in_test`, `never_indexed_with_a_dynamic_name_reference_test`, `quic_qpack_prop_tests` ("Never-indexed marks roundtrip") ✓ |
+| §7.1.3 | The mark is kept across an HTTP/3 connection in both directions, and marked fields are validated like any other | `quic_h3_connect_SUITE:never_indexed_fields_keep_their_mark`, `quic_h3_compliance_tests:a_never_indexed_field_reaches_the_owner_marked_test`, `a_marked_malformed_field_is_refused_test`, `marked_trailers_reach_the_owner_marked_test` ✓ |
 | §5 | Huffman EOS / over-long padding → reject | `quic_qpack_tests:huffman_invalid_eos_rejected_test` ✓ |
 
 ## Scheduler behaviour
