@@ -950,3 +950,101 @@ ric_roundtrip(EncoderCeiling, DecoderMax) ->
         {E0, D0},
         lists:seq(1, 300)
     ).
+
+%%====================================================================
+%% Never-indexed literals (RFC 9204 Sections 4.5.4, 4.5.6 and 7.1.3)
+%%====================================================================
+
+%% A marked field is a literal with the N bit: a static name reference
+%% when the name is in the static table, a literal name otherwise.
+never_indexed_is_encoded_as_a_literal_with_n_test_() ->
+    [
+        ?_assertMatch(
+            <<0, 0, 2#0111:4, _:4, _/binary>>, quic_qpack:encode([{Name, <<"v">>, never_indexed}])
+        )
+     || Name <- [<<"authorization">>, <<"cookie">>, <<":method">>]
+    ] ++
+        [
+            ?_assertMatch(
+                <<0, 0, 2#0011:4, 0:1, _:3, _/binary>>,
+                quic_qpack:encode([{Name, <<"v">>, never_indexed}])
+            )
+         || Name <- [<<"x-key">>, <<"x-a-longer-secret-name">>]
+        ].
+
+%% Not even when the static table holds the exact field.
+never_indexed_exact_static_match_stays_a_literal_test() ->
+    ?assertMatch(
+        <<0, 0, 2#0111:4, _:4, _/binary>>,
+        quic_qpack:encode([{<<":method">>, <<"GET">>, never_indexed}])
+    ),
+    ?assertMatch(<<0, 0, 2#11:2, _:6>>, quic_qpack:encode([{<<":method">>, <<"GET">>}])).
+
+%% It is not inserted, and an entry that already holds it is not used.
+never_indexed_stays_out_of_the_dynamic_table_test() ->
+    E0 = quic_qpack:new(#{max_dynamic_size => 4096}),
+    Secret = {<<"x-token">>, <<"a-value-long-enough-to-index">>},
+    {_, E1} = quic_qpack:encode([erlang:append_element(Secret, never_indexed)], 0, E0),
+    ?assertEqual(0, quic_qpack:get_insert_count(E1)),
+    ?assertEqual(<<>>, quic_qpack:get_encoder_instructions(E1)),
+    %% the same field unmarked is inserted and, once acknowledged, indexed
+    {_, E2} = quic_qpack:encode([Secret], 4, E1),
+    ?assertEqual(1, quic_qpack:get_insert_count(E2)),
+    {ok, E3} = quic_qpack:process_decoder_instructions(
+        quic_qpack:encode_insert_count_increment(1), quic_qpack:clear_encoder_instructions(E2)
+    ),
+    {Indexed, E4} = quic_qpack:encode([Secret], 8, E3),
+    ?assertEqual(1, quic_qpack:get_last_ric(E4)),
+    ?assertMatch(<<_RIC, _Base, 2#10:2, _:6>>, Indexed),
+    {Marked, E5} = quic_qpack:encode([erlang:append_element(Secret, never_indexed)], 12, E4),
+    ?assertEqual(0, quic_qpack:get_last_ric(E5)),
+    ?assertMatch(<<0, _Base, 2#0011:4, _/bitstring>>, Marked).
+
+%% The decoder gives the mark to a caller that asked for it, and drops
+%% it otherwise.
+never_indexed_decode_is_opt_in_test() ->
+    Fields = [
+        {<<":method">>, <<"POST">>},
+        {<<"authorization">>, <<"secret">>, never_indexed},
+        {<<"x-key">>, <<"k">>, never_indexed},
+        {<<"x-plain">>, <<"p">>}
+    ],
+    Encoded = quic_qpack:encode(Fields),
+    ?assertEqual(
+        {ok, Fields},
+        element(1, quic_qpack:decode(Encoded, quic_qpack:new(#{never_indexed => true})))
+    ),
+    ?assertEqual(
+        {ok, [
+            {<<":method">>, <<"POST">>},
+            {<<"authorization">>, <<"secret">>},
+            {<<"x-key">>, <<"k">>},
+            {<<"x-plain">>, <<"p">>}
+        ]},
+        quic_qpack:decode(Encoded)
+    ).
+
+%% The N bit of a literal whose name is a dynamic table reference, before
+%% and after the Base (Sections 4.5.4 and 4.5.5).
+never_indexed_with_a_dynamic_name_reference_test() ->
+    D0 = quic_qpack:new(#{max_dynamic_size => 4096, never_indexed => true}),
+    %% Insert With Literal Name: x-a = v
+    {ok, D1} = quic_qpack:process_encoder_instructions(<<2#010:3, 3:5, "x-a", 1, $v>>, D0),
+    Marked = [{<<"x-a">>, <<"w">>, never_indexed}],
+    %% RIC 1, Base 1, 0110 + relative index 0
+    ?assertMatch({{ok, Marked}, _}, quic_qpack:decode(<<2, 0, 2#01100000, 1, $w>>, D1)),
+    %% RIC 1, Base 0 (Sign 1, Delta Base 0), 00001 + post-base index 0
+    ?assertMatch({{ok, Marked}, _}, quic_qpack:decode(<<2, 16#80, 2#00001000, 1, $w>>, D1)),
+    %% the same two with N clear
+    Plain = [{<<"x-a">>, <<"w">>}],
+    ?assertMatch({{ok, Plain}, _}, quic_qpack:decode(<<2, 0, 2#01000000, 1, $w>>, D1)),
+    ?assertMatch({{ok, Plain}, _}, quic_qpack:decode(<<2, 16#80, 2#00000000, 1, $w>>, D1)).
+
+%% A marked field counts against the field section size like any other.
+never_indexed_counts_against_the_size_limit_test() ->
+    Encoded = quic_qpack:encode([{<<"x-key">>, <<"0123456789">>, never_indexed}]),
+    D = quic_qpack:new(#{never_indexed => true}),
+    ?assertMatch({{ok, [_]}, _}, quic_qpack:decode(Encoded, D, 5 + 10 + 32)),
+    ?assertMatch(
+        {{error, field_section_too_large}, _}, quic_qpack:decode(Encoded, D, 5 + 10 + 31)
+    ).

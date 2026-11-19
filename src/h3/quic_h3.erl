@@ -275,7 +275,10 @@
 -type conn() :: pid().
 -type stream_id() :: non_neg_integer().
 -type push_id() :: non_neg_integer().
--type headers() :: [{binary(), binary()}].
+%% `{Name, Value, never_indexed}' marks a field the QPACK encoder must
+%% send as a never-indexed literal (RFC 9204 Section 7.1.3). You can send
+%% it on any connection; you receive it only with `qpack_never_indexed'.
+-type headers() :: [{binary(), binary()} | {binary(), binary(), never_indexed}].
 -type status() :: 100..599.
 -type error_code() :: non_neg_integer().
 
@@ -309,7 +312,10 @@
     %% After a request refused with stream_limit, send
     %% {streams_available, bidi} once one can open again (see the module
     %% doc). Default false.
-    notify_streams_available => boolean()
+    notify_streams_available => boolean(),
+    %% Deliver a field the peer sent as a never-indexed literal as
+    %% {Name, Value, never_indexed}. Default false.
+    qpack_never_indexed => boolean()
 }.
 
 %% Override function invoked once per newly accepted QUIC connection.
@@ -325,7 +331,8 @@
     h3_datagram_enabled => boolean(),
     max_buffered_body => non_neg_integer(),
     defer_requests_until_settings => boolean(),
-    stream_reset_final_size => boolean()
+    stream_reset_final_size => boolean(),
+    qpack_never_indexed => boolean()
 }.
 
 %% Options of accept/2: those start_server/3 applies to each connection.
@@ -339,7 +346,8 @@
     max_buffered_body => non_neg_integer(),
     defer_requests_until_settings => boolean(),
     stream_reset_final_size => boolean(),
-    notify_streams_available => boolean()
+    notify_streams_available => boolean(),
+    qpack_never_indexed => boolean()
 }.
 
 -type server_opts() :: #{
@@ -369,6 +377,10 @@
     %% After an open refused with stream_limit, send {streams_available, Dir}
     %% once one would succeed (see the module doc). Default false.
     notify_streams_available => boolean(),
+    %% Deliver a field the peer sent as a never-indexed literal as
+    %% {Name, Value, never_indexed}, to the owner and the handler.
+    %% Default false.
+    qpack_never_indexed => boolean(),
     %% Per-connection configuration override; the returned map's
     %% `owner', `handler', `stream_type_handler', `h3_datagram_enabled',
     %% `max_buffered_body', `defer_requests_until_settings',
@@ -426,7 +438,8 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
             stream_type_handler,
             h3_datagram_enabled,
             stream_reset_final_size,
-            notify_streams_available
+            notify_streams_available,
+            qpack_never_indexed
         ],
         Opts
     ),
@@ -814,6 +827,9 @@ listener_defaults(Opts) ->
         ),
         notify_streams_available => valid_flag(
             notify_streams_available, maps:get(notify_streams_available, Opts, false)
+        ),
+        qpack_never_indexed => valid_flag(
+            qpack_never_indexed, maps:get(qpack_never_indexed, Opts, false)
         )
     }.
 
@@ -838,7 +854,8 @@ resolve_per_conn_opts(Defaults, Fun, ConnPid) when is_function(Fun, 1) ->
 %% `Opts' takes the options `start_server/3' applies to each connection:
 %% `handler', `settings', `stream_type_handler', `h3_datagram_enabled',
 %% `max_buffered_body', `defer_requests_until_settings',
-%% `stream_reset_final_size', `notify_streams_available' and `owner'.
+%% `stream_reset_final_size', `notify_streams_available',
+%% `qpack_never_indexed' and `owner'.
 %% `owner' defaults to the caller, which inside `alpn_handler' is the
 %% QUIC connection process, so pass the process that should receive the
 %% owner events.
@@ -1183,6 +1200,9 @@ build_h3_opts(Opts) ->
         ),
         notify_streams_available => valid_flag(
             notify_streams_available, maps:get(notify_streams_available, Opts, false)
+        ),
+        qpack_never_indexed => valid_flag(
+            qpack_never_indexed, maps:get(qpack_never_indexed, Opts, false)
         ),
         defer_requests_until_settings => valid_defer_requests(
             maps:get(defer_requests_until_settings, Opts, false)

@@ -48,6 +48,13 @@ qpack_prop_test_() ->
                     proper:quickcheck(prop_huffman_roundtrip(), [{numtests, 200}, {to_file, user}])
                 )
             end},
+            {"Never-indexed marks roundtrip", fun() ->
+                ?assert(
+                    proper:quickcheck(prop_never_indexed_roundtrip(), [
+                        {numtests, 100}, {to_file, user}
+                    ])
+                )
+            end},
             {"Header names preserved", fun() ->
                 ?assert(
                     proper:quickcheck(prop_header_name_preserved(), [
@@ -61,6 +68,33 @@ qpack_prop_test_() ->
 %%====================================================================
 %% Properties
 %%====================================================================
+
+%% Marked and unmarked fields come back as sent from a decoder that keeps
+%% the mark, through a dynamic table, and no marked field is inserted.
+prop_never_indexed_roundtrip() ->
+    ?FORALL(
+        Fields,
+        non_empty(list({http_header_name(), http_header_value(), boolean()})),
+        begin
+            Headers = [
+                case Marked of
+                    true -> {N, V, never_indexed};
+                    false -> {N, V}
+                end
+             || {N, V, Marked} <- Fields
+            ],
+            Encoder = quic_qpack:new(#{max_dynamic_size => 4096}),
+            Decoder0 = quic_qpack:new(#{max_dynamic_size => 4096, never_indexed => true}),
+            {Encoded, Encoder1} = quic_qpack:encode(Headers, 0, Encoder),
+            {ok, Decoder1} = quic_qpack:process_encoder_instructions(
+                quic_qpack:get_encoder_instructions(Encoder1), Decoder0
+            ),
+            {Result, _} = quic_qpack:decode(Encoded, Decoder1),
+            Inserted = quic_qpack:get_insert_count(Encoder1),
+            Result =:= {ok, Headers} andalso
+                Inserted =< length([F || {_, _} = F <- Headers])
+        end
+    ).
 
 %% Single header encode/decode roundtrip
 prop_header_roundtrip() ->

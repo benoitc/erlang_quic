@@ -5550,3 +5550,98 @@ blocked_response(RIC) ->
 %% The field section of blocked_request/1, without its frame.
 blocked_section(RIC) ->
     <<(RIC + 1), 0, 16#D1, 16#D7, 16#C1, 16#50, 1, $a, 16#80>>.
+
+%%====================================================================
+%% Never-indexed fields (RFC 9204 §7.1.3)
+%%====================================================================
+
+%% A field the application marks goes out as a never-indexed literal; the
+%% rest of the response is built as for an unmarked one.
+a_marked_response_field_is_sent_never_indexed_test() ->
+    {{ok, _}, [{0, Payload, _} | _]} = respond_capture(
+        200,
+        [
+            {<<"set-cookie">>, <<"s=1">>, never_indexed},
+            {<<"content-length">>, <<"2">>},
+            {<<"server">>, <<"t">>}
+        ],
+        <<"hi">>,
+        <<"GET">>
+    ),
+    {ok, {headers, Block}, _} = quic_h3_frame:decode(iolist_to_binary(Payload)),
+    ?assertMatch(
+        {
+            {ok, [
+                {<<":status">>, <<"200">>},
+                {<<"set-cookie">>, <<"s=1">>, never_indexed},
+                {<<"content-length">>, <<"2">>},
+                {<<"server">>, <<"t">>}
+            ]},
+            _
+        },
+        quic_qpack:decode(Block, quic_qpack:new(#{never_indexed => true}))
+    ).
+
+%% The rules that read a field still apply to a marked one: no
+%% Content-Length on a 204, marked or not (RFC 9110 Section 8.6).
+a_marked_field_is_still_filtered_test() ->
+    {{ok, _}, [{0, Payload, _} | _]} = respond_capture(
+        204, [{<<"content-length">>, <<"0">>, never_indexed}], <<>>, <<"GET">>
+    ),
+    {ok, {headers, Block}, _} = quic_h3_frame:decode(iolist_to_binary(Payload)),
+    ?assertEqual({ok, [{<<":status">>, <<"204">>}]}, quic_qpack:decode(Block)).
+
+%% With qpack_never_indexed the owner sees the mark; without it, not.
+a_never_indexed_field_reaches_the_owner_marked_test() ->
+    Fields = [
+        {<<":status">>, <<"200">>, never_indexed},
+        {<<"set-cookie">>, <<"s=1">>, never_indexed},
+        {<<"content-length">>, <<"0">>}
+    ],
+    Frame = quic_h3_frame:encode_headers(quic_qpack:encode(Fields)),
+    Marking = #{qpack_decoder => quic_qpack:new(#{never_indexed => true})},
+    ?assertMatch([{response, 0, 200, Fields} | _], response_events(Frame, Marking)),
+    ?assertMatch(
+        [
+            {response, 0, 200, [
+                {<<":status">>, <<"200">>},
+                {<<"set-cookie">>, <<"s=1">>},
+                {<<"content-length">>, <<"0">>}
+            ]}
+            | _
+        ],
+        response_events(Frame, #{})
+    ).
+
+%% A marked field is validated like any other.
+a_marked_malformed_field_is_refused_test() ->
+    Frame = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, <<"200">>}, {<<"X-Upper">>, <<"v">>, never_indexed}])
+    ),
+    Marking = #{qpack_decoder => quic_qpack:new(#{never_indexed => true})},
+    ?assertEqual([{stream_reset, 0, ?H3_MESSAGE_ERROR}], response_events(Frame, Marking)).
+
+marked_trailers_reach_the_owner_marked_test() ->
+    Trailers = [{<<"x-sum">>, <<"1">>, never_indexed}],
+    Frames = <<
+        (quic_h3_frame:encode_headers(quic_qpack:encode([{<<":status">>, <<"200">>}])))/binary,
+        (quic_h3_frame:encode_data(<<"abc">>))/binary,
+        (quic_h3_frame:encode_headers(quic_qpack:encode(Trailers)))/binary
+    >>,
+    Marking = #{qpack_decoder => quic_qpack:new(#{never_indexed => true})},
+    ?assertEqual(
+        [{trailers, 0, Trailers}],
+        [E || {trailers, _, _} = E <- response_events(Frames, Marking)]
+    ).
+
+response_events(Frames, Overrides) ->
+    Request = #h3_stream{id = 0, type = request, state = half_closed_local, method = <<"GET">>},
+    State = make_test_state(
+        maps:merge(
+            #{role => client, quic_conn => fake_quic_conn(), streams => #{0 => Request}},
+            Overrides
+        )
+    ),
+    flush_mailbox(),
+    {ok, _} = quic_h3_connection:handle_stream_data(0, Frames, true, State),
+    owner_events().
