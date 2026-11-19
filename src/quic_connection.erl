@@ -2558,7 +2558,7 @@ handle_common_event(info, {timeout, _StaleRef, pacing_timeout}, _StateName, Stat
 handle_common_event(
     info,
     {timeout, Ref, early_keys_discard_timeout},
-    StateName,
+    _StateName,
     #state{early_keys_discard_timer = Ref} = State
 ) when
     Ref =/= undefined andalso is_integer(State#state.early_keys_discard_deadline)
@@ -2592,7 +2592,7 @@ handle_common_event(info, {timeout, _StaleRef, early_keys_discard_timeout}, _Sta
 handle_common_event(
     info,
     {timeout, Ref, prev_keys_retire_timeout},
-    StateName,
+    _StateName,
     #state{prev_keys_retire_timer = Ref} = State
 ) when
     Ref =/= undefined andalso is_integer(State#state.prev_keys_retire_deadline)
