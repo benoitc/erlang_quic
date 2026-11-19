@@ -60,7 +60,8 @@ peer_update_after_own_update(_Config) ->
     end.
 
 %% The server can only start its update once it has seen a packet that
-%% confirms the client's, so it may need another exchange first.
+%% confirms the client's, and three PTOs after that (RFC 9001 Section
+%% 6.5), so it may need another exchange or a wait first.
 server_key_update(_Conn, _SConn, 0) ->
     ct:fail(server_never_updated);
 server_key_update(Conn, SConn, N) ->
@@ -69,6 +70,10 @@ server_key_update(Conn, SConn, N) ->
             ok;
         {error, key_update_in_progress} ->
             ok = roundtrip(Conn, <<"ping">>),
+            server_key_update(Conn, SConn, N - 1);
+        {error, key_update_too_soon} ->
+            %% Three PTOs after the client's update was confirmed.
+            timer:sleep(100),
             server_key_update(Conn, SConn, N - 1)
     end.
 

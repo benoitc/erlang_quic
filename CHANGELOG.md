@@ -50,6 +50,13 @@ All notable changes to this project will be documented in this file.
   `gso_run_send_error` warning and the connection ran on
   retransmissions. The batch now goes out packet by packet and the
   socket stops using GSO.
+- `quic_connection:key_update/1` could start a key update right after
+  the previous one was confirmed, while the peer may still hold its
+  old read keys and drop the packets. It now returns
+  `{error, key_update_too_soon}` until three probe timeouts have
+  passed (RFC 9001 Section 6.5). The update forced by the AEAD
+  confidentiality limit does not wait, as that limit is mandatory
+  (Section 6.6).
 
 ## [3.1.3] - 2026-11-18
 

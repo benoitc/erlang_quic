@@ -606,6 +606,10 @@ get_mtu(Conn) ->
 %% @doc Initiate a key update (RFC 9001 Section 6).
 %% This triggers a key update cycle, deriving new encryption keys.
 %% Only valid when connection is in connected state.
+%% Returns `{error, handshake_not_confirmed}' before the handshake is
+%% confirmed, `{error, key_update_in_progress}' until the peer has
+%% confirmed the previous update and `{error, key_update_too_soon}' for
+%% three probe timeouts after that (Sections 6.1 and 6.5).
 -spec key_update(pid()) -> ok | {error, term()}.
 key_update(Conn) ->
     call(Conn, key_update).
@@ -2093,11 +2097,16 @@ connected({call, From}, key_update, #state{key_state = KeyState} = State) ->
             %% RFC 9001 Section 6.1: not before the handshake is confirmed
             {keep_state, State, [{reply, From, {error, handshake_not_confirmed}}]};
         true ->
-            case KeyState#key_update_state.update_state of
-                idle ->
+            case KeyState of
+                #key_update_state{update_state = idle, prev_keys = undefined} ->
                     %% Initiate key update
                     NewState = initiate_key_update(State),
                     {keep_state, NewState, [{reply, From, ok}]};
+                #key_update_state{update_state = idle} ->
+                    %% RFC 9001 Section 6.5: the previous keys are held for
+                    %% three PTOs after the update that replaced them was
+                    %% confirmed, and so are the peer's.
+                    {keep_state, State, [{reply, From, {error, key_update_too_soon}}]};
                 _ ->
                     %% Key update already in progress
                     {keep_state, State, [{reply, From, {error, key_update_in_progress}}]}
@@ -15232,7 +15241,8 @@ normalize_alpn_list(_) ->
 %% Count an outgoing 1-RTT packet toward the AEAD confidentiality limit
 %% and force a key update before it is reached (RFC 9001 §6.6). Only the
 %% first over-limit packet in an idle phase triggers the update; the
-%% counter resets when the new phase begins.
+%% counter resets when the new phase begins. The limit is a MUST, so
+%% this update does not wait out the three PTOs of Section 6.5.
 %% N packets at once, for the chunk-run sender.
 maybe_force_key_update(#state{key_state = undefined} = State, _N) ->
     State;
