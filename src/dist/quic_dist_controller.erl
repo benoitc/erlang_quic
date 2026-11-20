@@ -535,12 +535,10 @@ init_state(enter, _OldState, #state{role = client} = State) ->
         {error, Reason} ->
             {stop, {stream_setup_failed, Reason}}
     end;
-init_state(enter, _OldState, #state{role = server, conn = Conn} = State) ->
+init_state(enter, _OldState, #state{role = server} = State) ->
     %% Server: the listener made us the owner before the connection saw
-    %% its first packet. This call is redundant, and is kept only so a
-    %% controller started any other way still ends up owning its
-    %% connection; nothing depends on its timing any more.
-    ok = quic:set_owner_sync(Conn, self()),
+    %% its first packet, so there is nothing to take over. By now the
+    %% peer may already have closed; that close reaches us as owner.
     %% Setup streams - transition via timeout since enter can't change state
     case setup_streams(State) of
         {ok, State1} ->

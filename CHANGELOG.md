@@ -21,6 +21,8 @@ All notable changes to this project will be documented in this file.
   right after the handshake.
 - An HTTP/3 server declines a connection that closed before it was
   taken over, instead of reporting a connection handler error.
+- A distribution server no longer crashes when the peer closes the
+  connection as it is being set up.
 - With `qpack_never_indexed`, the headers of `push_promise` and
   `push_stream` events lost the never-indexed mark, so code forwarding a
   pushed request could not keep it on the next hop (RFC 9204 Section
