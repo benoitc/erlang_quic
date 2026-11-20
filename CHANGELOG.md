@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- With `qpack_never_indexed`, the headers of `push_promise` and
+  `push_stream` events lost the never-indexed mark, so code forwarding a
+  pushed request could not keep it on the next hop (RFC 9204 Section
+  7.1.3). They now carry it like the other events. A promise repeated
+  with the same fields but different marks is still accepted as the
+  same promise (RFC 9114 Section 7.2.5).
+
 ## [3.2.0] - 2026-11-19
 
 ### Added

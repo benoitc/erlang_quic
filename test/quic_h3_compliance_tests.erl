@@ -5634,6 +5634,75 @@ marked_trailers_reach_the_owner_marked_test() ->
         [E || {trailers, _, _} = E <- response_events(Frames, Marking)]
     ).
 
+%% A pushed request keeps its marks for an owner that forwards it.
+a_never_indexed_promise_reaches_the_owner_marked_test() ->
+    Promise = marked_promise(<<"GET">>),
+    {ok, _} = promise_events(Promise, #{never_indexed => true}),
+    ?assertMatch([{push_promise, 5, 0, Promise}], owner_events()),
+    {ok, _} = promise_events(Promise, #{}),
+    ?assertMatch(
+        [{push_promise, 5, 0, [_, _, _, _, {<<"authorization">>, <<"t">>}]}], owner_events()
+    ).
+
+%% The push stream gets the same marks, and a marked :method still counts.
+a_marked_promise_opens_its_push_stream_marked_test() ->
+    Promise = marked_promise(<<"HEAD">>),
+    {ok, State} = promise_events(Promise, #{never_indexed => true}),
+    _ = owner_events(),
+    Response = quic_h3_frame:encode_headers(
+        quic_qpack:encode([{<<":status">>, <<"200">>}, {<<"content-length">>, <<"5">>}])
+    ),
+    {ok, _} = quic_h3_connection:handle_stream_data(11, <<1, 5, Response/binary>>, true, State),
+    ?assertMatch(
+        [{push_stream, 5, 0, Promise}, {push_response, 5, 200, _}, {push_complete, 5}],
+        owner_events()
+    ).
+
+%% A marked field in a promise is validated like any other.
+a_marked_malformed_promise_is_refused_test() ->
+    Promise = marked_promise(<<"GET">>) ++ [{<<"X-Upper">>, <<"v">>, never_indexed}],
+    ?assertMatch(
+        {error, {connection_error, ?H3_MESSAGE_ERROR, <<"malformed PUSH_PROMISE headers">>}, _},
+        promise_events(Promise, #{never_indexed => true})
+    ).
+
+%% RFC 9114 §7.2.5 compares names and values; the mark is neither.
+a_repeated_promise_differing_only_in_marks_is_a_duplicate_test() ->
+    Promise = marked_promise(<<"GET">>),
+    Promised = #{5 => {0, Promise}},
+    ?assertEqual(
+        duplicate_ok,
+        quic_h3_connection:validate_push_promise_duplicate(5, plain_promise(Promise), Promised)
+    ),
+    ?assertMatch(
+        {error, {connection_error, ?H3_GENERAL_PROTOCOL_ERROR, _}},
+        quic_h3_connection:validate_push_promise_duplicate(
+            5, lists:keyreplace(<<":path">>, 1, Promise, {<<":path">>, <<"/b">>}), Promised
+        )
+    ).
+
+marked_promise(Method) ->
+    [
+        {<<":method">>, Method, never_indexed},
+        {<<":scheme">>, <<"https">>},
+        {<<":authority">>, <<"example.com">>},
+        {<<":path">>, <<"/a">>},
+        {<<"authorization">>, <<"t">>, never_indexed}
+    ].
+
+plain_promise(Fields) ->
+    [{element(1, Field), element(2, Field)} || Field <- Fields].
+
+promise_events(Promise, DecoderOpts) ->
+    Request = #h3_stream{id = 0, type = request, state = half_closed_local, method = <<"GET">>},
+    State = push_blocking_state(#{
+        promised_pushes => #{},
+        streams => #{0 => Request},
+        qpack_decoder => quic_qpack:new(DecoderOpts)
+    }),
+    Frame = quic_h3_frame:encode_push_promise(5, quic_qpack:encode(Promise)),
+    quic_h3_connection:handle_stream_data(0, Frame, false, State).
+
 response_events(Frames, Overrides) ->
     Request = #h3_stream{id = 0, type = request, state = half_closed_local, method = <<"GET">>},
     State = make_test_state(

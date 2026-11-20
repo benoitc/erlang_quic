@@ -253,7 +253,7 @@
     %% local_max_push_id: Maximum push ID we've sent to server
     local_max_push_id :: non_neg_integer() | undefined,
     %% promised_pushes: Push promises received - maps PushId to {RequestStreamId, Headers}
-    promised_pushes = #{} :: #{non_neg_integer() => {non_neg_integer(), [{binary(), binary()}]}},
+    promised_pushes = #{} :: #{non_neg_integer() => {non_neg_integer(), quic_h3:headers()}},
     %% received_pushes: Active push streams from server - maps PushId to a
     %% full #h3_stream{} so content-length / body / frame_state tracking
     %% matches regular request streams (RFC 9114 §4.1.2, §4.6).
@@ -2469,7 +2469,7 @@ correlate_push_stream(
                 id = StreamId,
                 type = push,
                 state = open,
-                method = proplists:get_value(<<":method">>, Headers),
+                method = proplists:get_value(<<":method">>, plain_fields(Headers)),
                 frame_state = expecting_headers
             },
             State1 = State#state{
@@ -3493,10 +3493,8 @@ decode_push_promise_headers(
     case decode_field_section(HeaderBlock, Decoder, State) of
         {{ok, Decoded}, Decoder1} ->
             State1 = send_section_ack(StreamId, HeaderBlock, State#state{qpack_decoder = Decoder1}),
-            %% A promise is compared with its repeats and kept for the push
-            %% stream, so it is read without the mark.
             validate_and_apply_push_promise(
-                StreamId, PushId, Stream, plain_fields(Decoded), Cancelled, Owner, Promised, State1
+                StreamId, PushId, Stream, Decoded, Cancelled, Owner, Promised, State1
             );
         {{error, field_section_too_large}, _Decoder1} ->
             {error,
@@ -3517,7 +3515,7 @@ decode_push_promise_headers(
 validate_and_apply_push_promise(
     StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State
 ) ->
-    case validate_promised_request_headers(Headers, State) of
+    case validate_promised_request_headers(plain_fields(Headers), State) of
         ok ->
             apply_push_promise(
                 StreamId, PushId, Stream, Headers, Cancelled, Owner, Promised, State
@@ -3592,17 +3590,21 @@ validate_push_promise_id(_PushId, _MaxPushId) ->
 
 %% RFC 9114 Section 7.2.5: same push ID may be promised on multiple request
 %% streams only if the decompressed headers are identical. Mismatched repeat
-%% promises MUST be treated as H3_GENERAL_PROTOCOL_ERROR.
+%% promises MUST be treated as H3_GENERAL_PROTOCOL_ERROR. Names and values
+%% are compared, not the never-indexed mark.
 validate_push_promise_duplicate(PushId, Headers, Promised) ->
     case maps:find(PushId, Promised) of
         error ->
             ok;
-        {ok, {_StreamId, Headers}} ->
-            duplicate_ok;
-        {ok, {_StreamId, _Other}} ->
-            {error,
-                {connection_error, ?H3_GENERAL_PROTOCOL_ERROR,
-                    <<"PUSH_PROMISE headers mismatch for repeated push ID">>}}
+        {ok, {_StreamId, Stored}} ->
+            case plain_fields(Stored) =:= plain_fields(Headers) of
+                true ->
+                    duplicate_ok;
+                false ->
+                    {error,
+                        {connection_error, ?H3_GENERAL_PROTOCOL_ERROR,
+                            <<"PUSH_PROMISE headers mismatch for repeated push ID">>}}
+            end
     end.
 
 %% RFC 9114 §4.2.2: what we advertised as SETTINGS_MAX_FIELD_SECTION_SIZE
