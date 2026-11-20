@@ -818,10 +818,10 @@ early_data(enter, _OldState, State) ->
         {ok, State1} ->
             case send_settings(State1) of
                 {ok, State2} -> {keep_state, State2};
-                {error, Reason} -> {stop, {error, Reason}}
+                {error, Reason} -> critical_streams_failed(Reason, State1)
             end;
         {error, Reason} ->
-            {stop, {error, Reason}}
+            critical_streams_failed(Reason, State)
     end;
 early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
     case early_data_allowed(Headers, Opts) of
@@ -1015,10 +1015,10 @@ h3_connecting(enter, _OldState, State) ->
                 {ok, State2} ->
                     {keep_state, State2};
                 {error, Reason} ->
-                    {stop, {error, Reason}}
+                    critical_streams_failed(Reason, State1)
             end;
         {error, Reason} ->
-            {stop, {error, Reason}}
+            critical_streams_failed(Reason, State)
     end;
 h3_connecting(
     info,
@@ -1502,38 +1502,49 @@ handle_quic_down(Reason, #state{owner = Owner} = State) ->
 %%====================================================================
 
 open_critical_streams(#state{quic_conn = QuicConn} = State) ->
-    %% Open control stream
-    case quic:open_unidirectional_stream(QuicConn) of
+    case open_typed_stream(QuicConn, control) of
         {ok, ControlStreamId} ->
-            %% Send stream type
-            TypeData = quic_h3_frame:encode_stream_type(control),
-            ok = quic:send_data(QuicConn, ControlStreamId, TypeData, false),
-
-            %% Open QPACK encoder stream
-            case quic:open_unidirectional_stream(QuicConn) of
+            case open_typed_stream(QuicConn, qpack_encoder) of
                 {ok, EncoderStreamId} ->
-                    EncTypeData = quic_h3_frame:encode_stream_type(qpack_encoder),
-                    ok = quic:send_data(QuicConn, EncoderStreamId, EncTypeData, false),
-
-                    %% Open QPACK decoder stream
-                    case quic:open_unidirectional_stream(QuicConn) of
+                    case open_typed_stream(QuicConn, qpack_decoder) of
                         {ok, DecoderStreamId} ->
-                            DecTypeData = quic_h3_frame:encode_stream_type(qpack_decoder),
-                            ok = quic:send_data(QuicConn, DecoderStreamId, DecTypeData, false),
-
                             {ok, State#state{
                                 local_control_stream = ControlStreamId,
                                 local_encoder_stream = EncoderStreamId,
                                 local_decoder_stream = DecoderStreamId
                             }};
-                        {error, Reason} ->
-                            {error, Reason}
+                        {error, _} = Error ->
+                            Error
                     end;
-                {error, Reason} ->
-                    {error, Reason}
+                {error, _} = Error ->
+                    Error
             end;
-        {error, Reason} ->
-            {error, Reason}
+        {error, _} = Error ->
+            Error
+    end.
+
+%% A unidirectional stream that starts with its type (RFC 9114 Section 6.2).
+open_typed_stream(QuicConn, Type) ->
+    case quic:open_unidirectional_stream(QuicConn) of
+        {ok, StreamId} ->
+            case
+                quic:send_data(QuicConn, StreamId, quic_h3_frame:encode_stream_type(Type), false)
+            of
+                ok -> {ok, StreamId};
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Streams cannot be opened on a connection that closed under us; its
+%% close is already in the mailbox and is reported like any other.
+critical_streams_failed(Reason, #state{quic_conn = QC, quic_ref = Ref} = State) ->
+    receive
+        {quic, QC, {closed, Closed}} -> handle_quic_failed(Closed, State);
+        {'DOWN', Ref, process, _, Down} -> handle_quic_down(Down, State)
+    after 0 ->
+        {stop, {error, Reason}}
     end.
 
 send_settings(

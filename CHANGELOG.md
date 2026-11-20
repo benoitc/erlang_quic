@@ -5,6 +5,8 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- An HTTP/3 server no longer logs a crash for each client it refuses
+  right after the handshake.
 - With `qpack_never_indexed`, the headers of `push_promise` and
   `push_stream` events lost the never-indexed mark, so code forwarding a
   pushed request could not keep it on the next hop (RFC 9204 Section
