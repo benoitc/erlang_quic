@@ -620,6 +620,8 @@ set_owner(Conn, NewOwner) when is_pid(Conn), is_pid(NewOwner) ->
 
 %% @doc Set the owner process for a connection (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
+%% Returns `{error, closed}' when the connection is closing or gone. The
+%% current owner keeps the `{quic, Conn, {closed, Reason}}' it was sent.
 -spec set_owner_sync(Conn, NewOwner) -> ok | {error, term()} when
     Conn :: pid(),
     NewOwner :: pid().

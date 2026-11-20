@@ -21,6 +21,7 @@
     start_link/3,
     start_link/4,
     prime/1,
+    take_over/2,
     request/2,
     request/3,
     open_bidi_stream/2,
@@ -391,6 +392,67 @@ start_link(QuicConn, Host, Port, Opts) ->
 -spec prime(pid()) -> ok.
 prime(Conn) ->
     gen_statem:cast(Conn, prime).
+
+%% @private
+%% Make Conn, an H3 process the caller started, the owner of QuicConn.
+%% A connection that has already closed refuses: Conn is stopped without
+%% its exit reaching the caller, and the error is the connection's close
+%% reason, `closed' when it gave none.
+-spec take_over(pid(), pid()) -> ok | {error, term()}.
+take_over(QuicConn, Conn) ->
+    case quic:set_owner_sync(QuicConn, Conn) of
+        ok ->
+            %% With Happy Eyeballs the connection can already be `connected',
+            %% so the server's control stream and SETTINGS may have reached
+            %% the caller, its owner until now. set_owner_sync re-delivers
+            %% {connected} but not that backlog, so forward it in order.
+            forward_quic_backlog(QuicConn, Conn);
+        {error, Reason} ->
+            stop_unlinked(Conn),
+            {error, close_reason(QuicConn, Reason)}
+    end.
+
+%% Drain the caller's `{quic, QuicConn, _}' messages to Conn in arrival
+%% order, skipping {connected}, which set_owner already re-delivered.
+forward_quic_backlog(QuicConn, Conn) ->
+    receive
+        {quic, QuicConn, {connected, _}} ->
+            forward_quic_backlog(QuicConn, Conn);
+        {quic, QuicConn, _} = Msg ->
+            Conn ! Msg,
+            forward_quic_backlog(QuicConn, Conn)
+    after 0 ->
+        ok
+    end.
+
+%% Why the connection closed, from what it sent the caller, which drops
+%% the rest.
+close_reason(QuicConn, Reason) ->
+    receive
+        {quic, QuicConn, {closed, Closed}} -> close_reason(QuicConn, Closed);
+        {quic, QuicConn, _} -> close_reason(QuicConn, Reason)
+    after 0 ->
+        Reason
+    end.
+
+stop_unlinked(Conn) ->
+    unlink(Conn),
+    try
+        gen_statem:stop(Conn, shutdown, 5000)
+    catch
+        exit:_ -> ok
+    end,
+    receive
+        {'EXIT', Conn, _} -> ok
+    after 0 -> ok
+    end,
+    flush_events(Conn).
+
+flush_events(Conn) ->
+    receive
+        {quic_h3, Conn, _} -> flush_events(Conn)
+    after 0 -> ok
+    end.
 
 %% @doc Send a request (client only).
 %% Returns the stream ID for tracking the response.

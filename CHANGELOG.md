@@ -4,9 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- `quic:set_owner_sync/2` on a connection that is closing now returns
+  `{error, closed}`, the same as once the connection is gone, instead
+  of `{error, {invalid_state, draining}}`. The owner still receives
+  `{quic, Conn, {closed, Reason}}` with the reason.
+
 ### Fixed
+- `quic_h3:connect/3` could crash the calling process when the server
+  closed the connection right after the handshake, for example a server
+  that requires a client certificate refusing a client without one.
+  Depending on timing the caller got `{error, _}`, crashed, or waited
+  until `connect_timeout`. It now always returns `{error, Reason}` with
+  the reason the server closed with.
 - An HTTP/3 server no longer logs a crash for each client it refuses
   right after the handshake.
+- An HTTP/3 server declines a connection that closed before it was
+  taken over, instead of reporting a connection handler error.
 - With `qpack_never_indexed`, the headers of `push_promise` and
   `push_stream` events lost the never-indexed mark, so code forwarding a
   pushed request could not keep it on the next hop (RFC 9204 Section

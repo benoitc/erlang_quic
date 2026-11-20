@@ -416,6 +416,15 @@ connect(Host, Port) ->
 %%                This ensures requests can be made immediately. Default: `false'.</li>
 %%   <li>`connect_timeout' - Timeout in ms for sync connect. Default: 5000.</li>
 %% </ul>
+%%
+%% When the server closes the connection while it is being set up,
+%% `connect/3' returns `{error, Reason}' with the reason the connection
+%% closed with, whenever the close arrives. A server that refuses the
+%% client after the handshake gives
+%% `{peer_closed, transport, Code, FrameType, Phrase}', for example code
+%% 16#174 (certificate_required) when it asks for a client certificate and
+%% gets none. Without `sync', a close that arrives once `connect/3' has
+%% returned reaches the owner as `{quic_h3, Conn, {closed, Reason}}'.
 %% @end
 -spec connect(Host, Port, Opts) -> {ok, conn()} | {error, term()} when
     Host :: binary() | string() | inet:ip_address(),
@@ -446,35 +455,19 @@ start_h3_connection(QuicConn, HostBin, Port, Opts) ->
     case quic_h3_connection:start_link(QuicConn, HostBin, Port, H3Opts) of
         {ok, H3Conn} ->
             ok = quic_connection:hold_peer_streams(QuicConn),
-            %% Transfer ownership to H3 process so it receives QUIC events
-            ok = quic:set_owner_sync(QuicConn, H3Conn),
-            %% With Happy Eyeballs the connection can already be `connected'
-            %% by the time we get here, so the server's control stream and
-            %% SETTINGS may have been delivered to us (the prior owner) before
-            %% H3Conn existed. set_owner_sync re-delivers {connected} but not
-            %% that backlog, so forward it on in order.
-            forward_quic_backlog(QuicConn, H3Conn),
-            %% Prime the H3 process so it can choose between the 0-RTT
-            %% `early_data' path and the regular `awaiting_quic' wait.
-            ok = quic_h3_connection:prime(H3Conn),
-            maybe_wait_connected(H3Conn, Opts);
+            case quic_h3_connection:take_over(QuicConn, H3Conn) of
+                ok ->
+                    %% Prime the H3 process so it can choose between the 0-RTT
+                    %% `early_data' path and the regular `awaiting_quic' wait.
+                    ok = quic_h3_connection:prime(H3Conn),
+                    maybe_wait_connected(H3Conn, Opts);
+                {error, _} = Error ->
+                    quic:safe_close(QuicConn),
+                    Error
+            end;
         {error, Reason} ->
             quic:safe_close(QuicConn, 0, <<"h3 init failed">>),
             {error, Reason}
-    end.
-
-%% Drain this process's mailbox of `{quic, Conn, _}' messages and forward them
-%% to H3Conn in arrival order. {connected} is skipped: set_owner re-delivers it
-%% to the new owner already, so forwarding it too would duplicate it.
-forward_quic_backlog(Conn, H3Conn) ->
-    receive
-        {quic, Conn, {connected, _}} ->
-            forward_quic_backlog(Conn, H3Conn);
-        {quic, Conn, _} = Msg ->
-            H3Conn ! Msg,
-            forward_quic_backlog(Conn, H3Conn)
-    after 0 ->
-        ok
     end.
 
 maybe_wait_connected(H3Conn, Opts) ->
@@ -1171,9 +1164,12 @@ start_h3_connection(QuicConnPid, H3Opts, Owner) ->
     case start_h3_process(QuicConnPid, H3Opts, Owner) of
         {ok, H3Conn} ->
             %% Transfer ownership to H3 process so it receives QUIC events
-            %% including the {connected, Info} notification after handshake completes
-            ok = quic:set_owner_sync(QuicConnPid, H3Conn),
-            {ok, H3Conn};
+            %% including the {connected, Info} notification after handshake
+            %% completes. A connection already closed is declined.
+            case quic_h3_connection:take_over(QuicConnPid, H3Conn) of
+                ok -> {ok, H3Conn};
+                {error, _} = Error -> Error
+            end;
         {error, Reason} ->
             {error, Reason}
     end.

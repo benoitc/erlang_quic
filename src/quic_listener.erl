@@ -60,8 +60,14 @@
 %%% ```
 %%% connection_handler => fun(Conn) ->
 %%%     {ok, Pid} = my_conn:start_link(Conn),
-%%%     ok = quic:set_owner_sync(Conn, Pid),
-%%%     {ok, Pid}
+%%%     case quic:set_owner_sync(Conn, Pid) of
+%%%         ok ->
+%%%             {ok, Pid};
+%%%         {error, _} = Error ->
+%%%             %% Closed before the swap, `{error, closed}': decline it.
+%%%             my_conn:stop(Pid),
+%%%             Error
+%%%     end
 %%% end
 %%% '''
 %%%
