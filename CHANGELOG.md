@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.3.0] - 2026-11-20
 
 ### Changed
 - `quic:set_owner_sync/2` on a connection that is closing now returns
@@ -25,18 +25,19 @@ All notable changes to this project will be documented in this file.
   other attempts are no longer waited for.
 - An HTTP/3 server no longer logs a crash for each client it refuses
   right after the handshake.
-- An HTTP/3 server declines a connection that closed before it was
-  taken over, instead of reporting a connection handler error.
+- An HTTP/3 server declines a connection that the client closed before
+  the server had set it up, instead of logging a connection handler
+  error.
 - A distribution server no longer crashes when the peer closes the
   connection as it is being set up.
 - A server that refused a client during the handshake, for example one
-  that requires a client certificate and got none, sent a second,
-  different CONNECTION_CLOSE: it went on reading the rest of the
-  client's flight after its alert and raised unexpected_message as
-  well. The client could see that close instead of the real one, and
-  the server logged a warning for each refused client. A fatal alert now
-  ends the handshake (RFC 9846 Section 6.2), and a closing connection
-  only ever repeats its first CONNECTION_CLOSE (RFC 9000 Section 10.2.1).
+  that requires a client certificate and got none, could give the
+  client the wrong reason: after refusing, it went on reading what the
+  client had sent and closed a second time with an "unexpected message"
+  error, which the client sometimes saw instead of the real one. The
+  server also logged a warning for each refused client. A refusal now
+  ends the handshake (RFC 9846 Section 6.2), and a connection only ever
+  sends its first close (RFC 9000 Section 10.2.1).
 - With `qpack_never_indexed`, the headers of `push_promise` and
   `push_stream` events lost the never-indexed mark, so code forwarding a
   pushed request could not keep it on the next hop (RFC 9204 Section
