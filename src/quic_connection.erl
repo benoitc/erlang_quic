@@ -7991,6 +7991,10 @@ process_tls_messages(Level, Data, State) ->
                     %% Pass the original bytes to process_tls_message for transcript
                     State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
                     case Rest =/= <<>> andalso crypto_level_closed(Level, State1) of
+                        _ when State1#state.closing_frame =/= undefined ->
+                            %% RFC 9846 Section 6.2: a fatal alert ends the
+                            %% handshake; the rest of the flight is not read.
+                            State1;
                         true ->
                             close_with_transport_error(
                                 ?QUIC_PROTOCOL_VIOLATION,
@@ -13773,6 +13777,10 @@ close_with_error(Level, Class, Code, FrameType, Reason, State) ->
     CloseFrame = {connection_close, Class, Code, FrameType, Reason},
     emit_local_close(Level, {Class, Code, Reason}, CloseFrame, State).
 
+%% RFC 9000 Section 10.2.1: a closing connection repeats the
+%% CONNECTION_CLOSE it sent, never a different one.
+emit_local_close(_Level, _Reason, _CloseFrame, #state{closing_frame = {_, _}} = State) ->
+    State;
 emit_local_close(Level, Reason, CloseFrame, State) ->
     CloseLevel = select_close_level(Level, State),
     emit_close_at_level(CloseLevel, CloseFrame, closing(Reason, CloseLevel, CloseFrame, State)).
