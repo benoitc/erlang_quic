@@ -148,11 +148,9 @@ Notes:
 
 - Without the option every field arrives as `{Name, Value}`, as before.
 - With it, a marked field is a three-element tuple in the `request`,
-  `response`, `trailers`, `push_response` and `push_trailers` events and
-  in the request handler's headers, so match on both shapes.
-  `lists:keyfind/3` finds either.
-- The headers of `push_promise` and `push_stream` events are always
-  `{Name, Value}`.
+  `response`, `trailers`, `push_promise`, `push_stream`, `push_response`
+  and `push_trailers` events and in the request handler's headers, so
+  match on both shapes. `lists:keyfind/3` finds either.
 - The server options `start_server/3` and `accept/2` take
   `qpack_never_indexed` too.
 
