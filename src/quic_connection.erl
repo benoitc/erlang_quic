@@ -7988,6 +7988,10 @@ process_tls_messages(Level, Data, State) ->
                     %% Pass the original bytes to process_tls_message for transcript
                     State1 = process_tls_message(Level, Type, Body, OriginalMsg, State),
                     case Rest =/= <<>> andalso crypto_level_closed(Level, State1) of
+                        _ when State1#state.closing_frame =/= undefined ->
+                            %% RFC 9846 Section 6.2: a fatal alert ends the
+                            %% handshake; the rest of the flight is not read.
+                            State1;
                         true ->
                             close_with_transport_error(
                                 ?QUIC_PROTOCOL_VIOLATION,

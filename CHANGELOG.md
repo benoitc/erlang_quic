@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- A server that refused a client during the handshake, for example one
+  that requires a client certificate and got none, sent a second,
+  different CONNECTION_CLOSE: it went on reading the rest of the
+  client's flight after its alert and raised unexpected_message as
+  well. The client could see that close instead of the real one, and
+  the server logged a warning for each refused client. A fatal alert now
+  ends the handshake (RFC 9846 Section 6.2), and a closing connection
+  only ever repeats its first CONNECTION_CLOSE (RFC 9000 Section 10.2.1).
 - With `qpack_never_indexed`, the headers of `push_promise` and
   `push_stream` events lost the never-indexed mark, so code forwarding a
   pushed request could not keep it on the next hop (RFC 9204 Section
