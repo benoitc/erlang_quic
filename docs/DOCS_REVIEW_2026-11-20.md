@@ -192,5 +192,17 @@ stages, not a diagram.
 
 ## Release gate status
 
-This plan has been given to the maintainer. The release waits for the
-answer to which items must be done first.
+The maintainer asked for the documentation to be fixed, then the
+release. Done on this branch, with no source change:
+
+- Item 1 of section 14: `docs/features.md` (the owner calls),
+  `docs/CLIENT_GUIDE.md` (a refused Happy Eyeballs winner),
+  `docs/DEVELOPER_GUIDE.md` (the handler example), the
+  `docs/MODULE_MAP.md` numbers and the `take_over/2` note, the
+  `AGENTS.md` date.
+- Item 2: the "Connection Ownership" section in `docs/DESIGN.md`.
+
+Still open after this branch: everything in item 4 of section 14, and
+questions 2 and 4 to 6. Questions 1 and 3 had no answer. The release is
+3.3.0, since the result of a public function changed; the "Changed"
+entry of the CHANGELOG is what livery and hackney need to read.

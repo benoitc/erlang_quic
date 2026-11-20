@@ -358,6 +358,13 @@ fail / time out), then returns `{ok, Conn}`; the owner still receives the
 literal/tuple, or a pre-opened `socket` keeps the immediate, asynchronous
 return.
 
+The first attempt to complete its handshake wins the race even if the
+server closes it right away, as a server that requires a client
+certificate does with a client that has none. `connect/4` then returns
+`{error, Reason}` with the server's reason, for example
+`{peer_closed, transport, 16#174, 0, <<"certificate required">>}`,
+without waiting for the other attempts (RFC 8305 Section 5).
+
 ```erlang
 %% Force IPv6, or disable racing for the legacy IPv4-first resolver.
 quic:connect("example.com", 443, #{family => inet6}, self()).

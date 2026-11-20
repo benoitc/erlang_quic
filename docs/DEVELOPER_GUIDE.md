@@ -140,13 +140,11 @@ handle_info({quic, Conn, {closed, Reason}}, State) ->
 -module(connection_handler).
 -export([start/2]).
 
+%% The listener makes the pid you return the owner before the
+%% connection sees its first packet, so the process does not take
+%% ownership itself.
 start(Conn, _DCID) ->
-    {ok, spawn_link(fun() -> init(Conn) end)}.
-
-init(Conn) ->
-    %% Take ownership of the connection
-    ok = quic:set_owner(Conn, self()),
-    loop(Conn, #{}).
+    {ok, spawn_link(fun() -> loop(Conn, #{}) end)}.
 
 loop(Conn, State) ->
     receive
