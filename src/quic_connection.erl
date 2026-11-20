@@ -13770,6 +13770,10 @@ close_with_error(Level, Class, Code, FrameType, Reason, State) ->
     CloseFrame = {connection_close, Class, Code, FrameType, Reason},
     emit_local_close(Level, {Class, Code, Reason}, CloseFrame, State).
 
+%% RFC 9000 Section 10.2.1: a closing connection repeats the
+%% CONNECTION_CLOSE it sent, never a different one.
+emit_local_close(_Level, _Reason, _CloseFrame, #state{closing_frame = {_, _}} = State) ->
+    State;
 emit_local_close(Level, Reason, CloseFrame, State) ->
     CloseLevel = select_close_level(Level, State),
     emit_close_at_level(CloseLevel, CloseFrame, closing(Reason, CloseLevel, CloseFrame, State)).
