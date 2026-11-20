@@ -21,6 +21,7 @@
     start_link/3,
     start_link/4,
     prime/1,
+    take_over/2,
     request/2,
     request/3,
     open_bidi_stream/2,
@@ -391,6 +392,67 @@ start_link(QuicConn, Host, Port, Opts) ->
 -spec prime(pid()) -> ok.
 prime(Conn) ->
     gen_statem:cast(Conn, prime).
+
+%% @private
+%% Make Conn, an H3 process the caller started, the owner of QuicConn.
+%% A connection that has already closed refuses: Conn is stopped without
+%% its exit reaching the caller, and the error is the connection's close
+%% reason, `closed' when it gave none.
+-spec take_over(pid(), pid()) -> ok | {error, term()}.
+take_over(QuicConn, Conn) ->
+    case quic:set_owner_sync(QuicConn, Conn) of
+        ok ->
+            %% With Happy Eyeballs the connection can already be `connected',
+            %% so the server's control stream and SETTINGS may have reached
+            %% the caller, its owner until now. set_owner_sync re-delivers
+            %% {connected} but not that backlog, so forward it in order.
+            forward_quic_backlog(QuicConn, Conn);
+        {error, Reason} ->
+            stop_unlinked(Conn),
+            {error, close_reason(QuicConn, Reason)}
+    end.
+
+%% Drain the caller's `{quic, QuicConn, _}' messages to Conn in arrival
+%% order, skipping {connected}, which set_owner already re-delivered.
+forward_quic_backlog(QuicConn, Conn) ->
+    receive
+        {quic, QuicConn, {connected, _}} ->
+            forward_quic_backlog(QuicConn, Conn);
+        {quic, QuicConn, _} = Msg ->
+            Conn ! Msg,
+            forward_quic_backlog(QuicConn, Conn)
+    after 0 ->
+        ok
+    end.
+
+%% Why the connection closed, from what it sent the caller, which drops
+%% the rest.
+close_reason(QuicConn, Reason) ->
+    receive
+        {quic, QuicConn, {closed, Closed}} -> close_reason(QuicConn, Closed);
+        {quic, QuicConn, _} -> close_reason(QuicConn, Reason)
+    after 0 ->
+        Reason
+    end.
+
+stop_unlinked(Conn) ->
+    unlink(Conn),
+    try
+        gen_statem:stop(Conn, shutdown, 5000)
+    catch
+        exit:_ -> ok
+    end,
+    receive
+        {'EXIT', Conn, _} -> ok
+    after 0 -> ok
+    end,
+    flush_events(Conn).
+
+flush_events(Conn) ->
+    receive
+        {quic_h3, Conn, _} -> flush_events(Conn)
+    after 0 -> ok
+    end.
 
 %% @doc Send a request (client only).
 %% Returns the stream ID for tracking the response.
@@ -818,10 +880,10 @@ early_data(enter, _OldState, State) ->
         {ok, State1} ->
             case send_settings(State1) of
                 {ok, State2} -> {keep_state, State2};
-                {error, Reason} -> {stop, {error, Reason}}
+                {error, Reason} -> critical_streams_failed(Reason, State1)
             end;
         {error, Reason} ->
-            {stop, {error, Reason}}
+            critical_streams_failed(Reason, State)
     end;
 early_data({call, From}, {request, Headers, Opts}, #state{role = client} = State) ->
     case early_data_allowed(Headers, Opts) of
@@ -1015,10 +1077,10 @@ h3_connecting(enter, _OldState, State) ->
                 {ok, State2} ->
                     {keep_state, State2};
                 {error, Reason} ->
-                    {stop, {error, Reason}}
+                    critical_streams_failed(Reason, State1)
             end;
         {error, Reason} ->
-            {stop, {error, Reason}}
+            critical_streams_failed(Reason, State)
     end;
 h3_connecting(
     info,
@@ -1502,38 +1564,49 @@ handle_quic_down(Reason, #state{owner = Owner} = State) ->
 %%====================================================================
 
 open_critical_streams(#state{quic_conn = QuicConn} = State) ->
-    %% Open control stream
-    case quic:open_unidirectional_stream(QuicConn) of
+    case open_typed_stream(QuicConn, control) of
         {ok, ControlStreamId} ->
-            %% Send stream type
-            TypeData = quic_h3_frame:encode_stream_type(control),
-            ok = quic:send_data(QuicConn, ControlStreamId, TypeData, false),
-
-            %% Open QPACK encoder stream
-            case quic:open_unidirectional_stream(QuicConn) of
+            case open_typed_stream(QuicConn, qpack_encoder) of
                 {ok, EncoderStreamId} ->
-                    EncTypeData = quic_h3_frame:encode_stream_type(qpack_encoder),
-                    ok = quic:send_data(QuicConn, EncoderStreamId, EncTypeData, false),
-
-                    %% Open QPACK decoder stream
-                    case quic:open_unidirectional_stream(QuicConn) of
+                    case open_typed_stream(QuicConn, qpack_decoder) of
                         {ok, DecoderStreamId} ->
-                            DecTypeData = quic_h3_frame:encode_stream_type(qpack_decoder),
-                            ok = quic:send_data(QuicConn, DecoderStreamId, DecTypeData, false),
-
                             {ok, State#state{
                                 local_control_stream = ControlStreamId,
                                 local_encoder_stream = EncoderStreamId,
                                 local_decoder_stream = DecoderStreamId
                             }};
-                        {error, Reason} ->
-                            {error, Reason}
+                        {error, _} = Error ->
+                            Error
                     end;
-                {error, Reason} ->
-                    {error, Reason}
+                {error, _} = Error ->
+                    Error
             end;
-        {error, Reason} ->
-            {error, Reason}
+        {error, _} = Error ->
+            Error
+    end.
+
+%% A unidirectional stream that starts with its type (RFC 9114 Section 6.2).
+open_typed_stream(QuicConn, Type) ->
+    case quic:open_unidirectional_stream(QuicConn) of
+        {ok, StreamId} ->
+            case
+                quic:send_data(QuicConn, StreamId, quic_h3_frame:encode_stream_type(Type), false)
+            of
+                ok -> {ok, StreamId};
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
+
+%% Streams cannot be opened on a connection that closed under us; its
+%% close is already in the mailbox and is reported like any other.
+critical_streams_failed(Reason, #state{quic_conn = QC, quic_ref = Ref} = State) ->
+    receive
+        {quic, QC, {closed, Closed}} -> handle_quic_failed(Closed, State);
+        {'DOWN', Ref, process, _, Down} -> handle_quic_down(Down, State)
+    after 0 ->
+        {stop, {error, Reason}}
     end.
 
 send_settings(

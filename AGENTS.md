@@ -199,8 +199,11 @@ citations and the table, with no CHANGELOG entry.
 
 ### Pending updates
 
-None known, checked 2026-11-19.
-A newer version found later goes in a table here, with what is known
+| Spec followed | Newer version | Known to differ |
+|---|---|---|
+| RFC 8305 Happy Eyeballs v2 | draft-ietf-happy-happyeyeballs-v3-05, found 2026-11-20; it updates the RFC 8305 algorithm | Adds SVCB/HTTPS records, grouping attempts by ALPN and service priority, and NAT64 handling. Section 6.1 counts a QUIC attempt as established once its handshake completes, which `quic_happy` follows. Not diffed yet (step 2). |
+
+A newer version found later goes in this table, with what is known
 to differ, and needs the diff in step 2 before any code changes.
 
 ## Skills

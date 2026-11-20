@@ -54,6 +54,23 @@ Establish an HTTP/3 connection to a server.
 {ok, Conn} = quic_h3:connect("example.com", 443, #{sync => true}).
 ```
 
+When the server closes the connection while it is being set up, you get
+`{error, Reason}` with the reason the connection closed with, whenever
+the close arrives. A server that refuses you after the handshake gives
+`{peer_closed, transport, Code, FrameType, Phrase}`; one that requires a
+client certificate and gets none uses code `16#174`:
+
+```erlang
+case quic_h3:connect(Host, Port, #{sync => true}) of
+    {ok, Conn} -> {ok, Conn};
+    {error, {peer_closed, transport, 16#174, _, _}} -> {error, client_cert_required};
+    {error, Reason} -> {error, Reason}
+end.
+```
+
+Without `sync`, a close that arrives once `connect/3` has returned
+reaches you as `{quic_h3, Conn, {closed, Reason}}`.
+
 #### request/2, request/3
 
 Send an HTTP request.

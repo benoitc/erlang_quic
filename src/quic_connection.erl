@@ -514,8 +514,8 @@ set_owner(_Conn, _NewOwner) ->
 
 %% @doc Set new owner process (synchronous).
 %% Use this when you need to ensure ownership is transferred before continuing.
-%% A connection that is already draining or closed refuses the swap with
-%% `{error, {invalid_state, StateName}}'.
+%% A connection that is closing or gone refuses the swap with
+%% `{error, closed}'; its owner has been sent `{quic, Conn, {closed, Reason}}'.
 -spec set_owner_sync(pid(), pid()) -> ok | {error, term()}.
 set_owner_sync(Conn, NewOwner) when is_pid(NewOwner) ->
     call(Conn, {set_owner, NewOwner});
@@ -2337,6 +2337,9 @@ draining(
     {keep_state, State#state{timer_ref = TimerRef}};
 draining({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {draining, state_to_map(State)}}]};
+%% The same answer as once the process is gone; the owner was told why.
+draining({call, From}, {set_owner, _NewOwner}, State) ->
+    {keep_state, State, [{reply, From, {error, closed}}]};
 draining(info, drain_timeout, State) ->
     {next_state, closed, State};
 draining(info, {udp, _Socket, IP, Port, _Data}, State) ->

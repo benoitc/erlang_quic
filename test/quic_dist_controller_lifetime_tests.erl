@@ -71,9 +71,47 @@ a_transport_error_fails_the_pending_read_test() ->
     ?assertEqual({ok, {error, closed}}, wait_read(Reader, 2000)),
     stop_conn(Conn).
 
+%% The listener made the server controller the owner before the first
+%% packet. A peer that closes right away leaves a connection that refuses
+%% any further swap; the controller must start all the same.
+a_server_controller_starts_on_a_closed_connection_test() ->
+    Conn = spawn(fun closed_conn_loop/0),
+    Trap = process_flag(trap_exit, true),
+    try
+        {ok, Ctrl} = quic_dist_controller:start_link(Conn, server, undefined),
+        ?assertEqual(ok, wait_state(Ctrl, handshaking, 2000)),
+        ?assertEqual([], [E || {'EXIT', Pid, _} = E <- flush(), Pid =:= Ctrl]),
+        unlink(Ctrl),
+        exit(Ctrl, kill)
+    after
+        process_flag(trap_exit, Trap),
+        Conn ! stop
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
+
+flush() ->
+    receive
+        Msg -> [Msg | flush()]
+    after 0 -> []
+    end.
+
+%% A connection the peer has closed: it refuses a new owner.
+closed_conn_loop() ->
+    receive
+        {'$gen_call', From, {set_owner, _}} ->
+            gen_statem:reply(From, {error, closed}),
+            closed_conn_loop();
+        {'$gen_call', From, _Other} ->
+            gen_statem:reply(From, ok),
+            closed_conn_loop();
+        stop ->
+            ok;
+        _ ->
+            closed_conn_loop()
+    end.
 
 %% A controller in `handshaking', the state the dist handshake runs in,
 %% over a connection stub that answers the calls a controller makes and
