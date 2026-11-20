@@ -94,6 +94,41 @@ The implementation is organized into the following module groups:
 - **draining**: Connection closing, processing remaining packets
 - **closed**: Connection terminated
 
+## Connection Ownership
+
+A connection sends its events, `{quic, Conn, _}`, to one process, its
+owner. Ownership often moves while the connection is being set up, and
+the peer can close the connection during that move. Read this before
+you change any code that calls `quic:set_owner_sync/2`.
+
+Two rules make a move safe:
+
+- The connection tells its owner `{quic, Conn, {closed, Reason}}` when
+  it starts closing, before it answers any later call. If a swap fails,
+  the close reason is already in the old owner's mailbox.
+- A connection that is closing (`draining`) or gone refuses a new owner
+  with `{error, closed}`. Nothing is sent to the process that would have
+  become the owner.
+
+So the process that tried the swap still owns the connection's last
+words: it takes the close reason from its own mailbox and reports it.
+It must not treat the refusal as a crash, and must not hand back a
+connection that has already closed.
+
+Where ownership moves:
+
+| Path | Code | Tests |
+|---|---|---|
+| A listener's `connection_handler` returns the owner, set before the first packet | `quic_listener`, in `assign_owner` | `quic_listener_tests` |
+| HTTP/3 client and server give the connection to the HTTP/3 process | `quic_h3_connection:take_over/2`, called from `quic_h3` | `quic_h3_connect_closed_tests`, `quic_h3_connect_race_tests` |
+| Happy Eyeballs hands the winning attempt to the caller's owner | `quic_happy`, in `on_connected` | `quic_happy_owner_error_tests` |
+| The dist client controller takes its connection in `init/1` | `quic_dist_controller:init/1` | `quic_dist_auth_gate_tests` |
+
+Events the connection sent to the old owner before the swap stay in
+that owner's mailbox. The HTTP/3 and Happy Eyeballs paths forward them
+to the new owner in order, skipping `{connected, _}`, which the swap
+sends again itself.
+
 ## Packet Processing
 
 ### Encryption Levels

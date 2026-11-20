@@ -110,7 +110,7 @@ change. Docs and CHANGELOG entries go in the same pull request.
 
 The specs erlang_quic implements, at the version the code follows. Where a
 newer one exists it is listed under [Pending updates](#pending-updates).
-Last checked: 2026-11-19.
+Last checked: 2026-11-20.
 
 ### QUIC
 
