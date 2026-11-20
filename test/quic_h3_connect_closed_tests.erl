@@ -14,8 +14,8 @@
 -include_lib("public_key/include/public_key.hrl").
 
 -define(CERTIFICATE_REQUIRED, 16#174).
-%% One address: Happy Eyeballs would race ::1 too, and its timeout is
-%% not what these tests are about.
+%% One address, so the tests do not depend on how the host resolves
+%% `localhost'.
 -define(HOST, <<"127.0.0.1">>).
 
 closed_before_hand_off_test_() ->

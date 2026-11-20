@@ -17,6 +17,12 @@ All notable changes to this project will be documented in this file.
   Depending on timing the caller got `{error, _}`, crashed, or waited
   until `connect_timeout`. It now always returns `{error, Reason}` with
   the reason the server closed with.
+- With a host name that resolves to several addresses, `quic:connect/4`
+  could return `{error, connect_timeout}` after the full timeout when
+  the server completed the handshake and closed the connection at once.
+  It now returns the reason the server closed with: the attempt whose
+  handshake completed has won the race (RFC 8305 Section 5), and the
+  other attempts are no longer waited for.
 - An HTTP/3 server no longer logs a crash for each client it refuses
   right after the handshake.
 - An HTTP/3 server declines a connection that closed before it was

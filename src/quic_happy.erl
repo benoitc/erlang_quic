@@ -242,9 +242,9 @@ buffer_owner_msg(#{attempts := Attempts, backlog := Backlog} = St, Pid, Msg) ->
 %% (re-delivers {connected}); the remaining attempts are still owned by this
 %% coordinator and self-close on owner-DOWN when we exit below.
 on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, _Info) ->
-    %% set_owner_sync is a gen_statem:call; a winner that died between
-    %% {connected} and here raises, one that started closing returns an
-    %% error, and either way we continue the race.
+    %% set_owner_sync is a gen_statem:call. A winner that crashed between
+    %% {connected} and here raises, and the race goes on. One the server
+    %% closed returns an error, and the race is over.
     try quic_connection:set_owner_sync(Pid, Owner) of
         ok ->
             %% The connection handshaked while we owned it, so any peer data
@@ -258,10 +258,22 @@ on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, 
             Caller ! {quic_happy_result, self(), {ok, Pid}},
             ok;
         {error, Reason} ->
-            loop(drop_attempt(note_error(St, Pid, Reason), Pid))
+            %% Its handshake completed, so it won (RFC 8305 Section 5); the
+            %% server closed it before the hand-off. Its close is the result,
+            %% and the other attempts close as we exit.
+            finish(St, {error, close_reason(Pid, Reason)})
     catch
         _:_ ->
             loop(drop_attempt(St, Pid))
+    end.
+
+%% Why the connection closed, from what it sent us, its owner.
+close_reason(Conn, Reason) ->
+    receive
+        {quic, Conn, {closed, Closed}} -> close_reason(Conn, Closed);
+        {quic, Conn, _} -> close_reason(Conn, Reason)
+    after 0 ->
+        Reason
     end.
 
 %% Drain this process's mailbox of `{quic, Conn, _}' messages and forward them
