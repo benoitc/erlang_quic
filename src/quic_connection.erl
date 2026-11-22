@@ -5713,10 +5713,13 @@ handle_packet_loop(Data, State) ->
             %% keys yet, the level cannot have been discarded.
             maybe_reenable_socket(State),
             keep_early_packet(no_handshake_keys, Data, State);
-        {error, no_handshake_keys} ->
-            %% A late Handshake packet after those keys were discarded,
-            %% which RFC 9001 Section 4.9.2 says to drop. The packets
-            %% coalesced after it are still read (RFC 9000 Section 12.2).
+        {error, Reason} when
+            Reason =:= no_initial_keys; Reason =:= no_handshake_keys; Reason =:= no_early_keys
+        ->
+            %% A packet for keys that are gone or never came, which RFC 9001
+            %% Section 4.9 says to drop: a late Initial or Handshake packet,
+            %% or a 0-RTT packet without 0-RTT keys. The packets coalesced
+            %% after it are still read (RFC 9000 Section 12.2).
             handle_packet_loop(next_coalesced_packet(Data), State);
         {error, Reason} ->
             %% Log decryption failure for debugging. Include the packet
@@ -6023,7 +6026,7 @@ handle_first_version_negotiation(_DCID, _SCID, VersionsBin, #state{version = Our
             %% Nothing to negotiate down to: this build speaks version 1
             %% only. Abandon the connection with the offered list rather
             %% than retransmitting the Initial until the timeout.
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => version_negotiation, ours => Ours, offered => Versions},
                 ?QUIC_LOG_META
             ),
@@ -6652,7 +6655,7 @@ decode_and_process_streaming(Level, Plaintext, State) ->
 
 decode_and_process_streaming(Level, <<>>, State, []) ->
     %% RFC 9000 Section 12.4: a packet with zero frames is a PROTOCOL_VIOLATION.
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{what => packet_with_no_frames, level => Level}, ?QUIC_LOG_META
     ),
     NewState = close_with_error(
@@ -6670,7 +6673,7 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
     case decode_frame(Data) of
         {error, {unknown_frame_type, Type}} ->
             %% RFC 9000 Section 12.4: unknown frame type is FRAME_ENCODING_ERROR.
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => unknown_frame_type, type => Type, level => Level}, ?QUIC_LOG_META
             ),
             ReasonBin = list_to_binary(io_lib:format("unknown frame type 0x~.16b", [Type])),
@@ -6686,7 +6689,7 @@ decode_and_process_streaming(Level, Data, State, Acc) ->
         {error, Reason} ->
             %% RFC 9000 §12.4: a malformed/truncated frame from an
             %% (authenticated) peer is a FRAME_ENCODING_ERROR, not a drop.
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => frame_decode_error, reason => Reason, level => Level}, ?QUIC_LOG_META
             ),
             NewState = close_with_error(
@@ -7013,7 +7016,7 @@ process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = client}} = Stat
     maybe_probe_preferred_address(confirm_handshake(clear_hs_flight(State0)));
 process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = server}} = State) ->
     %% RFC 9000 §19.20: clients MUST NOT send HANDSHAKE_DONE.
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{what => invalid_handshake_done_frame, reason => server_received}, ?QUIC_LOG_META
     ),
     close_with_error(
@@ -7026,7 +7029,7 @@ process_frame(app, handshake_done, #state{cfg = #conn_cfg{role = server}} = Stat
     );
 process_frame(Level, handshake_done, State) when Level =/= app ->
     %% RFC 9000 §19.20: HANDSHAKE_DONE MUST be sent in a 1-RTT packet.
-    ?LOG_WARNING(#{what => invalid_handshake_done_level, level => Level}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => invalid_handshake_done_level, level => Level}, ?QUIC_LOG_META),
     close_with_error(
         level_for_close(Level),
         transport,
@@ -7053,7 +7056,7 @@ process_frame(app, {max_data, MaxData}, #state{max_data_remote = Current} = Stat
     end;
 process_frame(Level, {max_data, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_DATA only allowed in 1-RTT packets
-    ?LOG_WARNING(#{what => invalid_max_data_level, level => Level}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => invalid_max_data_level, level => Level}, ?QUIC_LOG_META),
     close_with_error(
         Level,
         transport,
@@ -7121,7 +7124,7 @@ process_frame(
     end;
 process_frame(Level, {max_stream_data, _, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAM_DATA only allowed in 1-RTT packets
-    ?LOG_WARNING(#{what => invalid_max_stream_data_level, level => Level}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => invalid_max_stream_data_level, level => Level}, ?QUIC_LOG_META),
     close_with_error(
         Level,
         transport,
@@ -7154,7 +7157,7 @@ process_frame(app, {max_streams, uni, Max}, #state{max_streams_uni_remote = Curr
     end;
 process_frame(Level, {max_streams, Dir, _}, State) when Level =/= app ->
     %% Protocol violation: MAX_STREAMS only allowed in 1-RTT packets
-    ?LOG_WARNING(#{what => invalid_max_streams_level, level => Level}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => invalid_max_streams_level, level => Level}, ?QUIC_LOG_META),
     FrameType =
         case Dir of
             bidi -> ?FRAME_MAX_STREAMS_BIDI;
@@ -7224,7 +7227,7 @@ process_frame(
             ExistingFinalSize =/= undefined andalso ExistingFinalSize =/= FinalSize
         ->
             %% FINAL_SIZE_ERROR: RESET_STREAM has different final size than previously known
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{
                     what => final_size_error,
                     stream_id => StreamId,
@@ -7474,7 +7477,7 @@ process_frame(app, {data_blocked, _Limit}, State) ->
     State;
 process_frame(Level, {data_blocked, _}, State) when Level =/= app ->
     %% Protocol violation: DATA_BLOCKED only allowed in 1-RTT packets
-    ?LOG_WARNING(#{what => invalid_data_blocked_level, level => Level}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => invalid_data_blocked_level, level => Level}, ?QUIC_LOG_META),
     close_with_error(
         Level,
         transport,
@@ -7907,7 +7910,7 @@ buffer_crypto_data(Level, Offset, Data, State) ->
             (gb_trees:size(Buffer) >= ?MAX_CRYPTO_BUFFER_ENTRIES),
     case Overflow of
         true ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{
                     what => crypto_buffer_exceeded,
                     level => LevelAtom,
@@ -8243,7 +8246,7 @@ process_tls_message(
                     notify_owner({error, {tls_alert, illegal_parameter}}, State),
                     send_tls_alert(?TLS_ALERT_ILLEGAL_PARAMETER, State);
                 {error, Reason} ->
-                    ?LOG_WARNING(
+                    ?LOG_DEBUG(
                         #{what => psk_not_selected, reason => Reason},
                         ?QUIC_LOG_META
                     ),
@@ -8845,13 +8848,13 @@ process_tls_message(
                 false ->
                     %% Signature verification failed - send TLS decrypt_error alert
                     %% RFC 9846 Section 4.5.2: decrypt_error (51) for signature verification failure
-                    ?LOG_ERROR(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
+                    ?LOG_DEBUG(#{what => client_cert_verify_failed}, ?QUIC_LOG_META),
                     send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
             end
     end;
 process_tls_message(_Level, Type, _Body, _OriginalMsg, State) ->
     %% A message the handshake is not waiting for (RFC 9846 Section 4).
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{what => unexpected_tls_message, type => Type, tls_state => (State#state.hs)#hs.tls_state},
         ?QUIC_LOG_META
     ),
@@ -8877,7 +8880,7 @@ server_certificate(Certs, Transcript, State) ->
     case (State#state.cfg)#conn_cfg.verify andalso (PeerCert =:= undefined) of
         true ->
             %% verify enabled but server sent no certificate.
-            ?LOG_ERROR(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => server_sent_no_certificate}, ?QUIC_LOG_META),
             notify_owner({error, {certificate_invalid, no_certificate}}, State1),
             send_tls_alert(?TLS_ALERT_CERTIFICATE_REQUIRED, State1);
         false ->
@@ -8911,7 +8914,7 @@ server_certificate_verify(Alg, Body, OriginalMsg, State) ->
 %% Section 6.2).
 refuse_message(Reason, State) ->
     {Code, Name} = parse_alert(Reason),
-    ?LOG_WARNING(#{what => tls_message_refused, reason => Reason}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => tls_message_refused, reason => Reason}, ?QUIC_LOG_META),
     case (State#state.cfg)#conn_cfg.role of
         client -> notify_owner({error, {tls_alert, Name}}, State);
         server -> ok
@@ -9075,7 +9078,7 @@ do_server_client_hello_cont(
                                     end,
                                 {EK, ES, Selected};
                             bad_binder ->
-                                ?LOG_WARNING(
+                                ?LOG_DEBUG(
                                     #{what => resumption_psk_binder_failed},
                                     ?QUIC_LOG_META
                                 ),
@@ -9094,7 +9097,7 @@ do_server_client_hello_cont(
                 %% here is impossible because the case can't
                 %% produce a valid tuple. Elvis prefers exit
                 %% over throw.
-                ?LOG_WARNING(
+                ?LOG_DEBUG(
                     #{what => psk_binder_verification_failed},
                     ?QUIC_LOG_META
                 ),
@@ -9108,7 +9111,7 @@ do_server_client_hello_cont(
         case quic_crypto:server_key_exchange(SelectedGroup, ClientPubKey) of
             {error, illegal_parameter} ->
                 %% Client share doesn't fit the group it named.
-                ?LOG_WARNING(
+                ?LOG_DEBUG(
                     #{what => bad_key_share, group => SelectedGroup},
                     ?QUIC_LOG_META
                 ),
@@ -9253,7 +9256,7 @@ run_alpn_handler(ALPN, #state{cfg = #conn_cfg{alpn_handler = Fn}} = State) ->
         {ok, Owner} when is_pid(Owner) ->
             {ok, held_by_handler(reown(State, Owner))};
         Other ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => alpn_handler_rejected, alpn => ALPN, result => Other},
                 ?QUIC_LOG_META
             ),
@@ -9316,7 +9319,7 @@ resolve_server_cert(ClientHelloInfo, #state{cfg = #conn_cfg{sni_callback = Fn}} 
                 }
             }};
         Other ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => sni_callback_rejected, server_name => ServerName, result => Other},
                 ?QUIC_LOG_META
             ),
@@ -9499,7 +9502,7 @@ process_stream_data(StreamId, Offset, Data, Fin, State) ->
     %% Cannot receive on locally-initiated unidirectional streams
     case validate_receive_stream(StreamId, Role) of
         {error, Reason} ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => invalid_receive_stream, stream_id => StreamId, reason => Reason},
                 ?QUIC_LOG_META
             ),
@@ -9555,7 +9558,7 @@ process_stream_data_validated(StreamId, Offset, Data, Fin, State) ->
 %% Close the connection with STREAM_STATE_ERROR for a frame that references a
 %% stream in a way the peer is not allowed to.
 stream_state_error_close(StreamId, Reason, State) ->
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{what => stream_state_error, stream_id => StreamId, reason => Reason}, ?QUIC_LOG_META
     ),
     close_with_transport_error(?QUIC_STREAM_STATE_ERROR, Reason, State).
@@ -9708,7 +9711,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
     case {EndOffset > RecvMaxData, DataReceived + NewBytes > MaxDataLocal, BufferOverflow} of
         {true, _, _} ->
             %% Stream-level flow control violation - RFC 9000 Section 4.1
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{
                     what => stream_flow_control_violation,
                     stream_id => StreamId,
@@ -9723,7 +9726,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             );
         {_, true, _} ->
             %% Connection-level flow control violation - RFC 9000 Section 4.1
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{
                     what => connection_flow_control_violation,
                     recv => DataReceived + NewBytes,
@@ -9737,7 +9740,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
             );
         {_, _, true} ->
             %% Receive buffer overflow - malicious peer sending too much out-of-order data
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{
                     what => recv_buffer_overflow,
                     stream_id => StreamId,
@@ -9763,7 +9766,7 @@ process_stream_data_slow(StreamId, Offset, Data, Fin, State) ->
 
             case FinalSizeError of
                 true ->
-                    ?LOG_WARNING(
+                    ?LOG_DEBUG(
                         #{
                             what => final_size_error,
                             stream_id => StreamId,
@@ -11554,7 +11557,7 @@ exceeds_stream_limit(StreamId, State) ->
     end.
 
 stream_limit_close(State) ->
-    ?LOG_WARNING(#{what => stream_limit_exceeded}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => stream_limit_exceeded}, ?QUIC_LOG_META),
     close_with_transport_error(
         ?QUIC_STREAM_LIMIT_ERROR, <<"stream limit exceeded">>, State
     ).
@@ -14043,7 +14046,7 @@ verify_server_authentication(Body, TranscriptHash, Advance, State) ->
                 ok ->
                     Advance;
                 {error, Reason} ->
-                    ?LOG_ERROR(
+                    ?LOG_DEBUG(
                         #{what => server_cert_invalid, reason => Reason}, ?QUIC_LOG_META
                     ),
                     notify_owner({error, {certificate_invalid, Reason}}, State),
@@ -14054,7 +14057,7 @@ verify_server_authentication(Body, TranscriptHash, Advance, State) ->
                     send_tls_alert(cert_alert_code(Reason), State)
             end;
         false ->
-            ?LOG_ERROR(#{what => server_cert_verify_failed}, ?QUIC_LOG_META),
+            ?LOG_DEBUG(#{what => server_cert_verify_failed}, ?QUIC_LOG_META),
             notify_owner({error, {certificate_invalid, bad_signature}}, State),
             notify_owner({closed, {certificate_invalid, bad_signature}}, State),
             send_tls_alert(?TLS_ALERT_DECRYPT_ERROR, State)
@@ -14064,7 +14067,7 @@ verify_server_authentication(Body, TranscriptHash, Advance, State) ->
 %% rejects a server one: tell the owner synchronously so a caller waiting on
 %% `{closed, _}' fails fast, then send the matching TLS alert.
 reject_client_cert(Reason, State) ->
-    ?LOG_ERROR(#{what => client_cert_invalid, reason => Reason}, ?QUIC_LOG_META),
+    ?LOG_DEBUG(#{what => client_cert_invalid, reason => Reason}, ?QUIC_LOG_META),
     notify_owner({error, {certificate_invalid, Reason}}, State),
     notify_owner({closed, {certificate_invalid, Reason}}, State),
     send_tls_alert(cert_alert_code(Reason), State).
@@ -17517,7 +17520,7 @@ apply_peer_transport_params(TransportParams, State) ->
             State1 = apply_peer_transport_params_internal(TransportParams, State),
             maybe_notify_streams_available(uni, maybe_notify_streams_available(bidi, State1));
         {error, Reason} ->
-            ?LOG_ERROR(
+            ?LOG_DEBUG(
                 #{what => transport_parameter_validation_failed, reason => Reason},
                 ?QUIC_LOG_META
             ),

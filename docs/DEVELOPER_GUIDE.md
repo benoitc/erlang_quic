@@ -420,6 +420,12 @@ logger:set_module_level(quic_connection, debug).
 logger:set_module_level(quic_crypto, debug).
 ```
 
+A peer that is refused (a certificate that does not verify, a connection
+your `connection_handler`, `sni_callback` or `alpn_handler` declines) or
+that breaks the protocol is logged at debug level, with the reason, so
+peers cannot fill your logs. The owner still receives the error. To see
+these reports, enable debug for `quic_connection` and `quic_listener`.
+
 ## Best Practices
 
 1. **Always handle connection close events** - Connections can close at any time

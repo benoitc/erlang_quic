@@ -1379,7 +1379,7 @@ check_dialed_node(undefined, _Node, _Conn) ->
 check_dialed_node(Node, Node, _Conn) ->
     ok;
 check_dialed_node(AuthNode, Node, Conn) ->
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{
             what => dist_auth_identity_mismatch,
             conn => Conn,

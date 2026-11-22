@@ -209,13 +209,15 @@ identity_run(Config, Tag, Probe, ServerSees, ClientSees) ->
     ct:log("identity run: ~p", [Out]),
     {Target, consult_or_empty(NodeupFile), Out}.
 
-%% quic logs under its own domain, which the default handler drops, so
-%% each node also gets a handler that writes its reports to File.
+%% Refusals are logged at debug, so each node lets debug events through,
+%% keeps the default handler at notice, and writes its reports to File.
 event_log_args(File) ->
-    Handler = io_lib:format(
-        "[{handler,qauth_events,quic_dist_auth_test_cb,#{config=>#{file=>~p}}}]", [File]
+    Handlers = io_lib:format(
+        "[{handler,default,logger_std_h,#{level=>notice}},"
+        "{handler,qauth_events,quic_dist_auth_test_cb,#{config=>#{file=>~p}}}]",
+        [File]
     ),
-    ["-kernel", "logger", lists:flatten(Handler)].
+    ["-kernel", "logger_level", "debug", "-kernel", "logger", lists:flatten(Handlers)].
 
 consult_or_empty(File) ->
     case file:consult(File) of

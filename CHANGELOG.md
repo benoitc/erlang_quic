@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- A server that requires client certificates logged an error for every
+  client it refused, and a client logged one for every server
+  certificate it refused. Any peer could fill the logs at the rate it
+  can open handshakes. A refused peer, a connection the application
+  declines and a peer that breaks the protocol are now logged at debug
+  level, with the reason; the owner still receives the error.
+- A client logged a warning for the close a refusing server sends in an
+  Initial packet after the client has dropped its Initial keys, and a
+  server for 0-RTT packets it has no keys for. RFC 9001 Section 4.9 says
+  to drop these packets, and they are now dropped without a warning.
+
 ## [3.3.1] - 2026-11-22
 
 ### Fixed
