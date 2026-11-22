@@ -327,6 +327,17 @@ statem_opts(Opts) ->
         N when is_integer(N), N >= 0 -> [{spawn_opt, [{fullsweep_after, N}]} | Hibernate]
     end.
 
+%% Set here and not as a spawn option: spawn_opt drops min_bin_vheap_size
+%% when no other heap option comes with it (erlang/otp#11840).
+set_min_bin_vheap_size(Opts) ->
+    case maps:get(min_bin_vheap_size, Opts, undefined) of
+        undefined ->
+            ok;
+        N when is_integer(N), N >= 0 ->
+            _ = process_flag(min_bin_vheap_size, N),
+            ok
+    end.
+
 %% @doc Send data on a stream.
 -spec send_data(pid(), non_neg_integer(), iodata(), boolean()) ->
     ok | {error, term()}.
@@ -718,6 +729,7 @@ callback_mode() ->
 
 init([Host, Port, Opts, Owner, Socket]) ->
     process_flag(trap_exit, true),
+    set_min_bin_vheap_size(Opts),
 
     %% Generate connection IDs
     SCID = generate_connection_id(),
@@ -762,6 +774,7 @@ init([Host, Port, Opts, Owner, Socket]) ->
 %% Server-side initialization
 init({server, Opts}) ->
     process_flag(trap_exit, true),
+    set_min_bin_vheap_size(Opts),
 
     %% Extract required options
     Socket = maps:get(socket, Opts),

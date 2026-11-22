@@ -12,6 +12,15 @@ All notable changes to this project will be documented in this file.
   ignored the stream and never saw the server's SETTINGS. The connection
   now reaches its new owner with its events in the order they were
   received.
+### Added
+- `min_bin_vheap_size` connection option, set on the connection process
+  as its process flag of the same name. Unset, the VM default applies as
+  before. A connection with a deep send queue keeps far more off-heap
+  binary data alive than the default of 46422 words, and then spends
+  every other garbage collection on a major one that frees nothing
+  (erlang/otp#11841). With `2097152` a server streaming 4 KiB messages
+  on 64 streams over loopback sent about 30% more messages per second
+  (#607).
 
 ## [3.3.0] - 2026-11-20
 

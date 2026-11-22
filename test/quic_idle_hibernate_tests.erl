@@ -84,6 +84,26 @@ fullsweep_after_reaches_the_connection_process_test_() ->
         end)
     end}.
 
+%% The VM rounds the size up to the next one in its heap size series.
+min_bin_vheap_size_reaches_the_connection_process_test_() ->
+    {timeout, 30, fun() ->
+        with_connection(#{min_bin_vheap_size => 2097152}, fun(Conn) ->
+            {garbage_collection, GC} = process_info(Conn, garbage_collection),
+            ?assert(proplists:get_value(min_bin_vheap_size, GC) >= 2097152)
+        end)
+    end}.
+
+min_bin_vheap_size_defaults_to_the_vm_default_test_() ->
+    {timeout, 30, fun() ->
+        with_connection(#{}, fun(Conn) ->
+            {garbage_collection, GC} = process_info(Conn, garbage_collection),
+            ?assertEqual(
+                element(2, erlang:system_info(min_bin_vheap_size)),
+                proplists:get_value(min_bin_vheap_size, GC)
+            )
+        end)
+    end}.
+
 %% Echo enough data to leave real garbage on the heap, and report the
 %% largest heap seen while it was in flight. A single sample taken once
 %% the echo has arrived can be a heap that already collapsed: the transfer
