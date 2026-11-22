@@ -400,29 +400,15 @@ prime(Conn) ->
 %% reason, `closed' when it gave none.
 -spec take_over(pid(), pid()) -> ok | {error, term()}.
 take_over(QuicConn, Conn) ->
-    case quic:set_owner_sync(QuicConn, Conn) of
+    %% The connection can already be delivering: the server's control
+    %% stream may be half in the caller's mailbox. hand_over/3 gets Conn
+    %% that half before the rest.
+    case quic_connection:hand_over(QuicConn, Conn, []) of
         ok ->
-            %% With Happy Eyeballs the connection can already be `connected',
-            %% so the server's control stream and SETTINGS may have reached
-            %% the caller, its owner until now. set_owner_sync re-delivers
-            %% {connected} but not that backlog, so forward it in order.
-            forward_quic_backlog(QuicConn, Conn);
+            ok;
         {error, Reason} ->
             stop_unlinked(Conn),
             {error, close_reason(QuicConn, Reason)}
-    end.
-
-%% Drain the caller's `{quic, QuicConn, _}' messages to Conn in arrival
-%% order, skipping {connected}, which set_owner already re-delivered.
-forward_quic_backlog(QuicConn, Conn) ->
-    receive
-        {quic, QuicConn, {connected, _}} ->
-            forward_quic_backlog(QuicConn, Conn);
-        {quic, QuicConn, _} = Msg ->
-            Conn ! Msg,
-            forward_quic_backlog(QuicConn, Conn)
-    after 0 ->
-        ok
     end.
 
 %% Why the connection closed, from what it sent the caller, which drops

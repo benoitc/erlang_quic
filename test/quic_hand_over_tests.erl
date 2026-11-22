@@ -12,6 +12,7 @@
 -module(quic_hand_over_tests).
 
 -include_lib("eunit/include/eunit.hrl").
+-include_lib("public_key/include/public_key.hrl").
 
 %% An address nothing answers on: the connection stays in the handshake.
 -define(DEAD, {{127, 0, 0, 1}, 1}).
@@ -110,6 +111,141 @@ the_winner_reaches_its_owner_in_order_test_() ->
     end}.
 
 %%====================================================================
+%% HTTP/3: the caller hands the connection to the HTTP/3 process
+%%====================================================================
+
+%% The caller already holds the start of the server's control stream.
+take_over_keeps_the_callers_events_first_test_() ->
+    {timeout, 30, fun() ->
+        {Old, Conn} = old_owner(),
+        H3 = collector(),
+        Old ! {quic, Conn, ?HELD},
+        slow_old_owner(Conn, Old, 100),
+        Old ! {take_over, H3},
+        ok = wait_for(H3, fun(Ms) -> length(from(Conn, Ms)) >= 2 end),
+        ?assertMatch(
+            [{quic, Conn, ?HELD}, {quic, Conn, send_ready} | _], from(Conn, collected(H3))
+        ),
+        quic:safe_close(Conn)
+    end}.
+
+%% The server sends its control stream type byte, then SETTINGS 50 ms
+%% later. The type byte is with the caller when it hands the connection
+%% over, and the caller is held up for 100 ms right after: SETTINGS must
+%% still reach the HTTP/3 process after the type byte, or it ignores the
+%% stream and connect/3 times out.
+h3_connect_reads_the_control_stream_in_order_test_() ->
+    {timeout, 30, fun() ->
+        {ok, _} = application:ensure_all_started(quic),
+        {Cert, Key} = server_creds(),
+        Name = list_to_atom("hand_over_h3_" ++ integer_to_list(erlang:unique_integer([positive]))),
+        {ok, _} = quic:start_server(Name, 0, #{
+            cert => Cert,
+            key => Key,
+            alpn => [<<"h3">>],
+            connection_handler => fun(Conn) -> {ok, spawn(fun() -> h3_server(Conn) end)} end
+        }),
+        {ok, Port} = quic:get_server_port(Name),
+        ok = meck:new(quic, [passthrough]),
+        try
+            meck:expect(quic, connect, fun(Host, P, Opts, Owner) ->
+                {ok, Conn} = meck:passthrough([Host, P, Opts, Owner]),
+                ok = wait_type_byte(Conn, 5000),
+                _ = slow_old_owner(Conn, self(), 100, none),
+                {ok, Conn}
+            end),
+            {Result, Settings} = h3_connect(Port),
+            ?assertMatch({ok, _}, Result),
+            ?assert(is_map(Settings))
+        after
+            meck:unload(quic),
+            quic:stop_server(Name)
+        end
+    end}.
+
+h3_connect(Port) ->
+    Test = self(),
+    {Pid, MRef} = spawn_monitor(fun() ->
+        R = quic_h3:connect(<<"127.0.0.1">>, Port, #{
+            sync => true, verify => verify_none, connect_timeout => 1000
+        }),
+        Settings =
+            case R of
+                {ok, H} -> quic_h3_connection:get_peer_settings(H);
+                _ -> undefined
+            end,
+        Test ! {self(), R, Settings},
+        receive
+            stop -> ok
+        end
+    end),
+    receive
+        {Pid, R, Settings} ->
+            erlang:demonitor(MRef, [flush]),
+            Pid ! stop,
+            {R, Settings};
+        {'DOWN', MRef, process, Pid, Reason} ->
+            {{crashed, Reason}, undefined}
+    after 10000 ->
+        exit(Pid, kill),
+        {timeout, undefined}
+    end.
+
+%% The first flight of an HTTP/3 server, with SETTINGS held back 50 ms.
+h3_server(Conn) ->
+    receive
+        {quic, Conn, {connected, _}} -> ok
+    after 5000 -> exit(no_connect)
+    end,
+    {ok, Ctrl} = quic:open_unidirectional_stream(Conn),
+    ok = quic:send_data(Conn, Ctrl, quic_h3_frame:encode_stream_type(control), false),
+    {ok, Enc} = quic:open_unidirectional_stream(Conn),
+    ok = quic:send_data(Conn, Enc, quic_h3_frame:encode_stream_type(qpack_encoder), false),
+    {ok, Dec} = quic:open_unidirectional_stream(Conn),
+    ok = quic:send_data(Conn, Dec, quic_h3_frame:encode_stream_type(qpack_decoder), false),
+    timer:sleep(50),
+    Settings = quic_h3_frame:encode_settings(quic_h3_frame:default_settings()),
+    ok = quic:send_data(Conn, Ctrl, Settings, false),
+    h3_server_loop(Conn).
+
+h3_server_loop(Conn) ->
+    receive
+        {quic, Conn, {closed, _}} -> ok;
+        _ -> h3_server_loop(Conn)
+    after 10000 -> ok
+    end.
+
+%% Looks without taking: the hand-off must find the type byte.
+wait_type_byte(_Conn, Left) when Left =< 0 ->
+    timeout;
+wait_type_byte(Conn, Left) ->
+    {messages, Msgs} = process_info(self(), messages),
+    case [x || {quic, C, {stream_data, 3, <<0>>, _}} <- Msgs, C =:= Conn] of
+        [_ | _] ->
+            ok;
+        [] ->
+            timer:sleep(1),
+            wait_type_byte(Conn, Left - 1)
+    end.
+
+server_creds() ->
+    #{server_config := S} = public_key:pkix_test_data(#{
+        server_chain => chain([{dNSName, "localhost"}]),
+        client_chain => chain([{dNSName, "client.example"}])
+    }),
+    {KeyType, KeyDer} = proplists:get_value(key, S),
+    {proplists:get_value(cert, S), public_key:der_decode(KeyType, KeyDer)}.
+
+chain(SanNames) ->
+    Key = {key, {namedCurve, secp256r1}},
+    San = #'Extension'{
+        extnID = ?'id-ce-subjectAltName', critical = false, extnValue = SanNames
+    },
+    %% The default digest is SHA-1, which TLS 1.3 refuses.
+    Digest = {digest, sha256},
+    #{root => [Key, Digest], intermediates => [], peer => [Key, Digest, {extensions, [San]}]}.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -132,6 +268,9 @@ old_owner_loop(Conn) ->
     receive
         {hand_over, New} ->
             _ = quic_connection:hand_over(Conn, New, []),
+            old_owner_loop(Conn);
+        {take_over, H3} ->
+            _ = quic_h3_connection:take_over(Conn, H3),
             old_owner_loop(Conn)
     end.
 
