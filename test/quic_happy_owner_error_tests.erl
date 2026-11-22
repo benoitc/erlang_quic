@@ -1,7 +1,7 @@
 %%% -*- erlang -*-
 %%%
 %%% A winning attempt that is already closing when the coordinator hands
-%%% it over makes set_owner_sync/2 return an error. The coordinator does
+%%% it over makes hand_over/3 return an error. The coordinator does
 %%% not crash on a try_clause (#399), and the race ends with the reason
 %%% the server closed the winner with: its handshake completed, so it won
 %%% (RFC 8305 Section 5), and the other attempts are not waited for.
@@ -58,13 +58,13 @@ closed_connection(Coord, Closed) ->
     timer:sleep(400),
     Coord ! {quic, self(), {connected, #{}}},
     receive
-        {'$gen_call', From, {set_owner, _}} ->
+        {'$gen_call', From, {hand_over, _}} ->
             Coord ! {quic, self(), {closed, Closed}},
             gen_statem:reply(From, {error, closed})
     after 5000 -> ok
     end.
 
-%% Answers the coordinator's set_owner_sync/2 as a draining connection does.
+%% Answers the coordinator's hand_over/3 as a draining connection does.
 closing_connection() ->
     receive
         {'$gen_call', From, _} ->

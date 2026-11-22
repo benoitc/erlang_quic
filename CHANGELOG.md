@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- On a busy machine, `quic_h3:connect/3` with `sync => true` could fail
+  with `connect_timeout` against a server that was answering. While the
+  connection was being handed to the HTTP/3 process, part of the
+  server's control stream could arrive after the rest. The client then
+  ignored the stream and never saw the server's SETTINGS. The connection
+  now reaches its new owner with its events in the order they were
+  received.
+
 ## [3.3.0] - 2026-11-20
 
 ### Changed

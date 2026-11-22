@@ -14,7 +14,6 @@
 
 setup() ->
     meck:new(quic, [passthrough]),
-    meck:expect(quic, set_owner_sync, fun(_Conn, _NewOwner) -> ok end),
     meck:expect(quic, close, fun(_) -> ok end),
     meck:expect(quic, close, fun(_, _, _) -> ok end),
     meck:expect(quic, safe_close, fun(_) -> ok end),
@@ -78,8 +77,19 @@ stop(Pid) ->
     exit(Pid, shutdown),
     ok.
 
+%% Answers quic_connection:hand_over/3 as a connection still in its
+%% handshake does: the old owner's events go to the new one.
 fake_quic_loop() ->
     receive
-        stop -> ok;
-        _ -> fake_quic_loop()
+        stop ->
+            ok;
+        {'$gen_call', From, {hand_over, New}} ->
+            Tag = make_ref(),
+            gen_statem:reply(From, {hand_over, Tag}),
+            receive
+                {Tag, Events} -> [New ! E || E <- Events]
+            end,
+            fake_quic_loop();
+        _ ->
+            fake_quic_loop()
     end.

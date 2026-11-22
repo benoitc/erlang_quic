@@ -120,14 +120,33 @@ Where ownership moves:
 | Path | Code | Tests |
 |---|---|---|
 | A listener's `connection_handler` returns the owner, set before the first packet | `quic_listener`, in `assign_owner` | `quic_listener_tests` |
-| HTTP/3 client and server give the connection to the HTTP/3 process | `quic_h3_connection:take_over/2`, called from `quic_h3` | `quic_h3_connect_closed_tests`, `quic_h3_connect_race_tests` |
-| Happy Eyeballs hands the winning attempt to the caller's owner | `quic_happy`, in `on_connected` | `quic_happy_owner_error_tests` |
+| HTTP/3 client and server give the connection to the HTTP/3 process | `quic_h3_connection:take_over/2`, called from `quic_h3`, with `hand_over` in `quic_connection` | `quic_hand_over_tests`, `quic_h3_connect_closed_tests`, `quic_h3_connect_race_tests` |
+| Happy Eyeballs hands the winning attempt to the caller's owner | `quic_happy`, in `on_connected`, with `hand_over` in `quic_connection` | `quic_hand_over_tests`, `quic_happy_owner_error_tests` |
 | The dist client controller takes its connection in `init/1` | `quic_dist_controller:init/1` | `quic_dist_auth_gate_tests` |
 
 Events the connection sent to the old owner before the swap stay in
-that owner's mailbox. The HTTP/3 and Happy Eyeballs paths forward them
-to the new owner in order, skipping `{connected, _}`, which the swap
-sends again itself.
+that owner's mailbox. Forwarding them after `set_owner_sync/2` can put
+them out of order: from the swap on, the connection sends to the new
+owner directly, and Erlang orders messages only between one sender and
+one receiver, so a newer event can arrive ahead of an older one still
+being forwarded. A stream's bytes then reach the new owner out of order.
+
+`hand_over` in `quic_connection` moves a connection that is already
+delivering. The old owner calls it, and the connection:
+
+1. answers, then sends nothing while it waits;
+2. receives from the old owner the events it already took and those
+   left in its mailbox, in the order they arrived;
+3. sends `{connected, _}` again when connected, then those events, then
+   carries on.
+
+Every event the new owner gets comes from the connection, so the order
+holds. If the old owner dies the wait ends; if it does not answer within
+5 seconds, the connection closes with `hand_over_timeout`.
+
+The dist client needs none of this: the controller opens stream 0 after
+the swap, so nothing of the peer's dist traffic can reach the setup
+process first.
 
 ## Packet Processing
 

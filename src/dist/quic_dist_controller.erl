@@ -433,6 +433,7 @@ callback_mode() ->
 %% running a state-enter callback, so a swap made there leaves a window in
 %% which the connection still delivers to a process that has stopped
 %% reading. Swapping in `init/1' makes the setup process's drain final.
+%% The forward cannot reorder dist data: we open stream 0 after the swap.
 init({Conn, client, _Auth}) ->
     case quic:set_owner_sync(Conn, self()) of
         ok ->

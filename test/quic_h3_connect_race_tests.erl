@@ -3,16 +3,11 @@
 %%% Regression test for the HTTP/3 connect owner-transfer race.
 %%%
 %%% quic_h3:connect/3 opens the QUIC connection owned by the caller, then
-%%% transfers ownership to the H3 process via set_owner_sync/2. On fast
-%%% handshakes (localhost, low-RTT, 0-RTT) — and on the Happy Eyeballs race
-%%% path, where the connection handshakes while owned by the race
-%%% coordinator — the QUIC `connected' event and the peer's control-stream
-%%% SETTINGS arrive in the (transient) owner's mailbox before that transfer.
-%%% set_owner re-emits `connected' to the new owner but cannot replay the
-%%% already-delivered stream_data, so the H3 FSM never receives SETTINGS,
-%%% never converges, and the caller blocks until connect_timeout. connect/3
-%%% must drain and forward the leaked `{quic, QuicConn, _}' stream events to
-%%% the H3 process after the ownership transfer.
+%%% hands it to the H3 process. On fast handshakes (localhost, low-RTT,
+%%% 0-RTT), and on the Happy Eyeballs race path, the QUIC `connected' event
+%%% and the peer's control-stream SETTINGS reach the caller's mailbox before
+%%% that hand-off. They must reach the H3 process, or it never converges
+%%% and the caller blocks until connect_timeout.
 
 -module(quic_h3_connect_race_tests).
 
@@ -20,14 +15,6 @@
 
 setup() ->
     meck:new(quic, [passthrough]),
-    %% Mirror the real set_owner_sync/2: in the `connected' state it
-    %% re-emits `connected' to the new owner. It does NOT replay already
-    %% delivered stream data, so the leaked SETTINGS can only reach the H3
-    %% FSM if connect/3 drains and forwards them.
-    meck:expect(quic, set_owner_sync, fun(Conn, NewOwner) ->
-        NewOwner ! {quic, Conn, {connected, #{}}},
-        ok
-    end),
     meck:expect(quic, close, fun(_) -> ok end),
     meck:expect(quic, close, fun(_, _, _) -> ok end),
     meck:expect(quic, datagram_max_size, fun(_) -> 0 end),
@@ -145,8 +132,23 @@ cleanup(H3Conn, FakeQuicConn) ->
     exit(FakeQuicConn, shutdown),
     ok.
 
+%% Answers quic_connection:hand_over/3 as a connected connection does:
+%% `connected', then the old owner's events.
 fake_quic_loop() ->
     receive
-        stop -> ok;
-        _ -> fake_quic_loop()
+        stop ->
+            ok;
+        {'$gen_call', From, {hand_over, New}} ->
+            Tag = make_ref(),
+            New ! {quic, self(), {connected, #{}}},
+            gen_statem:reply(From, {hand_over, Tag}),
+            receive
+                {Tag, Events} -> [New ! E || {quic, _, Ev} = E <- Events, not is_connected(Ev)]
+            end,
+            fake_quic_loop();
+        _ ->
+            fake_quic_loop()
     end.
+
+is_connected({connected, _}) -> true;
+is_connected(_) -> false.
