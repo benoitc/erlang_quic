@@ -6,13 +6,13 @@ Where the code lives and what to read first. The source is 69 modules and about 
 
 In this order, they give you the whole path of a connection without opening the big module:
 
-1. `src/quic.erl` (1,190 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
+1. `src/quic.erl` (1,196 lines) is the public API and the owner-message protocol. Its module header lists every message an owner receives.
 2. `src/quic_listener.erl` (1,718) accepts connections. Its header is the clearest writing in the tree on connection ownership and the handover race.
 3. `src/quic_packet.erl` (405) and `src/quic_frame.erl` (549) are the wire format, with the header diagrams in the packet module.
 4. `src/quic_varint.erl` (112) is the encoding everything else is built from.
 5. `src/quic_crypto.erl` (671) is the key schedule, and `src/quic_aead.erl` packet protection.
 6. `src/quic_cc.erl` (459) is the congestion control behaviour, with `quic_loss` and `quic_ack` beside it.
-7. `src/quic_connection.erl` (17,922) is the state machine everything above meets in. Read it by section banner, not top to bottom.
+7. `src/quic_connection.erl` (17,991) is the state machine everything above meets in. Read it by section banner, not top to bottom.
 
 ## Layers
 
@@ -36,15 +36,18 @@ Most called, so most expensive to change:
 
 | Module | Lines | Called by | Calls |
 |--------|------:|----------:|------:|
-| `quic` | 976 | 8 | 6 |
+| `quic_redact` | 258 | 11 | 0 |
 | `quic_varint` | 112 | 8 | 0 |
-| `quic_crypto` | 671 | 6 | 1 |
-| `quic_listener` | 1,411 | 5 | 8 |
-| `quic_connection` | 12,691 | 5 | 22 |
-| `quic_cc` | 401 | 4 | 1 |
-| `quic_h3` | 836 | 4 | 2 |
+| `quic_connection` | 17,991 | 7 | 28 |
+| `quic` | 1,196 | 7 | 7 |
+| `quic_crypto` | 671 | 7 | 1 |
+| `quic_cert` | 495 | 6 | 0 |
+| `quic_listener` | 1,718 | 5 | 12 |
+| `quic_h3` | 1,238 | 4 | 3 |
 
-`quic_connection` calling 22 other modules and being called by 5 is the shape to keep in mind: it is the hub, and almost any protocol change lands in it.
+`quic_connection` calling 28 other modules and being called by 7 is the shape to keep in mind: it is the hub, and almost any protocol change lands in it.
+
+The counts come from the `xref` module call graph of `_build/default/lib/quic/ebin`, counting only modules of this application, measured on 2026-11-22. Measure again rather than copy them.
 
 ## Modules no grep will lead you to
 
@@ -79,12 +82,12 @@ The two hot paths have their own walkthroughs: [SEND_PATH.md](SEND_PATH.md) and
 
 ## Reading quic_h3_connection
 
-`src/h3/quic_h3_connection.erl` (6,250 lines) is the second largest module and
+`src/h3/quic_h3_connection.erl` (6,236 lines) is the second largest module and
 holds all of HTTP/3 for one connection, client and server. It also carries
 section banners:
 
 - API, then the gen_statem states: `bootstrapping`, `early_data`, `awaiting_quic`, `h3_connecting`, `connected`, and the two GOAWAY states.
-- `take_over/2`, near the top, is the one API function that does not run in the HTTP/3 process. `quic_h3:connect/3` and the server hand-off call it in their own process, and it reads that process's mailbox for what the connection sent before the swap (see [Connection ownership](DESIGN.md#connection-ownership)).
+- `take_over/2`, near the top, is the one API function that does not run in the HTTP/3 process. `quic_h3:connect/3` and the server hand-off call it in their own process. It reads that process's mailbox for what the connection sent before the swap, and the connection resends it to the HTTP/3 process before anything newer (`hand_over` in `quic_connection`; see [Connection ownership](DESIGN.md#connection-ownership)).
 - Critical streams (control, QPACK encoder and decoder), then stream handling: request and response frames, field sections, blocked streams.
 - Push stream handling on the receiving side, then, further down, server push and client push on the sending and bookkeeping side.
 - Sending: requests, responses, trailers, DATA.

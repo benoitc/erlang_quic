@@ -96,12 +96,9 @@ start(Port) ->
 stop() ->
     quic:stop_server(echo_server).
 
+%% The pid returned here owns the connection before its first packet.
 handle_connection(Conn, _DCID) ->
-    {ok, spawn(fun() -> connection_loop(Conn) end)}.
-
-connection_loop(Conn) ->
-    ok = quic:set_owner(Conn, self()),
-    loop(Conn).
+    {ok, spawn(fun() -> loop(Conn) end)}.
 
 loop(Conn) ->
     receive
