@@ -559,7 +559,7 @@ init_state(state_timeout, proceed_to_handshaking, #state{auth = undefined} = Sta
 init_state(state_timeout, proceed_to_handshaking, #state{auth = {_, Timeout}} = State) ->
     {keep_state, State, [{state_timeout, Timeout, auth_timeout}]};
 init_state(state_timeout, auth_timeout, #state{conn = Conn} = State) ->
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{what => dist_auth_handshake_timeout, conn => Conn},
         ?QUIC_LOG_META
     ),
@@ -580,7 +580,7 @@ init_state(
             AuthNode = quic_dist_auth:authenticated_node(Info),
             {next_state, handshaking, State#state{auth = undefined, auth_node = AuthNode}};
         {error, Reason} ->
-            ?LOG_WARNING(
+            ?LOG_DEBUG(
                 #{what => dist_auth_refused, conn => Conn, reason => Reason},
                 ?QUIC_LOG_META
             ),
@@ -630,7 +630,7 @@ handle_claim_node(From, Claim, State) ->
     refuse_claim(From, Claim, State).
 
 refuse_claim(From, Claimed, #state{conn = Conn, auth_node = AuthNode} = State) ->
-    ?LOG_WARNING(
+    ?LOG_DEBUG(
         #{
             what => dist_auth_identity_mismatch,
             conn => Conn,
