@@ -71,6 +71,45 @@ a_caller_that_is_not_the_owner_swaps_at_once_test_() ->
     end}.
 
 %%====================================================================
+%% Happy Eyeballs: the coordinator hands the winner to the owner
+%%====================================================================
+
+%% The winner delivered Early to the coordinator before the hand-off. The
+%% owner must get it before anything the winner sends after the switch.
+the_winner_reaches_its_owner_in_order_test_() ->
+    {timeout, 30, fun() ->
+        {ok, _} = application:ensure_all_started(quic),
+        Owner = collector(),
+        Before = conn_children(),
+        {IP, Port} = ?DEAD,
+        {ok, Coord} = quic_happy:start_coordinator(#{
+            addrs => [{IP, inet}],
+            port => Port,
+            opts => #{verify => false},
+            owner => Owner,
+            caller => self(),
+            delay => 100,
+            timeout => 10000
+        }),
+        try
+            Attempt = wait_new_child(Before, 50),
+            slow_old_owner(Attempt, Coord, 100),
+            Early = {quic, Attempt, ?HELD},
+            Coord ! Early,
+            Coord ! {quic, Attempt, {connected, #{}}},
+            receive
+                {quic_happy_result, Coord, Result} -> ?assertEqual({ok, Attempt}, Result)
+            after 5000 -> error(no_result)
+            end,
+            ok = wait_for(Owner, fun(Ms) -> length(from(Attempt, Ms)) >= 2 end),
+            ?assertMatch([Early, {quic, Attempt, send_ready} | _], from(Attempt, collected(Owner))),
+            quic:safe_close(Attempt)
+        after
+            exit(Coord, kill)
+        end
+    end}.
+
+%%====================================================================
 %% Helpers
 %%====================================================================
 
@@ -181,3 +220,20 @@ wait_for(Collector, Pred, Left) ->
 
 count(Msg, Msgs) ->
     length([M || M <- Msgs, M =:= Msg]).
+
+from(Conn, Msgs) ->
+    [M || {quic, C, _} = M <- Msgs, C =:= Conn].
+
+conn_children() ->
+    [P || {_, P, _, _} <- supervisor:which_children(quic_conn_sup), is_pid(P)].
+
+wait_new_child(_Before, 0) ->
+    error(no_attempt_started);
+wait_new_child(Before, N) ->
+    case conn_children() -- Before of
+        [Pid | _] ->
+            Pid;
+        [] ->
+            timer:sleep(20),
+            wait_new_child(Before, N - 1)
+    end.

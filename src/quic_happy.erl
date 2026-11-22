@@ -242,19 +242,13 @@ buffer_owner_msg(#{attempts := Attempts, backlog := Backlog} = St, Pid, Msg) ->
 %% (re-delivers {connected}); the remaining attempts are still owned by this
 %% coordinator and self-close on owner-DOWN when we exit below.
 on_connected(#{owner := Owner, caller := Caller, backlog := Backlog} = St, Pid, _Info) ->
-    %% set_owner_sync is a gen_statem:call. A winner that crashed between
+    %% hand_over is a gen_statem:call. A winner that crashed between
     %% {connected} and here raises, and the race goes on. One the server
-    %% closed returns an error, and the race is over.
-    try quic_connection:set_owner_sync(Pid, Owner) of
+    %% closed returns an error, and the race is over. What the winner
+    %% delivered here (the server's HTTP/3 control stream, say) goes to the
+    %% owner ahead of anything it sends later.
+    try quic_connection:hand_over(Pid, Owner, lists:reverse(maps:get(Pid, Backlog, []))) of
         ok ->
-            %% The connection handshaked while we owned it, so any peer data
-            %% it already delivered (e.g. the server's HTTP/3 control stream
-            %% and SETTINGS) was buffered here or is still sitting in our
-            %% mailbox, and would be lost when we exit. set_owner_sync
-            %% re-delivers {connected} but not that backlog, so hand it to the
-            %% new owner in order.
-            [Owner ! M || M <- lists:reverse(maps:get(Pid, Backlog, []))],
-            forward_quic_backlog(Pid, Owner),
             Caller ! {quic_happy_result, self(), {ok, Pid}},
             ok;
         {error, Reason} ->
@@ -274,20 +268,6 @@ close_reason(Conn, Reason) ->
         {quic, Conn, _} -> close_reason(Conn, Reason)
     after 0 ->
         Reason
-    end.
-
-%% Drain this process's mailbox of `{quic, Conn, _}' messages and forward them
-%% to NewOwner in arrival order. {connected} is skipped: set_owner re-delivers
-%% it to the new owner already, so forwarding it too would duplicate it.
-forward_quic_backlog(Conn, NewOwner) ->
-    receive
-        {quic, Conn, {connected, _}} ->
-            forward_quic_backlog(Conn, NewOwner);
-        {quic, Conn, _} = Msg ->
-            NewOwner ! Msg,
-            forward_quic_backlog(Conn, NewOwner)
-    after 0 ->
-        ok
     end.
 
 finish(#{caller := Caller}, Result) ->
