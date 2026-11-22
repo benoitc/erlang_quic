@@ -68,6 +68,9 @@
 %% Paths a server keeps for addresses that probed it.
 -define(MAX_PROBED_PATHS, 4).
 
+%% How long a hand_over/3 waits for the old owner's events.
+-define(HAND_OVER_TIMEOUT, 5000).
+
 %% Suppress warnings for helper functions prepared for future use
 -compile([{nowarn_unused_function, [{send_handshake_ack, 1}, {contains_non_probing_frame, 1}]}]).
 
@@ -122,6 +125,7 @@
     peercert/1,
     set_owner/2,
     set_owner_sync/2,
+    hand_over/3,
     setopts/2,
     get_send_queue_info/1,
     get_path_stats/1,
@@ -521,6 +525,29 @@ set_owner_sync(Conn, NewOwner) when is_pid(NewOwner) ->
     call(Conn, {set_owner, NewOwner});
 set_owner_sync(_Conn, _NewOwner) ->
     {error, badarg}.
+
+%% @private
+%% Hand a live connection to NewOwner, run by its current owner. Held is
+%% what the owner already took from its mailbox, oldest first. The
+%% connection sends all of it to NewOwner before anything newer.
+-spec hand_over(pid(), pid(), [{quic, pid(), term()}]) -> ok | {error, term()}.
+hand_over(Conn, NewOwner, Held) when is_pid(NewOwner) ->
+    case call(Conn, {hand_over, NewOwner}) of
+        {hand_over, Tag} ->
+            Conn ! {Tag, Held ++ owner_events(Conn)},
+            ok;
+        Other ->
+            Other
+    end;
+hand_over(_Conn, _NewOwner, _Held) ->
+    {error, badarg}.
+
+owner_events(Conn) ->
+    receive
+        {quic, Conn, _} = Event -> [Event | owner_events(Conn)]
+    after 0 ->
+        []
+    end.
 
 %% @doc Send a datagram.
 -spec send_datagram(pid(), iodata()) -> ok | {error, term()}.
@@ -1171,6 +1198,39 @@ reown(#state{owner_mon = OldMon} = State, NewOwner) ->
     _ = erlang:demonitor(OldMon, [flush]),
     State#state{owner = NewOwner, owner_mon = erlang:monitor(process, NewOwner)}.
 
+%% hand_over/3 on the connection side. Nothing is sent while the old owner
+%% collects its events, so NewOwner gets them ahead of anything newer.
+hand_over_owner({Caller, _} = From, NewOwner, Connected, #state{owner = Caller} = State0) when
+    NewOwner =/= Caller
+->
+    State = reown(State0, NewOwner),
+    Tag = erlang:monitor(process, Caller),
+    gen_statem:reply(From, {hand_over, Tag}),
+    announce_connected(Connected, NewOwner),
+    receive
+        {Tag, Events} ->
+            erlang:demonitor(Tag, [flush]),
+            _ = [NewOwner ! Event || Event <- Events, not is_connected_event(Event)],
+            {keep_state, State};
+        {'DOWN', Tag, process, Caller, _} ->
+            {keep_state, State}
+    after ?HAND_OVER_TIMEOUT ->
+        erlang:demonitor(Tag, [flush]),
+        {keep_state, State, [{next_event, cast, {close, hand_over_timeout}}]}
+    end;
+hand_over_owner(From, NewOwner, Connected, State) ->
+    announce_connected(Connected, NewOwner),
+    {keep_state, reown(State, NewOwner), [{reply, From, ok}]}.
+
+announce_connected(none, _NewOwner) ->
+    ok;
+announce_connected(Connected, NewOwner) ->
+    NewOwner ! {quic, self(), Connected},
+    ok.
+
+is_connected_event({quic, _, {connected, _}}) -> true;
+is_connected_event(_) -> false.
+
 %% Continue client initialization after socket is ready
 init_client_state(Host, Opts, Owner, SCID, DCID, RemoteAddr, Sock, LocalAddr) ->
     %% The version decides the Initial salt, so it has to be settled before
@@ -1524,6 +1584,8 @@ idle({call, From}, sockname, State) ->
     {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 idle({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
+idle({call, From}, {hand_over, NewOwner}, State) ->
+    hand_over_owner(From, NewOwner, none, State);
 idle(cast, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams in idle state if early keys are available
@@ -1644,6 +1706,8 @@ handshaking({call, From}, sockname, State) ->
     {keep_state, State, [{reply, From, {ok, current_sockname(State)}}]};
 handshaking({call, From}, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
+handshaking({call, From}, {hand_over, NewOwner}, State) ->
+    hand_over_owner(From, NewOwner, none, State);
 handshaking(cast, {set_owner, NewOwner}, State) ->
     {keep_state, reown(State, NewOwner)};
 %% 0-RTT: Allow opening streams during handshake if early keys are available
@@ -1856,6 +1920,9 @@ connected({call, From}, {set_owner, NewOwner}, #state{alpn = Alpn, transport_par
     Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
     NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, reown(State, NewOwner), [{reply, From, ok}]};
+connected({call, From}, {hand_over, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
+    Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
+    hand_over_owner(From, NewOwner, {connected, Info}, State);
 connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP} = State) ->
     %% Notify new owner that connection is already established
     Info = #{alpn => Alpn, alpn_protocol => Alpn, transport_params => TP},
@@ -2339,6 +2406,8 @@ draining({call, From}, get_state, State) ->
     {keep_state, State, [{reply, From, {draining, state_to_map(State)}}]};
 %% The same answer as once the process is gone; the owner was told why.
 draining({call, From}, {set_owner, _NewOwner}, State) ->
+    {keep_state, State, [{reply, From, {error, closed}}]};
+draining({call, From}, {hand_over, _NewOwner}, State) ->
     {keep_state, State, [{reply, From, {error, closed}}]};
 draining(info, drain_timeout, State) ->
     {next_state, closed, State};

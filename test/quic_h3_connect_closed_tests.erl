@@ -24,6 +24,9 @@ closed_before_hand_off_test_() ->
             {"a draining connection refuses a new owner", fun() ->
                 a_draining_connection_refuses_a_new_owner(Server)
             end},
+            {"a draining connection refuses a hand-over", fun() ->
+                a_draining_connection_refuses_a_hand_over(Server)
+            end},
             {"connect/3 returns the close when it beats the hand-off", fun() ->
                 connect_returns_the_close(Server, #{sync => true})
             end},
@@ -57,6 +60,19 @@ a_draining_connection_refuses_a_new_owner(#{port := Port}) ->
         end
     end),
     ?assertEqual({error, closed}, quic:set_owner_sync(Conn, Other)),
+    Other ! stop.
+
+a_draining_connection_refuses_a_hand_over(#{port := Port}) ->
+    {Conn, Reason} = refused_connection(Port),
+    ?assertMatch({peer_closed, transport, ?CERTIFICATE_REQUIRED, _, _}, Reason),
+    ?assertMatch({draining, _}, sys:get_state(Conn)),
+    Other = spawn(fun() ->
+        receive
+            stop -> ok
+        end
+    end),
+    ?assertEqual({error, closed}, quic_connection:hand_over(Conn, Other, [])),
+    ?assertEqual({messages, []}, process_info(Other, messages)),
     Other ! stop.
 
 %% quic:connect/4 is held until the server's close is in the caller's
