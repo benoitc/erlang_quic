@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.3.1] - 2026-11-22
 
 ### Fixed
 - On a busy machine, `quic_h3:connect/3` with `sync => true` could fail
