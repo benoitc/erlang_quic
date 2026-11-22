@@ -935,9 +935,11 @@ terminate(_Reason, #listener_state{
     owns_tables = OwnsTables,
     socket_state = SocketState,
     socket_backend = Backend,
-    socket = Socket
+    socket = Socket,
+    send_sender = SendSender
 }) ->
     close_connections(ConnTab),
+    drain_shared_sender(SendSender),
     %% Close socket based on backend
     case Backend of
         socket when SocketState =/= undefined ->
@@ -997,6 +999,15 @@ stop_connection(Pid) ->
     Ref = erlang:monitor(process, Pid),
     exit(Pid, shutdown),
     Ref.
+
+%% The connections' last packets, CONNECTION_CLOSE among them, may still
+%% be queued at the shared sender: let it send them before the socket goes.
+drain_shared_sender(undefined) ->
+    ok;
+drain_shared_sender(Sender) ->
+    Ref = erlang:monitor(process, Sender),
+    Sender ! stop,
+    await_down([Ref], erlang:monotonic_time(millisecond) + ?CLOSE_CONNECTIONS_MS).
 
 await_down([], _Deadline) ->
     ok;

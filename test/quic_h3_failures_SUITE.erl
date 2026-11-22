@@ -23,7 +23,8 @@
     untrusted_certificate_fails_a_sync_connect/1,
     untrusted_certificate_reaches_the_owner/1,
     stopping_the_server_closes_a_waiting_h3_client/1,
-    stopping_the_server_closes_a_quic_client/1
+    stopping_the_server_closes_a_quic_client/1,
+    stopping_the_server_sends_what_its_sender_holds/1
 ]).
 
 %% Well inside any idle timeout, so a close that never comes fails here.
@@ -37,7 +38,8 @@ all() ->
         untrusted_certificate_fails_a_sync_connect,
         untrusted_certificate_reaches_the_owner,
         stopping_the_server_closes_a_waiting_h3_client,
-        stopping_the_server_closes_a_quic_client
+        stopping_the_server_closes_a_quic_client,
+        stopping_the_server_sends_what_its_sender_holds
     ].
 
 init_per_suite(Config) ->
@@ -103,6 +105,37 @@ stopping_the_server_closes_a_quic_client(Config) ->
     after ?WAIT_MS -> ct:fail(client_not_told)
     end.
 
+%% On the socket backend a server connection hands its packets to the
+%% listener's shared sender. The sender is held here while the server
+%% stops, so the CONNECTION_CLOSE is still queued when the connection is
+%% gone.
+stopping_the_server_sends_what_its_sender_holds(_Config) ->
+    Before = shared_senders(),
+    {ok, Server} = quic_test_echo_server:start(#{socket_backend => socket}),
+    Senders = shared_senders() -- Before,
+    ?assertMatch([_ | _], Senders),
+    Opts = maps:merge(quic_test_echo_server:client_opts(), #{alpn => [<<"echo">>]}),
+    {ok, Conn} = quic:connect(<<"127.0.0.1">>, maps:get(port, Server), Opts, self()),
+    receive
+        {quic, Conn, {connected, _}} -> ok
+    after ?WAIT_MS -> ct:fail(connect_timeout)
+    end,
+    Test = self(),
+    spawn_link(fun() ->
+        [true = erlang:suspend_process(P) || P <- Senders],
+        Test ! senders_held,
+        timer:sleep(200),
+        [true = erlang:resume_process(P) || P <- Senders]
+    end),
+    receive
+        senders_held -> ok
+    end,
+    quic_test_echo_server:stop(Server),
+    receive
+        {quic, Conn, {closed, _Reason}} -> ok
+    after ?WAIT_MS -> ct:fail(client_not_told)
+    end.
+
 %%====================================================================
 %% Helpers
 %%====================================================================
@@ -110,6 +143,14 @@ stopping_the_server_closes_a_quic_client(Config) ->
 %% Verifies the server against a CA that did not sign its certificate.
 untrusting(Config, Extra) ->
     Extra#{verify => verify_peer, cacerts => [?config(other_ca, Config)]}.
+
+shared_senders() ->
+    [
+        P
+     || P <- processes(),
+        process_info(P, current_function) =:=
+            {current_function, {quic_socket, shared_sender_loop, 1}}
+    ].
 
 with_h3_server(Config, F) ->
     Test = self(),

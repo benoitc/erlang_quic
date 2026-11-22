@@ -12,6 +12,11 @@ All notable changes to this project will be documented in this file.
   ignored the stream and never saw the server's SETTINGS. The connection
   now reaches its new owner with its events in the order they were
   received.
+- `quic:stop_server/1` on the `socket` backend could close the socket
+  while the listener's shared sender still held the CONNECTION_CLOSE of
+  the connections it had just stopped, so some clients heard nothing
+  until their idle timeout. The listener now lets the sender finish
+  first (#606).
 
 ## [3.3.0] - 2026-11-20
 
