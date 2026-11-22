@@ -228,3 +228,15 @@ None needed.
    - the `docs/QUIC_DIST.md` section map;
    - the `_checkouts` paragraph;
    - questions 4 to 6.
+
+## Release gate status
+
+You asked for the four pre-release items first, then 3.3.1 (question 1).
+Done on this branch, with no source change:
+
+- the `AGENTS.md` date;
+- the `docs/MODULE_MAP.md` sizes, the measured dependency table, and the
+  `take_over/2` sentence;
+- the `docs/GETTING_STARTED.md` server example.
+
+Still open after this branch: item 3 of section 14, and questions 2 to 6.
