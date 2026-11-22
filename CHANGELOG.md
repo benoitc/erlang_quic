@@ -26,6 +26,13 @@ All notable changes to this project will be documented in this file.
   (erlang/otp#11841). With `2097152` a server streaming 4 KiB messages
   on 64 streams over loopback sent about 30% more messages per second
   (#607).
+### Changed
+- Writes waiting in the send queue share packets. The tail of a write
+  larger than a packet used to leave in a packet of its own although
+  the next write was waiting behind it; the head of that write now
+  fills the packet. 4 KiB writes on a busy connection take three
+  packets each instead of four, the fourth nearly empty. A stream's
+  writes still leave in the order they were made (#608).
 
 ## [3.3.0] - 2026-11-20
 

@@ -12761,7 +12761,53 @@ send_stream_chunked_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
             )
     end.
 
-send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx) ->
+%% A packet pending from send coalescing has room left: the head of this
+%% send fills it, so the pending frames do not leave in a short packet.
+%% The pending frames stay ahead of this send's data on the wire.
+send_stream_chunked_step_unbudgeted(
+    StreamId, Offset, Data, Fin, #state{pend_size = PS} = State0, BytesSentSoFar, Ctx
+) when PS > 0 ->
+    {chunked_ctx, MaxChunkSize, _PacketSize, _HeaderPrefix, _LengthVarint, _Where} = Ctx,
+    Room = MaxChunkSize - PS - ?MAX_STREAM_FRAME_HEADER,
+    case Room >= ?MAX_STREAM_FRAME_HEADER of
+        true ->
+            %% The window may not hold the fuller packet: it then leaves as it is.
+            case settle_pending(Room + ?MAX_STREAM_FRAME_HEADER, State0) of
+                #state{pend_size = 0} = State ->
+                    send_stream_chunked_run_step(
+                        StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx
+                    );
+                State ->
+                    fill_pending_packet(
+                        StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx, Room
+                    )
+            end;
+        false ->
+            send_stream_chunked_run_step(
+                StreamId, Offset, Data, Fin, flush_pending_packet(State0), BytesSentSoFar, Ctx
+            )
+    end;
+send_stream_chunked_step_unbudgeted(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx) ->
+    send_stream_chunked_run_step(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx).
+
+fill_pending_packet(StreamId, Offset, Data, Fin, State, BytesSentSoFar, Ctx, Room) ->
+    #state{cc_state = CCState, cfg = #conn_cfg{pacing_enabled = PacingEnabled}} = State,
+    case stream_check(CCState, Room + ?PACKET_OVERHEAD, PacingEnabled, State) of
+        {ok, NewCCState} ->
+            <<Head:Room/binary, Rest/binary>> = Data,
+            Frame = {stream, StreamId, Offset, Head, false},
+            Payload = quic_frame:encode_iodata(Frame),
+            State1 = send_app_packet_internal(Payload, [Frame], State, NewCCState),
+            send_stream_chunked_loop(
+                StreamId, Offset + Room, Rest, Fin, State1, BytesSentSoFar + Room, Ctx
+            );
+        _Blocked ->
+            send_stream_chunked_run_step(
+                StreamId, Offset, Data, Fin, flush_pending_packet(State), BytesSentSoFar, Ctx
+            )
+    end.
+
+send_stream_chunked_run_step(StreamId, Offset, Data, Fin, State0, BytesSentSoFar, Ctx) ->
     {chunked_ctx, MaxChunkSize, PacketSize, _HeaderPrefix, _LengthVarint, Where} = Ctx,
     %% The run goes out after any pending coalesced packet, so that packet
     %% is in flight before the window is checked.
@@ -12910,7 +12956,17 @@ get_stream_urgency(StreamId, Streams) ->
 %% bytes at 0 while a real entry is pending.
 process_send_queue(#state{send_queue_count = 0} = State) ->
     State;
+process_send_queue(#state{coalesce = true} = State) ->
+    drain_send_queue(State);
 process_send_queue(State) ->
+    %% Coalescing stays on for the whole drain, so the tail of one entry
+    %% waits for the head of the next instead of leaving in a packet of
+    %% its own.
+    end_coalescing(true, drain_send_queue(start_coalescing(true, State))).
+
+drain_send_queue(#state{send_queue_count = 0} = State) ->
+    State;
+drain_send_queue(State) ->
     case burst_exhausted(State) of
         true -> arm_burst_continuation(State);
         false -> process_send_queue_unbudgeted(State)
