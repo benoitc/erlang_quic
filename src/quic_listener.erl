@@ -35,7 +35,7 @@
 %%% '''
 %%%
 %%% Return `{ok, HandlerPid}' to take the connection, or `{error, Reason}'
-%%% to decline it. The listener then logs a warning, stops the
+%%% to decline it. The listener then logs it at debug level, stops the
 %%% connection before it has seen a packet, and answers the client with
 %%% CONNECTION_CLOSE carrying CONNECTION_REFUSED (RFC 9000 Section 5.2.2).
 %%% A handler that raises or returns anything else also costs only that
@@ -1397,7 +1397,7 @@ create_connection_unconditional(
                     send_to_connection(ConnPid, Packet, RemoteAddr),
                     {ok, ConnPid};
                 {declined, DeclineReason} ->
-                    ?LOG_WARNING(
+                    ?LOG_DEBUG(
                         #{
                             what => connection_declined,
                             conn_pid => ConnPid,

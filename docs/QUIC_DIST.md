@@ -585,7 +585,8 @@ quic_dist then refuses the connection unless the peer's dist node name
 is `Node`. On the server it checks the name the peer announces in the
 dist handshake, before the peer is marked pending or up, so it never
 shows in `nodes()` under another name; a peer asking for a dynamic name
-is refused too. The mismatch is logged as `dist_auth_identity_mismatch`.
+is refused too. The mismatch is logged at debug level as
+`dist_auth_identity_mismatch`, like every other refusal.
 On the client it checks that `Node` is the node being dialed, and
 `net_kernel:connect_node/1` returns `false` otherwise. Any other
 `{ok, Info}` admits the peer without the check.
