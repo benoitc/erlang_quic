@@ -4,7 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- A `min_bin_vheap_size` connection option, in words. A connection with
+  a deep send queue keeps far more binary data alive than the VM
+  default allows for, and then runs a full garbage collection every
+  other time without freeing anything, which slows bulk sending. A
+  larger value avoids that, at the cost of holding up to that much
+  unused binary data between collections. Without the option nothing
+  changes.
+
+### Changed
+- Writes waiting in the send queue share packets. The tail of a write
+  larger than a packet used to leave in a packet of its own although
+  the next write was waiting behind it; the head of that write now
+  fills the packet. 4 KiB writes on a busy connection take three
+  packets each instead of four. A stream's writes still leave in the
+  order they were made.
+
 ### Fixed
+- `quic:stop_server/1` on the `socket` backend could close the socket
+  before the CONNECTION_CLOSE of the connections it had just stopped was
+  sent, so some clients heard nothing until their idle timeout. The
+  listener now sends them first.
 - A server that requires client certificates logged an error for every
   client it refused, and a client logged one for every server
   certificate it refused. Any peer could fill the logs at the rate it

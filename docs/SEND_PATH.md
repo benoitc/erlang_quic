@@ -68,6 +68,12 @@ it accumulates into `pend_payload` so several small sends share one packet;
 with coalescing off it goes straight to `send_app_packet_now/3`. A payload that
 would exceed the remaining budget flushes the pending packet first.
 
+Coalescing is on while several writes taken from the mailbox together are sent,
+and for the whole of a send-queue drain, so the tail of one queued write waits
+for the next one. A large write that finds a packet pending first fills the room
+left in it, then sends its full-size chunks; the pending frames stay ahead of
+its data, so a stream's writes still leave in order.
+
 **`send_app_packet_now/3`** is where a packet is actually built: select keys by
 role, assign the packet number from `pn_app`, encrypt, apply header protection,
 update the congestion controller and loss tracker, bump counters, and hand the
