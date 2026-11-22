@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- A `min_bin_vheap_size` connection option, in words. A connection with
+  a deep send queue keeps far more binary data alive than the VM
+  default allows for, and then runs a full garbage collection every
+  other time without freeing anything, which slows bulk sending. A
+  larger value avoids that, at the cost of holding up to that much
+  unused binary data between collections. Without the option nothing
+  changes.
+
+### Changed
+- Writes waiting in the send queue share packets. The tail of a write
+  larger than a packet used to leave in a packet of its own although
+  the next write was waiting behind it; the head of that write now
+  fills the packet. 4 KiB writes on a busy connection take three
+  packets each instead of four. A stream's writes still leave in the
+  order they were made.
+
+### Fixed
+- `quic:stop_server/1` on the `socket` backend could close the socket
+  before the CONNECTION_CLOSE of the connections it had just stopped was
+  sent, so some clients heard nothing until their idle timeout. The
+  listener now sends them first.
+
 ## [3.3.1] - 2026-11-22
 
 ### Fixed
@@ -12,27 +37,6 @@ All notable changes to this project will be documented in this file.
   ignored the stream and never saw the server's SETTINGS. The connection
   now reaches its new owner with its events in the order they were
   received.
-- `quic:stop_server/1` on the `socket` backend could close the socket
-  while the listener's shared sender still held the CONNECTION_CLOSE of
-  the connections it had just stopped, so some clients heard nothing
-  until their idle timeout. The listener now lets the sender finish
-  first (#606).
-### Added
-- `min_bin_vheap_size` connection option, set on the connection process
-  as its process flag of the same name. Unset, the VM default applies as
-  before. A connection with a deep send queue keeps far more off-heap
-  binary data alive than the default of 46422 words, and then spends
-  every other garbage collection on a major one that frees nothing
-  (erlang/otp#11841). With `2097152` a server streaming 4 KiB messages
-  on 64 streams over loopback sent about 30% more messages per second
-  (#607).
-### Changed
-- Writes waiting in the send queue share packets. The tail of a write
-  larger than a packet used to leave in a packet of its own although
-  the next write was waiting behind it; the head of that write now
-  fills the packet. 4 KiB writes on a busy connection take three
-  packets each instead of four, the fourth nearly empty. A stream's
-  writes still leave in the order they were made (#608).
 
 ## [3.3.0] - 2026-11-20
 
