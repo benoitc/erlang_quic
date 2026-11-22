@@ -248,7 +248,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:sockname/1` - Get local address
 - `quic:peercert/1` - Get peer certificate
 - `quic:set_owner/2` - Make another process the owner, the one that receives `{quic, Conn, _}` events, without waiting
-- `quic:set_owner_sync/2` - The same, returning once the swap is done. A connection that is closing or gone returns `{error, closed}`; the current owner keeps the `{quic, Conn, {closed, Reason}}` it was sent
+- `quic:set_owner_sync/2` - The same, returning once the swap is done. A connection that is closing or gone returns `{error, closed}`; the current owner keeps the `{quic, Conn, {closed, Reason}}` it was sent. Events already delivered stay with the current owner; forwarding them after the call can put them behind newer ones, so give the final owner to `quic:connect/4` or the listener's `connection_handler` instead
 - `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
 - `quic:has_early_keys/1` - Whether 0-RTT (early data) keys are held right now (false once 1-RTT keys are installed, RFC 9001 §4.9.3)
 - `quic:early_data_accepted/1` - Whether the server accepted 0-RTT early data

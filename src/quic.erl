@@ -622,6 +622,12 @@ set_owner(Conn, NewOwner) when is_pid(Conn), is_pid(NewOwner) ->
 %% Use this when you need to ensure ownership is transferred before continuing.
 %% Returns `{error, closed}' when the connection is closing or gone. The
 %% current owner keeps the `{quic, Conn, {closed, Reason}}' it was sent.
+%%
+%% Events already delivered stay in the current owner's mailbox. Do not
+%% forward them to `NewOwner' after this call: the connection's newer
+%% events can reach `NewOwner' first. Give the final owner to
+%% `connect/4', or return it from the listener's `connection_handler',
+%% so that ownership moves before anything is delivered.
 -spec set_owner_sync(Conn, NewOwner) -> ok | {error, term()} when
     Conn :: pid(),
     NewOwner :: pid().
