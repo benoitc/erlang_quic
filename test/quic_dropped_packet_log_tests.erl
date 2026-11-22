@@ -1,8 +1,8 @@
 %%% -*- erlang -*-
 %%%
-%%% Packets the spec says to drop (RFC 9000 Sections 17.2 and 17.2.5.1)
-%%% are dropped without a warning, and the warning for a packet that
-%%% fails to decrypt carries no stateless reset token.
+%%% Packets the spec says to drop (RFC 9000 Sections 17.2 and 17.2.5.1,
+%%% RFC 9001 Section 4.9) are dropped without a warning, and the warning
+%%% for a packet that fails to decrypt carries no stateless reset token.
 
 -module(quic_dropped_packet_log_tests).
 
@@ -31,6 +31,23 @@ client_drops_retry_echoing_its_dcid_without_warning_test() ->
     S0 = client(),
     S = captured(fun() -> handle(retry(?ODCID), S0) end),
     ?assertNot((S#state.hs)#hs.retry_received),
+    ?assertEqual([], warnings()).
+
+%% A server that refuses the handshake closes in an Initial packet too,
+%% which reaches a client that has already discarded its Initial keys.
+client_drops_initial_after_discarding_its_keys_without_warning_test() ->
+    #state{hs = HS} = S0 = client(),
+    S = captured(fun() ->
+        handle(initial(?SCID, cid(8)), S0#state{hs = HS#hs{initial_keys = undefined}})
+    end),
+    ?assertEqual(undefined, S#state.close_reason),
+    ?assertEqual([], warnings()).
+
+server_drops_zero_rtt_without_keys_without_warning_test() ->
+    #state{hs = HS} = S0 = server(),
+    ZeroRtt = <<16#D0, ?QUIC_VERSION_1:32, 8, "own-cid0", 8, (cid(8))/binary, 24, 0:(24 * 8)>>,
+    S = captured(fun() -> handle(ZeroRtt, S0#state{hs = HS#hs{early_keys = undefined}}) end),
+    ?assertEqual(undefined, S#state.close_reason),
     ?assertEqual([], warnings()).
 
 undecryptable_packet_still_warns_test() ->

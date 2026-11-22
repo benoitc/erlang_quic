@@ -5713,10 +5713,13 @@ handle_packet_loop(Data, State) ->
             %% keys yet, the level cannot have been discarded.
             maybe_reenable_socket(State),
             keep_early_packet(no_handshake_keys, Data, State);
-        {error, no_handshake_keys} ->
-            %% A late Handshake packet after those keys were discarded,
-            %% which RFC 9001 Section 4.9.2 says to drop. The packets
-            %% coalesced after it are still read (RFC 9000 Section 12.2).
+        {error, Reason} when
+            Reason =:= no_initial_keys; Reason =:= no_handshake_keys; Reason =:= no_early_keys
+        ->
+            %% A packet for keys that are gone or never came, which RFC 9001
+            %% Section 4.9 says to drop: a late Initial or Handshake packet,
+            %% or a 0-RTT packet without 0-RTT keys. The packets coalesced
+            %% after it are still read (RFC 9000 Section 12.2).
             handle_packet_loop(next_coalesced_packet(Data), State);
         {error, Reason} ->
             %% Log decryption failure for debugging. Include the packet
