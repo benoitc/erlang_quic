@@ -509,3 +509,21 @@ spurious_congestion_without_cut_test() ->
 spurious_congestion_bbr_test() ->
     CC0 = quic_cc:new(bbr, #{}),
     ?assertEqual(CC0, quic_cc:on_spurious_congestion(CC0)).
+
+%% A connection may turn the minimum recovery period off.
+connection_min_recovery_duration_test_() ->
+    [
+        ?_assertEqual(
+            Expected,
+            quic_cc:min_recovery_duration(
+                quic_cc:new(quic_connection:build_cc_opts(Opts#{cc_algorithm => Algorithm}))
+            )
+        )
+     || Algorithm <- [newreno, cubic, bbr],
+        {Opts, Expected} <- [
+            {#{}, 100},
+            {#{min_recovery_duration => 0}, 0},
+            {#{min_recovery_duration => 20}, 20},
+            {#{min_recovery_duration => -1}, 100}
+        ]
+    ].
