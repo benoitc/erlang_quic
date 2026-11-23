@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [3.3.2] - 2026-11-23
 
 ### Added
 - A `min_bin_vheap_size` connection option, in words. A connection with
