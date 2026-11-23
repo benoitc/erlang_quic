@@ -1942,16 +1942,7 @@ connected(cast, {set_owner, NewOwner}, #state{alpn = Alpn, transport_params = TP
     NewOwner ! {quic, self(), {connected, Info}},
     {keep_state, reown(State, NewOwner)};
 connected({call, From}, {send_datagram, Data}, State) ->
-    case do_send_datagram(Data, note_app_limited(State)) of
-        {ok, NewState} ->
-            %% Event-driven flush: flush batch and timers after user API call
-            FlushedState = flush_event(NewState, event),
-            {keep_state, FlushedState, [{reply, From, ok}]};
-        {error, Reason, NewState} ->
-            {keep_state, NewState, [{reply, From, {error, Reason}}]};
-        {error, Reason} ->
-            {keep_state, State, [{reply, From, {error, Reason}}]}
-    end;
+    coalesced_datagrams([{From, Data}], State);
 connected({call, From}, {send_data, StreamId, Data, Fin}, State) ->
     coalesced_sends([{From, StreamId, Data, Fin}], State);
 connected({call, From}, open_stream, State) ->
@@ -4474,6 +4465,35 @@ drain_send_msgs(Acc, N) ->
             drain_send_msgs([{From, Sid, D, Fin} | Acc], N - 1);
         {'$gen_cast', {send_data_async, Sid, D, Fin}} ->
             drain_send_msgs([{async, Sid, D, Fin} | Acc], N - 1)
+    after 0 ->
+        lists:reverse(Acc)
+    end.
+
+%% Datagram sends waiting in the mailbox share packets the same way.
+coalesced_datagrams(Acc0, State0) ->
+    Sends = drain_datagram_msgs(Acc0, 63),
+    Coalesce = (tl(Sends) =/= []),
+    {RevReplies, State1} =
+        lists:foldl(
+            fun({From, Data}, {Rs, S}) ->
+                case do_send_datagram(Data, note_app_limited(S)) of
+                    {ok, S1} -> {[{reply, From, ok} | Rs], S1};
+                    {error, Reason, S1} -> {[{reply, From, {error, Reason}} | Rs], S1};
+                    {error, Reason} -> {[{reply, From, {error, Reason}} | Rs], S}
+                end
+            end,
+            {[], start_coalescing(Coalesce, State0)},
+            Sends
+        ),
+    State2 = end_coalescing(Coalesce, State1),
+    {keep_state, flush_event(State2, event), lists:reverse(RevReplies)}.
+
+drain_datagram_msgs(Acc, 0) ->
+    lists:reverse(Acc);
+drain_datagram_msgs(Acc, N) ->
+    receive
+        {'$gen_call', From, {send_datagram, Data}} ->
+            drain_datagram_msgs([{From, Data} | Acc], N - 1)
     after 0 ->
         lists:reverse(Acc)
     end.
