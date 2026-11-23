@@ -171,3 +171,14 @@ None needed.
    - a skip for the Linux-only case;
    - the two bench scripts;
    - questions 2 to 6.
+
+## Release gate status
+
+You asked for the three pre-release items first, then 3.3.2 (question 1).
+Done on this branch, with no source change:
+
+- the `AGENTS.md` date;
+- the two `docs/MODULE_MAP.md` sizes and the measurement date;
+- "Refused peers" in `docs/SERVER_GUIDE.md`.
+
+Still open after this branch: item 3 of section 14, and questions 2 to 6.

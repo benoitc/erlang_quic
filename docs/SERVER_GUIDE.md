@@ -140,6 +140,21 @@ arguments, and with them the secrets they hold:
 logger:remove_primary_filter(quic_redact).
 ```
 
+### Refused peers
+
+A client the server refuses is logged at debug level, with the reason:
+one without a certificate when `require_client_cert` is set, one whose
+certificate does not verify, one your `connection_handler`,
+`sni_callback` or `alpn_handler` declines. So is a client that breaks the
+protocol. Any client can cause these as often as it opens handshakes, so
+they stay out of your logs unless you ask for them. The connection's
+owner still receives the error, `{error, {certificate_invalid, Reason}}`
+for a refused certificate. To see the reports:
+
+```erlang
+logger:set_module_level([quic_connection, quic_listener], debug).
+```
+
 ## Loading Certificates
 
 ### From PEM Files
