@@ -992,11 +992,16 @@ init({server, Opts}) ->
 %%                     Defaults to RFC 9002 (2 * max_datagram_size).
 %%   - min_recovery_duration: Minimum time in recovery before exit (ms, default: 100)
 %%                            Prevents rapid cwnd oscillations on low-latency networks.
+%%                            0 ends recovery as RFC 9002 Section 7.3.2 does.
 build_cc_opts(Opts) ->
     CCOpts = #{},
     CCOpts1 = maybe_add_cc_opt(initial_window, Opts, CCOpts),
     CCOpts2 = maybe_add_cc_opt(minimum_window, Opts, CCOpts1),
-    CCOpts3 = maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2),
+    CCOpts3 =
+        case Opts of
+            #{min_recovery_duration := 0} -> CCOpts2#{min_recovery_duration => 0};
+            _ -> maybe_add_cc_opt(min_recovery_duration, Opts, CCOpts2)
+        end,
     %% Pass max_udp_payload_size as max_datagram_size to CC
     CCOpts4 =
         case maps:find(max_udp_payload_size, Opts) of

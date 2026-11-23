@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- `min_recovery_duration => 0` is accepted as a connection option and
+  turns the minimum recovery period off: recovery then ends as RFC 9002
+  Section 7.3.2 describes, when a packet sent during it is
+  acknowledged. The value used to be ignored, leaving the default of
+  100 ms in place. The default is unchanged.
+
 ## [3.3.2] - 2026-11-23
 
 ### Added
