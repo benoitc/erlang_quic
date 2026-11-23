@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+- Datagrams from concurrent `quic:send_datagram/2` calls share packets.
+  Each used to leave in a packet of its own, so a burst of small
+  datagrams met as many chances of loss as it had datagrams, and each
+  loss cut the congestion window. A burst of 64 datagrams of 70 bytes
+  now takes a handful of packets.
+
 ## [3.3.2] - 2026-11-23
 
 ### Added
