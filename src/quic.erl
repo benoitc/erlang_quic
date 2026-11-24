@@ -103,6 +103,7 @@
     peername/1,
     sockname/1,
     peercert/1,
+    server_name/1,
     set_owner/2,
     set_owner_sync/2,
     send_datagram/2,
@@ -609,6 +610,15 @@ sockname(Conn) when is_pid(Conn) ->
     Conn :: pid().
 peercert(Conn) when is_pid(Conn) ->
     quic_connection:peercert(Conn).
+
+%% @doc Get the server name (SNI) of the connection.
+%% On a server, the name the client sent in its ClientHello; on a client,
+%% the name it sent. `{error, no_server_name}' when none was sent, as
+%% when the client connected to an address.
+-spec server_name(Conn) -> {ok, binary()} | {error, term()} when
+    Conn :: pid().
+server_name(Conn) when is_pid(Conn) ->
+    quic_connection:server_name(Conn).
 
 %% @doc Set the owner process for a connection.
 %% Similar to gen_tcp:controlling_process/2.

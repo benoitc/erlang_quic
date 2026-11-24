@@ -123,6 +123,7 @@
     peername/1,
     sockname/1,
     peercert/1,
+    server_name/1,
     set_owner/2,
     set_owner_sync/2,
     hand_over/3,
@@ -519,6 +520,11 @@ sockname(Conn) ->
 -spec peercert(pid()) -> {ok, binary()} | {error, term()}.
 peercert(Conn) ->
     call(Conn, peercert).
+
+%% @doc Get the server name (SNI) the client sent.
+-spec server_name(pid()) -> {ok, binary()} | {error, term()}.
+server_name(Conn) ->
+    call(Conn, server_name).
 
 %% @doc Set new owner process (async).
 -spec set_owner(pid(), pid()) -> ok | {error, badarg}.
@@ -1924,6 +1930,8 @@ connected({call, From}, peercert, #state{hs = #hs{peer_cert = undefined}} = Stat
     {keep_state, State, [{reply, From, {error, no_peercert}}]};
 connected({call, From}, peercert, #state{hs = #hs{peer_cert = Cert}} = State) ->
     {keep_state, State, [{reply, From, {ok, Cert}}]};
+connected({call, From}, server_name, State) ->
+    {keep_state, State, [{reply, From, sent_server_name(State)}]};
 connected({call, From}, datagram_max_size, State) ->
     {keep_state, State, [{reply, From, max(0, datagram_budget(State))}]};
 connected({call, From}, datagram_stats, State) ->
@@ -12337,6 +12345,18 @@ queue_drop_oldest(Q) ->
         {{value, _}, Rest} -> Rest;
         {empty, _} -> Q
     end.
+
+%% A client keeps the name it verifies the certificate against, which may
+%% be an address; quic_tls leaves that out of SNI.
+sent_server_name(#state{hs = #hs{server_name = Name}, cfg = #conn_cfg{role = Role}}) when
+    is_binary(Name)
+->
+    case Role =:= client andalso quic_cert:host_address(Name) of
+        {ok, _Address} -> {error, no_server_name};
+        _ -> {ok, Name}
+    end;
+sent_server_name(_State) ->
+    {error, no_server_name}.
 
 %% Stats snapshot used by quic:datagram_stats/1.
 datagram_stats_snapshot(State) ->

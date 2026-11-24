@@ -25,6 +25,7 @@ calls() ->
         {peername, fun quic:peername/1},
         {sockname, fun quic:sockname/1},
         {peercert, fun quic:peercert/1},
+        {server_name, fun quic:server_name/1},
         {set_owner_sync, fun(C) -> quic:set_owner_sync(C, self()) end},
         {send_datagram, fun(C) -> quic:send_datagram(C, <<"x">>) end},
         {datagram_max_size, fun quic:datagram_max_size/1},

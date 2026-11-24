@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- `quic:server_name/1` returns the server name (SNI) the client sent
+  for a connection, on either side, or `{error, no_server_name}` when
+  it sent none. A server can check a request's authority against it
+  without taking over `sni_callback` to see the name.
+
 ## [3.3.2] - 2026-11-23
 
 ### Added
