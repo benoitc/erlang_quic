@@ -247,6 +247,7 @@ ok = quic:set_stream_reliable_size(Conn, StreamId, byte_size(Header)).
 - `quic:peername/1` - Get peer address
 - `quic:sockname/1` - Get local address
 - `quic:peercert/1` - Get peer certificate
+- `quic:server_name/1` - Get the server name (SNI) the client sent, on either side, once connected; `{error, no_server_name}` when it sent none
 - `quic:set_owner/2` - Make another process the owner, the one that receives `{quic, Conn, _}` events, without waiting
 - `quic:set_owner_sync/2` - The same, returning once the swap is done. A connection that is closing or gone returns `{error, closed}`; the current owner keeps the `{quic, Conn, {closed, Reason}}` it was sent. Events already delivered stay with the current owner; forwarding them after the call can put them behind newer ones, so give the final owner to `quic:connect/4` or the listener's `connection_handler` instead
 - `quic:migrate/1,2` - Trigger connection migration (with optional timeout)
